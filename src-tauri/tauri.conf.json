@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "稻芯智析",
+  "version": "0.1.0",
+  "identifier": "cn.rice-endosperm.daoxin",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "稻芯智析",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 840,
+        "minHeight": 620,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "publisher": "Rice Endosperm AI",
+    "copyright": "Copyright © 2026 Rice Endosperm AI",
+    "category": "Education",
+    "shortDescription": "水稻胚乳科研智能问答桌面客户端",
+    "longDescription": "稻芯智析是面向水稻胚乳发育、灌浆调控、基因功能与组学分析的科研智能问答客户端。",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "languages": ["SimpChinese", "English"]
+      },
+      "wix": {
+        "language": "zh-CN",
+        "upgradeCode": "550088d1-4359-51d8-bf2f-6582244c8bc5"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENCQTZCNDg4NDdDNDBEN0YKUldSL0RjUkhpTFNteTRBVEttK2xxOTdBSHFQVDVJSUgydndGSUppK3RKTDFURk5veCtjTDE4UG8K",
+      "endpoints": [
+        "https://github.com/yanmengli123/rice-endosperm-desktop/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

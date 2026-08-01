@@ -1,0 +1,41 @@
+name: Bug 报告
+description: 报告可复现的客户端问题（请勿提交 API Key）
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请先移除截图和日志中的 API Key、个人数据及未公开研究数据。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      placeholder: 例如 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: 操作系统
+      placeholder: 例如 Windows 11 24H2 x64
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期与实际结果
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已确认内容中没有 API Key、密码或敏感研究数据
+          required: true
