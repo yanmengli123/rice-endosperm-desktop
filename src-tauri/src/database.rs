@@ -515,7 +515,22 @@ mod migration_tests {
             .expect("backup directory")
             .count();
         assert_eq!(backup_count, 1);
-        std::fs::remove_dir_all(&root).expect("remove test directory");
+        drop(repaired);
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    async fn remove_test_directory(path: &std::path::Path) {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("remove test directory: {:?}", last_error.unwrap());
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
