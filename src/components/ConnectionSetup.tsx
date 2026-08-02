@@ -26,7 +26,6 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
     } catch (reason) {
       setError(normalizeCommandError(reason).message);
     } finally {
-      setApiKey("");
       setSaving(false);
     }
   }

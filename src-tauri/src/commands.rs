@@ -534,7 +534,10 @@ fn is_terminal(status: &str) -> bool {
 }
 
 fn error_is_reconnectable(error: &AppError) -> bool {
-    matches!(error, AppError::Network(_) | AppError::ServiceUnavailable)
+    matches!(
+        error,
+        AppError::Network(_) | AppError::ServiceUnavailable | AppError::LocalServiceUnavailable
+    )
 }
 
 #[cfg(test)]

@@ -26,6 +26,10 @@ pub enum AppError {
     RateLimited,
     #[error("服务暂时不可用，请稍后重试")]
     ServiceUnavailable,
+    #[error(
+        "本机 Yuxi 服务未就绪。请确认 Docker Desktop 已启动，并检查 Redis、worker、API 与 APISIX 服务后重试。"
+    )]
+    LocalServiceUnavailable,
     #[error("请求已取消")]
     Cancelled,
     #[error("找不到本地会话")]
@@ -62,6 +66,7 @@ impl AppError {
             Self::Forbidden => "forbidden",
             Self::RateLimited => "rate_limited",
             Self::ServiceUnavailable => "service_unavailable",
+            Self::LocalServiceUnavailable => "local_service_unavailable",
             Self::Cancelled => "cancelled",
             Self::ThreadNotFound => "thread_not_found",
             Self::Network(_) => "network_error",
@@ -75,7 +80,10 @@ impl AppError {
     fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited | Self::ServiceUnavailable | Self::Network(_)
+            Self::RateLimited
+                | Self::ServiceUnavailable
+                | Self::LocalServiceUnavailable
+                | Self::Network(_)
         )
     }
 }
@@ -87,6 +95,7 @@ impl From<AppError> for CommandError {
             AppError::Forbidden => Some(403),
             AppError::RateLimited => Some(429),
             AppError::ServiceUnavailable => Some(503),
+            AppError::LocalServiceUnavailable => Some(503),
             _ => None,
         };
         Self {
