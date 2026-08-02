@@ -10,6 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+src-tauri/target/
+src-tauri/target-*/
+crashdumps/
 *.local
 *.db
 *.db-shm
@@ -18,6 +21,7 @@ dist-ssr
 *.key
 *.pfx
 *.p12
+src-tauri/resources/libsodium.dll
 .env
 .env.*
 !.env.example

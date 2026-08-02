@@ -1,0 +1,5 @@
+* text=auto
+
+# SQLx migration checksums are byte-sensitive. Never let a Windows checkout
+# rewrite migration line endings after a release has been published.
+src-tauri/migrations/*.sql text eol=lf

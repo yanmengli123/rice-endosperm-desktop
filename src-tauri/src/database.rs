@@ -4,16 +4,21 @@ use chrono::Utc;
 use serde::Serialize;
 use sqlx::{
     FromRow, SqlitePool,
+    migrate::{MigrateError, Migrator},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use uuid::Uuid;
 
 use crate::{
     config::{agent_slug, default_gateway_url},
+    diagnostics,
     error::{AppError, AppResult},
 };
 
 const NEW_THREAD_TITLE: &str = "新对话";
+const MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const V1_LF_CHECKSUM: &str = "6F2F8974DC2BC853D4B6273B0F0947A92164C68855109BF463515E9F20D440F8685DC005927DD751E2B1E863AF645738";
+const V1_LEGACY_CRLF_CHECKSUM: &str = "40B0BBD1ADEC82DD375EAA5DB004CC46DA34D740C3B6012DE181E8F692A2D2C0DE03A5B0B50C1777070F697489636415";
 
 #[derive(Clone)]
 pub struct Database {
@@ -63,10 +68,7 @@ impl Database {
             .max_connections(4)
             .connect_with(options)
             .await?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|error| AppError::Database(error.to_string()))?;
+        run_migrations(&pool, app_data_dir, &database_path).await?;
         Ok(Self { pool })
     }
 
@@ -298,6 +300,232 @@ impl Database {
     }
 }
 
+async fn run_migrations(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    database_path: &Path,
+) -> AppResult<()> {
+    match MIGRATOR.run(pool).await {
+        Ok(()) => Ok(()),
+        Err(MigrateError::VersionMismatch(1)) => {
+            repair_v1_line_ending_mismatch(pool, app_data_dir, database_path).await?;
+            MIGRATOR
+                .run(pool)
+                .await
+                .map_err(|error| AppError::Database(error.to_string()))
+        }
+        Err(error) => Err(AppError::Database(error.to_string())),
+    }
+}
+
+async fn repair_v1_line_ending_mismatch(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    database_path: &Path,
+) -> AppResult<()> {
+    let stored_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 1 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let current_checksum = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 1)
+        .map(|migration| uppercase_hex(migration.checksum.as_ref()))
+        .ok_or_else(|| AppError::Database("找不到内置的数据库迁移版本 1".into()))?;
+
+    if stored_checksum.as_deref() != Some(V1_LEGACY_CRLF_CHECKSUM)
+        || current_checksum != V1_LF_CHECKSUM
+        || !is_v1_schema_compatible(pool).await?
+    {
+        return Err(AppError::Database(
+            "数据库迁移版本 1 的校验值不匹配，且不属于可安全修复的 v0.1.0 换行符兼容问题".into(),
+        ));
+    }
+
+    let backup_dir = app_data_dir.join("backups");
+    std::fs::create_dir_all(&backup_dir).map_err(|error| AppError::Database(error.to_string()))?;
+    let backup_path = backup_dir.join(format!(
+        "rice-endosperm-before-v1-repair-{}.db",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+    ));
+    create_consistent_backup(pool, &backup_path).await?;
+
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 1)
+        .ok_or_else(|| AppError::Database("找不到内置的数据库迁移版本 1".into()))?;
+    let result = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1 AND success = 1 AND hex(checksum) = ?",
+    )
+    .bind(migration.checksum.as_ref())
+    .bind(V1_LEGACY_CRLF_CHECKSUM)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Database(
+            "数据库迁移兼容修复未更新预期记录".into(),
+        ));
+    }
+
+    diagnostics::log(
+        "WARN",
+        "migration_v1_repaired",
+        &format!(
+            "normalized legacy CRLF checksum; backup={}; database={}",
+            backup_path.display(),
+            database_path.display()
+        ),
+    );
+    Ok(())
+}
+
+async fn is_v1_schema_compatible(pool: &SqlitePool) -> AppResult<bool> {
+    const EXPECTED: &[(&str, &[&str])] = &[
+        ("app_settings", &["key", "value", "updated_at"]),
+        (
+            "threads",
+            &[
+                "id",
+                "yuxi_thread_id",
+                "title",
+                "agent_slug",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+        (
+            "messages",
+            &[
+                "id",
+                "thread_id",
+                "role",
+                "content",
+                "position",
+                "created_at",
+            ],
+        ),
+        (
+            "runs",
+            &[
+                "run_id",
+                "request_id",
+                "thread_id",
+                "status",
+                "last_event_id",
+                "accumulated_text",
+                "error_code",
+                "created_at",
+                "updated_at",
+                "finished_at",
+            ],
+        ),
+    ];
+
+    let latest_version: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+    if latest_version != 1 {
+        return Ok(false);
+    }
+
+    for (table, expected_columns) in EXPECTED {
+        let actual_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(table)
+                .fetch_all(pool)
+                .await?;
+        if actual_columns.len() != expected_columns.len()
+            || !actual_columns
+                .iter()
+                .zip(*expected_columns)
+                .all(|(actual, expected)| actual == expected)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn create_consistent_backup(pool: &SqlitePool, backup_path: &Path) -> AppResult<()> {
+    sqlx::query("VACUUM main INTO ?")
+        .bind(backup_path.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .map_err(|error| AppError::Database(format!("创建迁移前备份失败：{error}")))?;
+    Ok(())
+}
+
+fn uppercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    bytes.iter().fold(
+        String::with_capacity(bytes.len() * 2),
+        |mut output, byte| {
+            let _ = write!(output, "{byte:02X}");
+            output
+        },
+    )
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::{Database, V1_LEGACY_CRLF_CHECKSUM, V1_LF_CHECKSUM};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn repairs_the_published_v1_crlf_checksum_without_losing_data() {
+        let root = std::env::temp_dir().join(format!("daoxin-migration-test-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        database
+            .save_setting("migration_test", "preserved")
+            .await
+            .expect("insert test data");
+        let legacy_checksum = decode_hex(V1_LEGACY_CRLF_CHECKSUM);
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+            .bind(legacy_checksum)
+            .execute(&database.pool)
+            .await
+            .expect("simulate v0.1.0 checksum");
+        database.pool.close().await;
+
+        let repaired = Database::open(&root).await.expect("repair legacy checksum");
+        let checksum: String =
+            sqlx::query_scalar("SELECT hex(checksum) FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&repaired.pool)
+                .await
+                .expect("read repaired checksum");
+        assert_eq!(checksum, V1_LF_CHECKSUM);
+        assert_eq!(
+            repaired
+                .setting("migration_test")
+                .await
+                .expect("read test data")
+                .as_deref(),
+            Some("preserved")
+        );
+        repaired.pool.close().await;
+        let backup_count = std::fs::read_dir(root.join("backups"))
+            .expect("backup directory")
+            .count();
+        assert_eq!(backup_count, 1);
+        std::fs::remove_dir_all(&root).expect("remove test directory");
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("ASCII checksum");
+                u8::from_str_radix(pair, 16).expect("hex checksum")
+            })
+            .collect()
+    }
 }

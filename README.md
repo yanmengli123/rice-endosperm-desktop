@@ -48,6 +48,7 @@ POST /api/agent/runs/{run_id}/cancel
 git clone https://github.com/yanmengli123/rice-endosperm-desktop.git
 cd rice-endosperm-desktop
 pnpm install --frozen-lockfile
+. .\.github\scripts\prepare-libsodium.ps1
 pnpm tauri dev
 ```
 
@@ -70,7 +71,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Windows 首次编译 Stronghold 时需要下载官方 libsodium 预编译包；CI 对下载文件执行固定 SHA-256 校验。
+Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.github\scripts\prepare-libsodium.ps1`。脚本会下载官方 libsodium 动态运行库、校验固定 SHA-256，并把 DLL 放入 Tauri 安装包资源；这种方式也避免静态 CRT 与 Rust MSVC 运行库冲突。
 
 ## 数据与安全
 
@@ -84,8 +85,8 @@ Windows 首次编译 Stronghold 时需要下载官方 libsodium 预编译包；C
 版本标签触发 GitHub Actions 构建并发布安装包：
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 发布所需更新签名私钥只保存在 GitHub Actions Secrets 中，仓库仅提交公钥。完整流程见 [发布指南](docs/RELEASING.md)。
