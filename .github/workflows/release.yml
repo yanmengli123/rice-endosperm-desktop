@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,7 +35,7 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/prepare-libsodium.ps1
       - name: Build and publish installers
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -54,23 +53,15 @@ jobs:
             完整变更与安全说明见仓库 README。安装包由公开源码自动构建；当前若未配置 Authenticode 证书，Windows 可能提示未知发布者。
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          includeUpdaterJson: false
+          assetNamePattern: Daoxin-Zhixi_[version]_[arch][setup].[ext]
+          retryAttempts: 2
           args: --bundles nsis,msi
-      - name: Generate and upload installer checksums
+      - name: Publish updater manifest and checksums
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $installers = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File |
-            Where-Object { $_.Extension -in ".exe", ".msi" } |
-            Sort-Object Name
-          if (-not $installers) { throw "No release installers were produced" }
-          $lines = foreach ($installer in $installers) {
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
-            "$hash  $($installer.Name)"
-          }
-          $lines | Set-Content -LiteralPath "SHA256SUMS.txt" -Encoding ASCII
-          gh release upload "$env:GITHUB_REF_NAME" "SHA256SUMS.txt" --clobber
+        run: ./.github/scripts/publish-release-metadata.ps1
       - name: Attest installer provenance
         uses: actions/attest-build-provenance@v2
         with:

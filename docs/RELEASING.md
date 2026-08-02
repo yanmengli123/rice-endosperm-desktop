@@ -18,8 +18,10 @@ Tauri 更新签名密钥与 Windows Authenticode 代码签名是两套独立机�
 1. 合并并确认 `main` 的 CI 通过。
 2. 创建带说明的 `vX.Y.Z` 标签。
 3. 推送标签，等待 `release.yml` 完成。
-4. 检查 Release 同时包含 NSIS、MSI、更新签名文件、`latest.json`、`SHA256SUMS.txt` 和 GitHub 构建来源证明。
+4. 检查 Release 同时包含以 `Daoxin-Zhixi_` 开头的 NSIS、MSI、更新签名文件、`latest.json`、`SHA256SUMS.txt` 和 GitHub 构建来源证明。安装后的产品名称仍为“稻芯智析”，ASCII 文件名只用于确保 GitHub 和更新器稳定处理下载资产。
 5. 在干净 Windows 虚拟机上验证安装、首次连接、对话、取消、重启恢复、检查更新和卸载。
 6. 公布 SHA-256；未启用 Authenticode 时明确披露“未知发布者”提示。
+
+`publish-release-metadata.ps1` 会核对标签与应用版本、安装包数量、签名和已上传资产，并显式生成 Tauri 2 `windows-x86_64` 更新清单。任何一项缺失都会使发布工作流失败，避免产生没有自动更新能力的“绿色”Release。
 
 不要手工替换已经发布的同版本安装包。需要修复时递增补丁版本并发布新标签，以保持更新签名和可追溯性。
