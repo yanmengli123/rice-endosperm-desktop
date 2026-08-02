@@ -4,6 +4,8 @@ use reqwest::{Client, Response, StatusCode, header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::sleep;
+use url::Url;
 
 use crate::{
     config::validate_gateway_url,
@@ -67,9 +69,33 @@ impl YuxiClient {
         api_key: &SecretString,
     ) -> AppResult<()> {
         let base = validate_gateway_url(gateway_url)?;
+        let mut last_error = None;
+        for delay in [None, Some(Duration::from_millis(800))] {
+            if let Some(delay) = delay {
+                sleep(delay).await;
+            }
+            match self.test_connection_once(&base, agent_slug, api_key).await {
+                Ok(()) => return Ok(()),
+                Err(error) if connection_error_is_retryable(&error) => last_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(connection_error_for_gateway(
+            &base,
+            last_error.unwrap_or(AppError::ServiceUnavailable),
+        ))
+    }
+
+    async fn test_connection_once(
+        &self,
+        base: &str,
+        agent_slug: &str,
+        api_key: &SecretString,
+    ) -> AppResult<()> {
         let status_response = self
             .authorized_get(&format!("{base}{CREDENTIAL_STATUS_PATH}"), api_key)
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(12))
             .send()
             .await?;
         if status_response.status().is_success() {
@@ -87,7 +113,7 @@ impl YuxiClient {
                 "run_id": "desktop-connection-test",
                 "agent_slug": agent_slug,
             }))
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(12))
             .send()
             .await?;
         match probe.status().as_u16() {
@@ -217,6 +243,22 @@ impl YuxiClient {
     }
 }
 
+fn connection_error_is_retryable(error: &AppError) -> bool {
+    matches!(error, AppError::Network(_) | AppError::ServiceUnavailable)
+}
+
+fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError {
+    let is_loopback = Url::parse(gateway_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+    if is_loopback && connection_error_is_retryable(&error) {
+        AppError::LocalServiceUnavailable
+    } else {
+        error
+    }
+}
+
 pub fn progress_text(value: &Value, current: &str) -> Option<String> {
     let payload = value.get("payload")?;
     if let Some(response) = payload
@@ -298,7 +340,9 @@ async fn response_error(response: Response) -> AppError {
 mod tests {
     use serde_json::json;
 
-    use super::{final_output, progress_text, terminal_status};
+    use crate::error::AppError;
+
+    use super::{connection_error_for_gateway, final_output, progress_text, terminal_status};
 
     #[test]
     fn extracts_cumulative_and_delta_text() {
@@ -321,5 +365,17 @@ mod tests {
         });
         assert_eq!(terminal_status(&value), Some("completed"));
         assert_eq!(final_output(&value), "最终回答");
+    }
+
+    #[test]
+    fn gives_actionable_errors_only_for_local_gateways() {
+        assert!(matches!(
+            connection_error_for_gateway("http://127.0.0.1:9088", AppError::ServiceUnavailable),
+            AppError::LocalServiceUnavailable
+        ));
+        assert!(matches!(
+            connection_error_for_gateway("https://api.example.cn", AppError::ServiceUnavailable),
+            AppError::ServiceUnavailable
+        ));
     }
 }
