@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod credentials;
 mod database;
+mod diagnostics;
 mod error;
 mod state;
 mod yuxi;
@@ -16,7 +17,8 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    diagnostics::install_panic_hook();
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_process::init())
@@ -24,9 +26,12 @@ pub fn run() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let version = app.package_info().version.to_string();
+            diagnostics::initialize(&app_data_dir, &version)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             let state = tauri::async_runtime::block_on(AppState::open(&app_data_dir, &version))
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             app.manage(state);
+            diagnostics::log("INFO", "startup_ready", "application state initialized");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -42,6 +47,9 @@ pub fn run() {
             send_message,
             cancel_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = result {
+        diagnostics::report_startup_error(&error.to_string());
+    }
 }
