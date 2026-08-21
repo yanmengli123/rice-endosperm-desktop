@@ -390,6 +390,20 @@ async fn send_message_inner(
 
     match final_result.status.as_str() {
         "completed" => {
+            if is_reasoning_protocol_failure(&final_text) {
+                state
+                    .database
+                    .update_run_progress(
+                        &created.run_id,
+                        "failed",
+                        last_event_id.as_deref(),
+                        "",
+                        Some("server_upgrade_required"),
+                        true,
+                    )
+                    .await?;
+                return Err(AppError::ServerUpgradeRequired);
+            }
             state
                 .database
                 .append_message(
@@ -431,18 +445,28 @@ async fn send_message_inner(
             let message = final_result
                 .error
                 .unwrap_or_else(|| "Agent 运行失败".into());
+            let error = if is_reasoning_protocol_failure(&message) {
+                AppError::ServerUpgradeRequired
+            } else {
+                AppError::Protocol(message)
+            };
+            let persisted_text = if matches!(&error, AppError::ServerUpgradeRequired) {
+                ""
+            } else {
+                &final_text
+            };
             state
                 .database
                 .update_run_progress(
                     &created.run_id,
                     &final_result.status,
                     last_event_id.as_deref(),
-                    &final_text,
-                    Some("agent_failed"),
+                    persisted_text,
+                    Some(error.code()),
                     true,
                 )
                 .await?;
-            Err(AppError::Protocol(message))
+            Err(error)
         }
     }
 }
@@ -540,9 +564,16 @@ fn error_is_reconnectable(error: &AppError) -> bool {
     )
 }
 
+fn is_reasoning_protocol_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("model call failed")
+        && normalized.contains("reasoning_content")
+        && normalized.contains("must be passed back")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SendMessageRequest, validate_send_request};
+    use super::{SendMessageRequest, is_reasoning_protocol_failure, validate_send_request};
 
     #[test]
     fn accepts_gateway_compatible_request_ids() {
@@ -552,5 +583,18 @@ mod tests {
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
         };
         assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn detects_reasoning_protocol_failure_from_legacy_server() {
+        let message = "Model call failed after 3 attempts with BadRequestError: The `reasoning_content` in the thinking mode must be passed back to the API.";
+        assert!(is_reasoning_protocol_failure(message));
+    }
+
+    #[test]
+    fn does_not_reclassify_normal_model_content() {
+        assert!(!is_reasoning_protocol_failure(
+            "reasoning_content is an API field described in this answer"
+        ));
     }
 }

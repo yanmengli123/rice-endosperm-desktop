@@ -10,9 +10,11 @@
 
 前往 [GitHub Releases](https://github.com/yanmengli123/rice-endosperm-desktop/releases/latest) 下载 Windows 安装包：
 
-- 推荐普通用户下载 `稻芯智析_*_x64-setup.exe`（NSIS）。
-- 需要企业软件分发时下载 `.msi`。
+- 推荐普通用户下载 `Daoxin-Zhixi_*_x64-setup.exe`（NSIS）。
+- 需要企业软件分发时下载 `Daoxin-Zhixi_*_x64.msi`。
 - 应用内“设置与连接 → 检查更新”可安装后续签名更新。
+
+当前版本与变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 首个公开版本尚未配置商业 Authenticode 证书，Windows SmartScreen 可能显示“未知发布者”。安装包仍由 GitHub Actions 从公开源码构建，并使用 Tauri 更新签名保证自动更新包的完整性。正式生产发行建议配置 OV/EV 代码签名证书。
 
@@ -85,8 +87,8 @@ Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.gi
 版本标签触发 GitHub Actions 构建并发布安装包：
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 发布所需更新签名私钥只保存在 GitHub Actions Secrets 中，仓库仅提交公钥。完整流程见 [发布指南](docs/RELEASING.md)。
