@@ -30,6 +30,10 @@ pub enum AppError {
         "本机 Yuxi 服务未就绪。请确认 Docker Desktop 已启动，并检查 Redis、worker、API 与 APISIX 服务后重试。"
     )]
     LocalServiceUnavailable,
+    #[error(
+        "Yuxi 服务端版本过旧，无法正确处理思考模型的多轮工具调用。请将 rice-endosperm-agent 更新到最新版并重启服务后重试；无需更换 API Key。"
+    )]
+    ServerUpgradeRequired,
     #[error("请求已取消")]
     Cancelled,
     #[error("找不到本地会话")]
@@ -57,7 +61,7 @@ impl AppError {
         }
     }
 
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::MissingCredential => "missing_credential",
             Self::InvalidCredential => "invalid_credential",
@@ -67,6 +71,7 @@ impl AppError {
             Self::RateLimited => "rate_limited",
             Self::ServiceUnavailable => "service_unavailable",
             Self::LocalServiceUnavailable => "local_service_unavailable",
+            Self::ServerUpgradeRequired => "server_upgrade_required",
             Self::Cancelled => "cancelled",
             Self::ThreadNotFound => "thread_not_found",
             Self::Network(_) => "network_error",
