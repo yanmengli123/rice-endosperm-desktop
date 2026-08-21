@@ -1,11 +1,11 @@
 import { Channel } from "@tauri-apps/api/core";
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
 import { cancelRun, normalizeCommandError, sendMessage } from "../services/tauri-client";
-import type { RunEvent } from "../types";
+import type { ChatCompletion, RunEvent } from "../types";
 
 type AdapterCallbacks = {
   onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
-  onCompleted?: () => void;
+  onCompleted?: (completion: ChatCompletion) => void;
 };
 
 class AsyncQueue<T> {
@@ -120,7 +120,7 @@ export function createYuxiAdapter(
           yield { content: [{ type: "text", text: accumulatedText }] };
         }
         callbacks.onRunState?.({ runId: activeRunId, status: "completed" });
-        callbacks.onCompleted?.();
+        callbacks.onCompleted?.(completion);
       } catch (error) {
         if (abortSignal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           callbacks.onRunState?.({ runId: activeRunId, status: "cancelled" });

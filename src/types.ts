@@ -38,10 +38,66 @@ export type ChatCompletion = {
   requestId: string;
   status: string;
   text: string;
+  context: ServerRunContext;
+};
+
+export type KnowledgeScopeMember = {
+  kbId?: string;
+  kbName?: string;
+  kbType?: string;
+  priority?: number;
+  documentEnabled: boolean;
+  graphEnabled: boolean;
+  structuredEnabled: boolean;
+  includedVia?: string;
+};
+
+export type KnowledgeScopeSummary = {
+  scopeId?: string;
+  scopeVersion?: number;
+  scopeMode?: string;
+  knowledgeStrategy?: string;
+  retrievalMode?: string;
+  allowWeb: boolean;
+  kbCount: number;
+  members: KnowledgeScopeMember[];
+};
+
+export type KnowledgeRetrievalSummary = {
+  retrievalId?: string;
+  status?: string;
+  intent?: string;
+  queryMode?: string;
+  plannerVersion?: string;
+  entityResolverVersion?: string;
+  retrievalOrchestratorVersion?: string;
+  claimValidatorVersion?: string;
+  contractSchemaVersion?: string;
+  sourceStatus: unknown[];
+  returnedRelationCount?: number;
+  returnedClaimCount?: number;
+  returnedEvidenceCount?: number;
+  warnings: unknown[];
+  errorCode?: string;
+  finishedAt?: string;
+};
+
+export type ServerRunContext = {
+  protocolVersion?: string;
+  modelSpec?: string;
+  knowledgeScope: KnowledgeScopeSummary;
+  knowledgeRetrievals: KnowledgeRetrievalSummary[];
+};
+
+export type PendingRunSync = {
+  recovered: number;
+  pending: number;
+  failed: number;
+  lastError?: string;
 };
 
 export type RunEvent =
   | { type: "started"; runId: string; threadId: string; requestId: string }
   | { type: "status"; status: string; message: string }
   | { type: "text"; text: string; eventId?: string }
-  | { type: "done"; runId: string; status: string; text: string };
+  | { type: "done"; runId: string; status: string; text: string; context: ServerRunContext };

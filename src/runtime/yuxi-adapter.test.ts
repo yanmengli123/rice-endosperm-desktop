@@ -36,6 +36,12 @@ describe("createYuxiAdapter", () => {
         requestId: "desktop-request-1",
         status: "completed",
         text: "Yuxi 服务端最终回答",
+        context: {
+          protocolVersion: "1.1",
+          modelSpec: "minimax-cn:MiniMax-M3",
+          knowledgeScope: { allowWeb: false, kbCount: 3, members: [] },
+          knowledgeRetrievals: [],
+        },
       };
     });
     const onCompleted = vi.fn();
@@ -58,6 +64,11 @@ describe("createYuxiAdapter", () => {
     }
 
     expect(rendered).toEqual(["检索中的模型过程", "Yuxi 服务端最终回答"]);
-    expect(onCompleted).toHaveBeenCalledOnce();
+    expect(onCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Yuxi 服务端最终回答",
+        context: expect.objectContaining({ modelSpec: "minimax-cn:MiniMax-M3" }),
+      }),
+    );
   });
 });

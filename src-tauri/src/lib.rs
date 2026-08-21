@@ -10,8 +10,9 @@ mod yuxi;
 use tauri::Manager;
 
 use commands::{
-    cancel_run, create_thread, delete_api_key, delete_thread, get_public_settings, list_threads,
-    load_messages, rename_thread, save_connection, send_message, test_connection,
+    cancel_run, create_thread, delete_api_key, delete_thread, get_public_settings,
+    get_thread_run_context, list_threads, load_messages, rename_thread, save_connection,
+    send_message, sync_pending_runs, test_connection,
 };
 use state::AppState;
 
@@ -42,6 +43,8 @@ pub fn run() {
             create_thread,
             list_threads,
             load_messages,
+            get_thread_run_context,
+            sync_pending_runs,
             rename_thread,
             delete_thread,
             send_message,

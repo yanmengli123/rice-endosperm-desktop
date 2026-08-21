@@ -4,16 +4,19 @@ import { ChatWorkspace } from "./components/ChatWorkspace";
 import { ConnectionSetup } from "./components/ConnectionSetup";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
+import { RunContextBar } from "./components/RunContextBar";
 import {
   createThread,
   deleteThread,
   getPublicSettings,
+  getThreadRunContext,
   listThreads,
   loadMessages,
   normalizeCommandError,
   renameThread,
+  syncPendingRuns,
 } from "./services/tauri-client";
-import type { LocalMessage, PublicSettings, ThreadSummary } from "./types";
+import type { ChatCompletion, LocalMessage, PublicSettings, ServerRunContext, ThreadSummary } from "./types";
 import "./styles.css";
 
 const FALLBACK_GATEWAY = "http://127.0.0.1:9088";
@@ -23,12 +26,15 @@ export default function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>();
   const [messages, setMessages] = useState<LocalMessage[]>([]);
+  const [runContext, setRunContext] = useState<ServerRunContext | null>(null);
+  const [recoveryPending, setRecoveryPending] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [runState, setRunState] = useState<{ status: string; message?: string }>({ status: "idle" });
   const initialized = useRef(false);
+  const threadLoadSequence = useRef(0);
 
   const refreshThreads = useCallback(async () => {
     const items = await listThreads();
@@ -37,8 +43,15 @@ export default function App() {
   }, []);
 
   const openThread = useCallback(async (threadId: string) => {
+    const sequence = ++threadLoadSequence.current;
     setActiveThreadId(threadId);
-    setMessages(await loadMessages(threadId));
+    const [threadMessages, context] = await Promise.all([
+      loadMessages(threadId),
+      getThreadRunContext(threadId),
+    ]);
+    if (sequence !== threadLoadSequence.current) return;
+    setMessages(threadMessages);
+    setRunContext(context);
   }, []);
 
   const ensureThread = useCallback(async () => {
@@ -46,6 +59,7 @@ export default function App() {
     const first = items[0] ?? (await createThread());
     if (items.length === 0) setThreads([first]);
     await openThread(first.id);
+    return first.id;
   }, [openThread, refreshThreads]);
 
   useEffect(() => {
@@ -55,14 +69,43 @@ export default function App() {
       try {
         const current = await getPublicSettings();
         setSettings(current);
-        if (current.hasApiKey) await ensureThread();
+        if (current.hasApiKey) {
+          const threadId = await ensureThread();
+          const recovery = await syncPendingRuns();
+          setRecoveryPending(recovery.pending);
+          if (recovery.recovered > 0 || recovery.failed > 0) {
+            await refreshThreads();
+            await openThread(threadId);
+          }
+          if (recovery.failed > 0 && recovery.lastError) setError(recovery.lastError);
+        }
       } catch (reason) {
         setError(normalizeCommandError(reason).message);
       } finally {
         setLoading(false);
       }
     })();
-  }, [ensureThread]);
+  }, [ensureThread, openThread, refreshThreads]);
+
+  useEffect(() => {
+    if (!settings?.hasApiKey || recoveryPending === 0) return;
+    const timeout = window.setTimeout(() => {
+      void syncPendingRuns()
+        .then(async (recovery) => {
+          setRecoveryPending(recovery.pending);
+          if (recovery.recovered > 0 || recovery.failed > 0) {
+            await refreshThreads();
+            if (activeThreadId) await openThread(activeThreadId);
+          }
+          if (recovery.failed > 0 && recovery.lastError) setError(recovery.lastError);
+        })
+        .catch((reason) => {
+          setError(normalizeCommandError(reason).message);
+          setRecoveryPending(0);
+        });
+    }, 4000);
+    return () => window.clearTimeout(timeout);
+  }, [activeThreadId, openThread, recoveryPending, refreshThreads, settings?.hasApiKey]);
 
   async function newThread() {
     try {
@@ -100,7 +143,8 @@ export default function App() {
     }
   }
 
-  const completed = useCallback(() => {
+  const completed = useCallback((completion: ChatCompletion) => {
+    setRunContext(completion.context);
     void refreshThreads();
   }, [refreshThreads]);
 
@@ -116,6 +160,15 @@ export default function App() {
           setSettings(connected);
           setLoading(true);
           void ensureThread()
+            .then(async (threadId) => {
+              const recovery = await syncPendingRuns();
+              setRecoveryPending(recovery.pending);
+              if (recovery.recovered > 0 || recovery.failed > 0) {
+                await refreshThreads();
+                await openThread(threadId);
+              }
+              if (recovery.failed > 0 && recovery.lastError) setError(recovery.lastError);
+            })
             .catch((reason) => setError(normalizeCommandError(reason).message))
             .finally(() => setLoading(false));
         }}
@@ -147,6 +200,7 @@ export default function App() {
             {runState.message || (runState.status === "running" ? "正在分析" : "服务已连接")}
           </div>
         </header>
+        <RunContextBar context={runContext} />
         {error && <div className="global-error"><CircleAlert size={17} />{error}<button onClick={() => setError("")}>关闭</button></div>}
         {activeThreadId ? (
           <ChatWorkspace

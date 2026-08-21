@@ -3,7 +3,9 @@ import type {
   ChatCompletion,
   LocalMessage,
   PublicSettings,
+  PendingRunSync,
   RunEvent,
+  ServerRunContext,
   SendMessageRequest,
   ThreadSummary,
 } from "../types";
@@ -24,6 +26,12 @@ export const listThreads = () => invoke<ThreadSummary[]>("list_threads");
 
 export const loadMessages = (threadId: string) =>
   invoke<LocalMessage[]>("load_messages", { threadId });
+
+export const getThreadRunContext = (threadId: string) =>
+  invoke<ServerRunContext | null>("get_thread_run_context", { threadId });
+
+export const syncPendingRuns = () =>
+  invoke<PendingRunSync>("sync_pending_runs");
 
 export const renameThread = (threadId: string, title: string) =>
   invoke<void>("rename_thread", { threadId, title });

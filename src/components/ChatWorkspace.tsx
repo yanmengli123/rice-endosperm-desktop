@@ -13,13 +13,13 @@ import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, Square } from "lucide-react";
 import remarkGfm from "remark-gfm";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
-import type { LocalMessage } from "../types";
+import type { ChatCompletion, LocalMessage } from "../types";
 
 type Props = {
   threadId: string;
   messages: LocalMessage[];
   onRunState: (state: { runId?: string; status: string; message?: string }) => void;
-  onCompleted: () => void;
+  onCompleted: (completion: ChatCompletion) => void;
 };
 
 function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {

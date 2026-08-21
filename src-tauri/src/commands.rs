@@ -15,7 +15,7 @@ use crate::{
     database::{LocalMessage, PublicSettings, ThreadSummary},
     error::{AppError, AppResult, CommandError},
     state::AppState,
-    yuxi::{ProgressText, RunResult, terminal_status},
+    yuxi::{ProgressText, RunResult, ServerRunContext, terminal_status},
 };
 
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
@@ -36,6 +36,16 @@ pub struct ChatCompletion {
     pub request_id: String,
     pub status: String,
     pub text: String,
+    pub context: ServerRunContext,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRunSync {
+    pub recovered: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +68,7 @@ pub enum RunEvent {
         run_id: String,
         status: String,
         text: String,
+        context: Box<ServerRunContext>,
     },
 }
 
@@ -186,6 +197,112 @@ pub async fn load_messages(
 }
 
 #[tauri::command]
+pub async fn get_thread_run_context(
+    thread_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<Value>, CommandError> {
+    let raw = state
+        .database
+        .latest_run_context(&thread_id)
+        .await
+        .map_err(CommandError::from)?;
+    Ok(raw.and_then(|value| serde_json::from_str(&value).ok()))
+}
+
+#[tauri::command]
+pub async fn sync_pending_runs(state: State<'_, AppState>) -> Result<PendingRunSync, CommandError> {
+    sync_pending_runs_inner(&state)
+        .await
+        .map_err(CommandError::from)
+}
+
+async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> {
+    let pending_runs = state.database.list_pending_runs().await?;
+    if pending_runs.is_empty() {
+        return Ok(PendingRunSync {
+            recovered: 0,
+            pending: 0,
+            failed: 0,
+            last_error: None,
+        });
+    }
+
+    let gateway_url = state.database.gateway_url().await?;
+    let api_key = state.credentials.api_key()?;
+    let mut summary = PendingRunSync {
+        recovered: 0,
+        pending: 0,
+        failed: 0,
+        last_error: None,
+    };
+    for pending_run in pending_runs {
+        let result = match state
+            .yuxi
+            .result(&gateway_url, agent_slug(), &api_key, &pending_run.run_id)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                summary.pending += 1;
+                summary.last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        persist_run_context(state, &pending_run.run_id, &result.context).await?;
+        match result.status.as_str() {
+            "completed" if !result.output.is_empty() => {
+                state
+                    .database
+                    .append_message(
+                        &format!("assistant-{}", pending_run.run_id),
+                        &pending_run.thread_id,
+                        "assistant",
+                        &result.output,
+                    )
+                    .await?;
+                state
+                    .database
+                    .update_run_progress(
+                        &pending_run.run_id,
+                        "completed",
+                        None,
+                        &result.output,
+                        None,
+                        true,
+                    )
+                    .await?;
+                summary.recovered += 1;
+            }
+            "failed" | "cancelled" | "interrupted" => {
+                state
+                    .database
+                    .update_run_progress(
+                        &pending_run.run_id,
+                        &result.status,
+                        None,
+                        &result.output,
+                        result.error_code.as_deref(),
+                        true,
+                    )
+                    .await?;
+                summary.failed += 1;
+                if let Some(message) = result.error {
+                    summary.last_error = Some(message);
+                }
+            }
+            _ => {
+                state
+                    .database
+                    .update_run_status(&pending_run.run_id, &result.status)
+                    .await?;
+                summary.pending += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
 pub async fn rename_thread(
     thread_id: String,
     title: String,
@@ -270,6 +387,8 @@ async fn send_message_inner(
             &request.request_id,
             &request.thread_id,
             &created.status,
+            &serde_json::to_string(&created.run_context)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
         )
         .await?;
     send_channel(
@@ -387,6 +506,8 @@ async fn send_message_inner(
         &cancellation,
     )
     .await?;
+    persist_run_context(state, &created.run_id, &final_result.context).await?;
+    let context = final_result.context.clone();
     let final_text = final_result.output;
 
     match final_result.status.as_str() {
@@ -431,6 +552,7 @@ async fn send_message_inner(
                     run_id: created.run_id.clone(),
                     status: "completed".into(),
                     text: final_text.clone(),
+                    context: Box::new(context.clone()),
                 },
             )?;
             Ok(ChatCompletion {
@@ -439,13 +561,18 @@ async fn send_message_inner(
                 request_id: created.request_id,
                 status: "completed".into(),
                 text: final_text,
+                context,
             })
         }
-        "cancelled" | "interrupted" => Err(AppError::Cancelled),
+        "cancelled" => Err(AppError::Cancelled),
         _ => {
-            let message = final_result
-                .error
-                .unwrap_or_else(|| "Agent 运行失败".into());
+            let message = final_result.error.unwrap_or_else(|| {
+                if final_result.status == "interrupted" {
+                    "服务端已中断本次运行，请在 Yuxi 服务端处理需要人工确认的步骤后重试".into()
+                } else {
+                    "Agent 运行失败".into()
+                }
+            });
             let error = if is_reasoning_protocol_failure(&message) {
                 AppError::ServerUpgradeRequired
             } else {
@@ -463,13 +590,23 @@ async fn send_message_inner(
                     &final_result.status,
                     last_event_id.as_deref(),
                     persisted_text,
-                    Some(error.code()),
+                    final_result.error_code.as_deref().or(Some(error.code())),
                     true,
                 )
                 .await?;
             Err(error)
         }
     }
+}
+
+async fn persist_run_context(
+    state: &AppState,
+    run_id: &str,
+    context: &ServerRunContext,
+) -> AppResult<()> {
+    let serialized =
+        serde_json::to_string(context).map_err(|error| AppError::Internal(error.to_string()))?;
+    state.database.update_run_context(run_id, &serialized).await
 }
 
 #[tauri::command]

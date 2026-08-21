@@ -95,10 +95,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .icon-button:hover { background: #edf3ed; }
 .connection-badge { display: flex; align-items: center; gap: 6px; border: 1px solid #d5e6d8; border-radius: 999px; background: #f0f8f1; color: var(--green-700); padding: 6px 10px; font-size: 11px; font-weight: 600; }
 .connection-badge.error { border-color: #f0cfcc; background: #fff2f1; color: #a33934; }
+.run-context-bar {
+  min-height: 38px; flex: 0 0 auto; display: flex; align-items: center; gap: 17px;
+  overflow-x: auto; border-bottom: 1px solid #dfe8e0; background: #f5faf5; padding: 7px 22px;
+  color: #526158; font-size: 10.5px; scrollbar-width: thin;
+}
+.run-context-bar > span { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; }
+.run-context-bar svg { color: var(--green-700); }
+.run-context-bar .authoritative-result { margin-left: auto; color: var(--green-800); font-weight: 650; }
+.run-context-bar.warning { background: #fff9ef; color: #7a5720; }
+.run-context-bar.warning svg { color: #a66c16; }
 .global-error { display: flex; align-items: center; gap: 9px; padding: 10px 18px; background: #fff0ed; color: #8c302b; border-bottom: 1px solid #efcbc6; font-size: 13px; }
 .global-error button { margin-left: auto; border: 0; background: transparent; text-decoration: underline; cursor: pointer; }
 
-.thread-root, .thread-viewport { min-height: 0; height: 100%; }
+.thread-root { min-height: 0; flex: 1; }
+.thread-viewport { min-height: 0; height: 100%; }
 .thread-viewport { overflow-y: auto; scroll-behavior: smooth; padding: 0 24px; }
 .thread-viewport > div:not(.thread-footer) { max-width: 890px; margin-left: auto; margin-right: auto; }
 .welcome-panel { display: flex; align-items: center; flex-direction: column; padding: 8vh 0 160px; text-align: center; }
@@ -201,6 +212,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .sidebar { position: absolute; inset: 0 auto 0 0; z-index: 10; box-shadow: 12px 0 30px rgba(24,53,35,.15); }
   .suggestion-grid { grid-template-columns: 1fr; }
   .topbar-left span { display: none; }
+  .run-context-bar .authoritative-result { margin-left: 0; }
 }
 
 @media (max-height: 690px) {

@@ -52,6 +52,12 @@ pub struct PublicSettings {
     pub api_key_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct PendingRun {
+    pub run_id: String,
+    pub thread_id: String,
+}
+
 impl Database {
     pub async fn open(app_data_dir: &Path) -> AppResult<Self> {
         std::fs::create_dir_all(app_data_dir)
@@ -254,22 +260,67 @@ impl Database {
         request_id: &str,
         thread_id: &str,
         status: &str,
+        server_context: &str,
     ) -> AppResult<()> {
         let timestamp = now();
         sqlx::query(
-            "INSERT INTO runs(run_id, request_id, thread_id, status, created_at, updated_at) \
-             VALUES(?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(request_id) DO UPDATE SET run_id = excluded.run_id, status = excluded.status, updated_at = excluded.updated_at",
+            "INSERT INTO runs(run_id, request_id, thread_id, status, server_context, created_at, updated_at) \
+             VALUES(?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(request_id) DO UPDATE SET run_id = excluded.run_id, status = excluded.status, \
+             server_context = excluded.server_context, updated_at = excluded.updated_at",
         )
         .bind(run_id)
         .bind(request_id)
         .bind(thread_id)
         .bind(status)
+        .bind(server_context)
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn update_run_context(&self, run_id: &str, server_context: &str) -> AppResult<()> {
+        sqlx::query("UPDATE runs SET server_context = ?, updated_at = ? WHERE run_id = ?")
+            .bind(server_context)
+            .bind(now())
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_run_status(&self, run_id: &str, status: &str) -> AppResult<()> {
+        sqlx::query("UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?")
+            .bind(status)
+            .bind(now())
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn latest_run_context(&self, thread_id: &str) -> AppResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT server_context FROM runs WHERE thread_id = ? AND server_context IS NOT NULL \
+             AND server_context != '' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_pending_runs(&self) -> AppResult<Vec<PendingRun>> {
+        sqlx::query_as::<_, PendingRun>(
+            "SELECT run_id, thread_id FROM runs \
+             WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted') \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn update_run_progress(
@@ -488,6 +539,18 @@ mod migration_tests {
             .await
             .expect("insert test data");
         let legacy_checksum = decode_hex(V1_LEGACY_CRLF_CHECKSUM);
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 2")
+            .execute(&database.pool)
+            .await
+            .expect("simulate published v1 migration state");
+        sqlx::query("DROP INDEX IF EXISTS idx_runs_status_updated")
+            .execute(&database.pool)
+            .await
+            .expect("remove v2 index");
+        sqlx::query("ALTER TABLE runs DROP COLUMN server_context")
+            .execute(&database.pool)
+            .await
+            .expect("remove v2 column");
         sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
             .bind(legacy_checksum)
             .execute(&database.pool)
@@ -502,6 +565,12 @@ mod migration_tests {
                 .await
                 .expect("read repaired checksum");
         assert_eq!(checksum, V1_LF_CHECKSUM);
+        let latest_version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&repaired.pool)
+                .await
+                .expect("read latest migration");
+        assert_eq!(latest_version, 2);
         assert_eq!(
             repaired
                 .setting("migration_test")
@@ -516,6 +585,48 @@ mod migration_tests {
             .count();
         assert_eq!(backup_count, 1);
         drop(repaired);
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
+    async fn persists_server_context_and_finds_only_unfinished_runs() {
+        let root = std::env::temp_dir().join(format!("daoxin-run-context-test-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        let thread = database.create_thread().await.expect("create thread");
+        let context = r#"{"protocolVersion":"1.1","modelSpec":"provider:model"}"#;
+        database
+            .insert_run("run-1", "request-1", &thread.id, "pending", context)
+            .await
+            .expect("insert pending run");
+
+        let pending = database
+            .list_pending_runs()
+            .await
+            .expect("list pending runs");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_id, "run-1");
+        assert_eq!(
+            database
+                .latest_run_context(&thread.id)
+                .await
+                .expect("read context")
+                .as_deref(),
+            Some(context)
+        );
+
+        database
+            .update_run_progress("run-1", "completed", None, "answer", None, true)
+            .await
+            .expect("complete run");
+        assert!(
+            database
+                .list_pending_runs()
+                .await
+                .expect("list completed runs")
+                .is_empty()
+        );
+        database.pool.close().await;
         drop(database);
         remove_test_directory(&root).await;
     }
