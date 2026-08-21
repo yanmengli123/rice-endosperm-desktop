@@ -84,9 +84,11 @@ export function createYuxiAdapter(
       let accumulatedText = "";
 
       channel.onmessage = (event) => queue.push(event);
-      const invocation = sendMessage(request, channel)
-        .then(() => queue.close())
-        .catch((error) => queue.fail(normalizeCommandError(error)));
+      const invocation = sendMessage(request, channel);
+      void invocation.then(
+        () => queue.close(),
+        (error) => queue.fail(normalizeCommandError(error)),
+      );
 
       const abort = () => {
         void cancelRun(request.requestId, activeRunId)
@@ -112,7 +114,11 @@ export function createYuxiAdapter(
             yield { content: [{ type: "text", text: accumulatedText }] };
           }
         }
-        await invocation;
+        const completion = await invocation;
+        if (completion.text !== accumulatedText) {
+          accumulatedText = completion.text;
+          yield { content: [{ type: "text", text: accumulatedText }] };
+        }
         callbacks.onRunState?.({ runId: activeRunId, status: "completed" });
         callbacks.onCompleted?.();
       } catch (error) {

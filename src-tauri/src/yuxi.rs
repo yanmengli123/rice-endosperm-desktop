@@ -259,36 +259,57 @@ fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError 
     }
 }
 
-pub fn progress_text(value: &Value, current: &str) -> Option<String> {
-    let payload = value.get("payload")?;
-    if let Some(response) = payload
-        .get("chunk")
-        .and_then(|chunk| chunk.get("response"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-    {
-        return Some(response.to_owned());
-    }
+#[derive(Default)]
+pub struct ProgressText {
+    message_id: Option<String>,
+    text: String,
+}
 
-    let items = payload.get("items")?.as_array()?;
-    for item in items.iter().rev() {
-        if let Some(response) = item
-            .get("response")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            return Some(response.to_owned());
+impl ProgressText {
+    pub fn apply(&mut self, value: &Value) -> Option<String> {
+        let payload = value.get("payload")?;
+        let chunks: Vec<&Value> =
+            if let Some(items) = payload.get("items").and_then(Value::as_array) {
+                items.iter().collect()
+            } else {
+                payload.get("chunk").into_iter().collect()
+            };
+
+        let mut changed = false;
+        for chunk in chunks {
+            let stream_event = chunk.get("stream_event");
+            let semantic_delta = stream_event
+                .filter(|event| event.get("type").and_then(Value::as_str) == Some("message_delta"))
+                .and_then(|event| event.get("content").and_then(Value::as_str))
+                .filter(|content| !content.is_empty());
+
+            if let Some(delta) = semantic_delta {
+                let incoming_message_id = stream_event
+                    .and_then(|event| event.get("message_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                if incoming_message_id != self.message_id.as_deref() {
+                    self.message_id = incoming_message_id.map(str::to_owned);
+                    self.text.clear();
+                }
+                self.text.push_str(delta);
+                changed = true;
+                continue;
+            }
+
+            if stream_event.is_none()
+                && let Some(delta) = chunk
+                    .get("response")
+                    .and_then(Value::as_str)
+                    .filter(|content| !content.is_empty())
+            {
+                self.text.push_str(delta);
+                changed = true;
+            }
         }
-        let Some(stream_event) = item.get("stream_event") else {
-            continue;
-        };
-        if stream_event.get("type").and_then(Value::as_str) == Some("message_delta")
-            && let Some(delta) = stream_event.get("content").and_then(Value::as_str)
-        {
-            return Some(format!("{current}{delta}"));
-        }
+
+        changed.then(|| self.text.clone())
     }
-    None
 }
 
 pub fn terminal_status(value: &Value) -> Option<&str> {
@@ -342,18 +363,37 @@ mod tests {
 
     use crate::error::AppError;
 
-    use super::{connection_error_for_gateway, final_output, progress_text, terminal_status};
+    use super::{ProgressText, connection_error_for_gateway, final_output, terminal_status};
 
     #[test]
-    fn extracts_cumulative_and_delta_text() {
-        let cumulative = json!({"payload": {"items": [{"response": "水稻胚乳"}]}});
-        assert_eq!(progress_text(&cumulative, "").as_deref(), Some("水稻胚乳"));
+    fn groups_deltas_by_message_and_ignores_duplicate_legacy_response() {
+        let mut progress = ProgressText::default();
+        let first = json!({"payload": {"items": [{
+            "response": "水稻",
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "水稻"}
+        }]}});
+        assert_eq!(progress.apply(&first).as_deref(), Some("水稻"));
 
-        let delta = json!({"payload": {"items": [{"stream_event": {"type": "message_delta", "content": "形成"}}]}});
-        assert_eq!(
-            progress_text(&delta, "水稻胚乳").as_deref(),
-            Some("水稻胚乳形成")
-        );
+        let second = json!({"payload": {"chunk": {
+            "response": "胚乳",
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "胚乳"}
+        }}});
+        assert_eq!(progress.apply(&second).as_deref(), Some("水稻胚乳"));
+
+        let next_message = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-2", "content": "最终回答"}
+        }}});
+        assert_eq!(progress.apply(&next_message).as_deref(), Some("最终回答"));
+    }
+
+    #[test]
+    fn excludes_reasoning_and_tool_events_from_visible_progress() {
+        let mut progress = ProgressText::default();
+        let reasoning = json!({"payload": {"items": [
+            {"stream_event": {"type": "message_delta", "message_id": "message-1", "reasoning_content": "内部思考"}},
+            {"stream_event": {"type": "tool_call", "message_id": "message-1", "name": "query_knowledge_scope"}}
+        ]}});
+        assert_eq!(progress.apply(&reasoning), None);
     }
 
     #[test]
