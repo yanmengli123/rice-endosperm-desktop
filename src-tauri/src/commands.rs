@@ -15,7 +15,7 @@ use crate::{
     database::{LocalMessage, PublicSettings, ThreadSummary},
     error::{AppError, AppResult, CommandError},
     state::AppState,
-    yuxi::{RunResult, progress_text, terminal_status},
+    yuxi::{ProgressText, RunResult, terminal_status},
 };
 
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
@@ -282,6 +282,7 @@ async fn send_message_inner(
     )?;
 
     let mut accumulated = String::new();
+    let mut progress_text = ProgressText::default();
     let mut last_event_id: Option<String> = None;
     let mut terminal_received = false;
 
@@ -327,7 +328,11 @@ async fn send_message_inner(
                     }
                     let value = serde_json::from_str::<Value>(&event.data)
                         .map_err(|error| AppError::Protocol(error.to_string()))?;
-                    if let Some(text) = progress_text(&value, &accumulated) {
+                    let belongs_to_parent_thread = value
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|thread_id| thread_id == created.thread_id);
+                    if belongs_to_parent_thread && let Some(text) = progress_text.apply(&value) {
                         accumulated = text;
                         state
                             .database
@@ -382,11 +387,7 @@ async fn send_message_inner(
         &cancellation,
     )
     .await?;
-    let final_text = if final_result.output.is_empty() {
-        accumulated
-    } else {
-        final_result.output
-    };
+    let final_text = final_result.output;
 
     match final_result.status.as_str() {
         "completed" => {
@@ -503,12 +504,20 @@ async fn wait_for_result(
     run_id: &str,
     cancellation: &CancellationToken,
 ) -> AppResult<RunResult> {
+    let mut completed_without_output = 0;
     for _ in 0..400 {
         let result = tokio::select! {
             _ = cancellation.cancelled() => return cancel_local_run(state, run_id, "").await,
             result = state.yuxi.result(gateway_url, agent_slug(), api_key, run_id) => result?,
         };
-        if is_terminal(&result.status) {
+        if result.status == "completed" && result.output.is_empty() {
+            completed_without_output += 1;
+            if completed_without_output >= 4 {
+                return Err(AppError::Protocol(
+                    "Yuxi 运行已完成，但最终回答尚未生成，请稍后重试".into(),
+                ));
+            }
+        } else if is_terminal(&result.status) {
             return Ok(result);
         }
         tokio::select! {
