@@ -18,7 +18,9 @@ export function RunContextBar({ context }: Props) {
     .map((member) => member.kbName || member.kbId)
     .filter(Boolean)
     .join("、");
-  const hasRetrievalError = Boolean(latest?.errorCode || latest?.status === "failed");
+  const hasRetrievalError = Boolean(
+    latest?.errorCode || latest?.status?.toLowerCase() === "failed",
+  );
 
   return (
     <section className={`run-context-bar ${hasRetrievalError ? "warning" : ""}`} aria-label="服务端运行上下文">

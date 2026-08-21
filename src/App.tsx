@@ -89,22 +89,39 @@ export default function App() {
 
   useEffect(() => {
     if (!settings?.hasApiKey || recoveryPending === 0) return;
-    const timeout = window.setTimeout(() => {
-      void syncPendingRuns()
-        .then(async (recovery) => {
-          setRecoveryPending(recovery.pending);
-          if (recovery.recovered > 0 || recovery.failed > 0) {
-            await refreshThreads();
-            if (activeThreadId) await openThread(activeThreadId);
-          }
-          if (recovery.failed > 0 && recovery.lastError) setError(recovery.lastError);
-        })
-        .catch((reason) => {
-          setError(normalizeCommandError(reason).message);
+    let cancelled = false;
+    let timeout: number | undefined;
+
+    const poll = async () => {
+      try {
+        const recovery = await syncPendingRuns();
+        if (cancelled) return;
+        setRecoveryPending(recovery.pending);
+        if (recovery.recovered > 0 || recovery.failed > 0) {
+          await refreshThreads();
+          if (activeThreadId) await openThread(activeThreadId);
+        }
+        if (recovery.failed > 0 && recovery.lastError) setError(recovery.lastError);
+        if (recovery.pending > 0 && !cancelled) {
+          timeout = window.setTimeout(() => void poll(), 4000);
+        }
+      } catch (reason) {
+        if (cancelled) return;
+        const normalized = normalizeCommandError(reason);
+        setError(normalized.message);
+        if (normalized.retryable) {
+          timeout = window.setTimeout(() => void poll(), 8000);
+        } else {
           setRecoveryPending(0);
-        });
-    }, 4000);
-    return () => window.clearTimeout(timeout);
+        }
+      }
+    };
+
+    timeout = window.setTimeout(() => void poll(), 4000);
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
   }, [activeThreadId, openThread, recoveryPending, refreshThreads, settings?.hasApiKey]);
 
   async function newThread() {
@@ -147,6 +164,16 @@ export default function App() {
     setRunContext(completion.context);
     void refreshThreads();
   }, [refreshThreads]);
+
+  const handleRunState = useCallback(
+    (state: { runId?: string; status: string; message?: string }) => {
+      setRunState(state);
+      if (state.status === "failed" && state.runId) {
+        setRecoveryPending((current) => Math.max(current, 1));
+      }
+    },
+    [],
+  );
 
   if (loading) {
     return <main className="boot-screen"><img src="/brand-logo.png" alt="" /><LoaderCircle className="spin" /><p>正在启动稻芯智析…</p></main>;
@@ -207,7 +234,7 @@ export default function App() {
             key={`${activeThreadId}-${messages.length}`}
             threadId={activeThreadId}
             messages={messages}
-            onRunState={setRunState}
+            onRunState={handleRunState}
             onCompleted={completed}
           />
         ) : (

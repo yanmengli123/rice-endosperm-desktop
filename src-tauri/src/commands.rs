@@ -19,6 +19,7 @@ use crate::{
 };
 
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
+const MAX_EMPTY_COMPLETED_POLLS: i64 = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,6 +273,30 @@ async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> 
                     )
                     .await?;
                 summary.recovered += 1;
+            }
+            "completed" => {
+                let poll_count = state
+                    .database
+                    .record_empty_completed_poll(&pending_run.run_id)
+                    .await?;
+                if poll_count >= MAX_EMPTY_COMPLETED_POLLS {
+                    let message = "Yuxi 运行已完成，但服务端未返回最终回答；任务不会重复提交，请检查服务端 Worker 日志";
+                    state
+                        .database
+                        .update_run_progress(
+                            &pending_run.run_id,
+                            "failed",
+                            None,
+                            "",
+                            Some("empty_server_output"),
+                            true,
+                        )
+                        .await?;
+                    summary.failed += 1;
+                    summary.last_error = Some(message.into());
+                } else {
+                    summary.pending += 1;
+                }
             }
             "failed" | "cancelled" | "interrupted" => {
                 state

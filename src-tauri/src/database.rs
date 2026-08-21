@@ -323,6 +323,18 @@ impl Database {
         .map_err(Into::into)
     }
 
+    pub async fn record_empty_completed_poll(&self, run_id: &str) -> AppResult<i64> {
+        sqlx::query_scalar(
+            "UPDATE runs SET status = 'awaiting_output', result_poll_count = result_poll_count + 1, \
+             updated_at = ? WHERE run_id = ? RETURNING result_poll_count",
+        )
+        .bind(now())
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn update_run_progress(
         &self,
         run_id: &str,
@@ -539,7 +551,7 @@ mod migration_tests {
             .await
             .expect("insert test data");
         let legacy_checksum = decode_hex(V1_LEGACY_CRLF_CHECKSUM);
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 2")
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 2")
             .execute(&database.pool)
             .await
             .expect("simulate published v1 migration state");
@@ -551,6 +563,10 @@ mod migration_tests {
             .execute(&database.pool)
             .await
             .expect("remove v2 column");
+        sqlx::query("ALTER TABLE runs DROP COLUMN result_poll_count")
+            .execute(&database.pool)
+            .await
+            .expect("remove v3 column");
         sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
             .bind(legacy_checksum)
             .execute(&database.pool)
@@ -570,7 +586,7 @@ mod migration_tests {
                 .fetch_one(&repaired.pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest_version, 2);
+        assert_eq!(latest_version, 3);
         assert_eq!(
             repaired
                 .setting("migration_test")
@@ -613,6 +629,29 @@ mod migration_tests {
                 .expect("read context")
                 .as_deref(),
             Some(context)
+        );
+
+        assert_eq!(
+            database
+                .record_empty_completed_poll("run-1")
+                .await
+                .expect("record empty result"),
+            1
+        );
+        assert_eq!(
+            database
+                .record_empty_completed_poll("run-1")
+                .await
+                .expect("record second empty result"),
+            2
+        );
+        assert_eq!(
+            database
+                .list_pending_runs()
+                .await
+                .expect("list awaiting-output run")
+                .len(),
+            1
         );
 
         database

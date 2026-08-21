@@ -11,6 +11,7 @@ describe("normalizeCommandError", () => {
 
     expect(result.message).toBe("API Key 无效或已停用");
     expect(result.code).toBe("unauthorized");
+    expect(result.retryable).toBe(false);
   });
 
   it("does not serialize arbitrary objects into the user message", () => {
