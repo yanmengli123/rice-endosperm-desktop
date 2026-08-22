@@ -202,33 +202,48 @@ impl YuxiClient {
         request_id: &str,
     ) -> AppResult<CreatedRun> {
         let base = validate_gateway_url(gateway_url)?;
-        let response = self
-            .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
-            .header("X-Client-Request-ID", request_id)
-            .json(&CreateRunRequest {
-                agent_slug,
-                messages: [InputMessage {
-                    role: "user",
-                    content: question,
-                }],
-                thread_id: yuxi_thread_id,
-                request_id,
-                async_mode: true,
-            })
-            .timeout(Duration::from_secs(45))
-            .send()
-            .await?;
-        let response = ensure_success(response).await?;
-        let created = response
-            .json::<CreatedRun>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        if created.run_id.is_empty() || created.thread_id.is_empty() {
-            return Err(AppError::Protocol(
-                "创建运行响应缺少 run_id 或 thread_id".into(),
-            ));
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let response = self
+                .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
+                .header("X-Client-Request-ID", request_id)
+                .json(&CreateRunRequest {
+                    agent_slug,
+                    messages: [InputMessage {
+                        role: "user",
+                        content: question,
+                    }],
+                    thread_id: yuxi_thread_id,
+                    request_id,
+                    async_mode: true,
+                })
+                .timeout(Duration::from_secs(45))
+                .send()
+                .await;
+            match response.map_err(AppError::from) {
+                Ok(response) => {
+                    let response = ensure_success(response).await?;
+                    let created = response
+                        .json::<CreatedRun>()
+                        .await
+                        .map_err(|error| AppError::Protocol(error.to_string()))?;
+                    if created.run_id.is_empty() || created.thread_id.is_empty() {
+                        return Err(AppError::Protocol(
+                            "创建运行响应缺少 run_id 或 thread_id".into(),
+                        ));
+                    }
+                    return Ok(created);
+                }
+                // 超时/连接类失败时服务端大概率已建 run；借助 request_id 幂等
+                // 重试一次，避免远端孤儿 run 永久脱离本地对账。
+                Err(error) if attempt == 0 && connection_error_is_retryable(&error) => {
+                    last_error = Some(error);
+                    sleep(Duration::from_millis(800)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(created)
+        Err(last_error.unwrap_or(AppError::ServiceUnavailable))
     }
 
     pub async fn event_response(
@@ -307,10 +322,14 @@ fn connection_error_is_retryable(error: &AppError) -> bool {
 }
 
 fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError {
+    // Url::host_str() 对 IPv6 返回带方括号的形式（"[::1]"），必须去括号后再比较。
     let is_loopback = Url::parse(gateway_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+        .is_some_and(|host| {
+            let normalized = host.trim_start_matches('[').trim_end_matches(']');
+            matches!(normalized, "127.0.0.1" | "localhost" | "::1")
+        });
     if is_loopback && connection_error_is_retryable(&error) {
         AppError::LocalServiceUnavailable
     } else {

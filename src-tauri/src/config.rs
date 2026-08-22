@@ -29,7 +29,12 @@ pub fn validate_gateway_url(value: &str) -> AppResult<String> {
         return Err(AppError::InvalidGateway("只能填写网关根地址".into()));
     }
 
-    let host = url.host_str().unwrap_or_default();
+    // Url::host_str() 对 IPv6 返回带方括号的形式（"[::1]"），去括号后再比较。
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     let local_http = url.scheme() == "http" && matches!(host, "127.0.0.1" | "localhost" | "::1");
     if url.scheme() != "https" && !local_http {
         return Err(AppError::InvalidGateway(
@@ -51,6 +56,7 @@ mod tests {
             "https://api.example.cn"
         );
         assert!(validate_gateway_url("http://127.0.0.1:9088").is_ok());
+        assert!(validate_gateway_url("http://[::1]:9088").is_ok());
     }
 
     #[test]

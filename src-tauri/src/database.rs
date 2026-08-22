@@ -198,21 +198,18 @@ impl Database {
         content: &str,
     ) -> AppResult<()> {
         let mut transaction = self.pool.begin().await?;
-        let next_position: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(position), 0) + 1 FROM messages WHERE thread_id = ?",
-        )
-        .bind(thread_id)
-        .fetch_one(&mut *transaction)
-        .await?;
+        // position 在 INSERT 内用标量子查询计算：单条语句在 SQLite 写锁下
+        // 原生原子，避免"先查 MAX 再插入"在并发下撞 UNIQUE(thread_id, position)。
         sqlx::query(
-            "INSERT INTO messages(id, thread_id, role, content, position, created_at) VALUES(?, ?, ?, ?, ?, ?) \
+            "INSERT INTO messages(id, thread_id, role, content, position, created_at) \
+             VALUES(?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ?), 0) + 1, ?) \
              ON CONFLICT(id) DO UPDATE SET content = excluded.content",
         )
         .bind(id)
         .bind(thread_id)
         .bind(role)
         .bind(content)
-        .bind(next_position)
+        .bind(thread_id)
         .bind(now())
         .execute(&mut *transaction)
         .await?;
@@ -292,12 +289,16 @@ impl Database {
     }
 
     pub async fn update_run_status(&self, run_id: &str, status: &str) -> AppResult<()> {
-        sqlx::query("UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?")
-            .bind(status)
-            .bind(now())
-            .bind(run_id)
-            .execute(&self.pool)
-            .await?;
+        // 镜像服务端非终态时不得覆盖本地已写入的终态（对账与存活流并发的守卫）。
+        sqlx::query(
+            "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ? \
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+        )
+        .bind(status)
+        .bind(now())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -345,9 +346,12 @@ impl Database {
         terminal: bool,
     ) -> AppResult<()> {
         let timestamp = now();
+        // 非终态进度写入不得降级已终态的行：sync_pending_runs 与存活流可能
+        // 并发更新同一 run，否则会出现 completed 被改回 running 的僵尸状态。
         sqlx::query(
             "UPDATE runs SET status = ?, last_event_id = COALESCE(?, last_event_id), accumulated_text = ?, \
-             error_code = ?, updated_at = ?, finished_at = CASE WHEN ? THEN ? ELSE finished_at END WHERE run_id = ?",
+             error_code = ?, updated_at = ?, finished_at = CASE WHEN ? THEN ? ELSE finished_at END \
+             WHERE run_id = ? AND (? OR status NOT IN ('completed', 'failed', 'cancelled', 'interrupted'))",
         )
         .bind(status)
         .bind(event_id)
@@ -357,6 +361,7 @@ impl Database {
         .bind(terminal)
         .bind(&timestamp)
         .bind(run_id)
+        .bind(!terminal)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -534,7 +539,9 @@ fn uppercase_hex(bytes: &[u8]) -> String {
 }
 
 fn now() -> String {
-    Utc::now().to_rfc3339()
+    // 统一带毫秒：to_rfc3339() 在纳秒为 0 时省略小数秒，字典序会在同一秒内
+    // 颠倒（'+' < '.'），影响 latest_run_context / list_threads 的排序。
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 #[cfg(test)]

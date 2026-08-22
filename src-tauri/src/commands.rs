@@ -13,6 +13,7 @@ use crate::{
     config::{agent_slug, validate_gateway_url},
     credentials::{api_key_hint, validate_api_key},
     database::{LocalMessage, PublicSettings, ThreadSummary},
+    diagnostics,
     error::{AppError, AppResult, CommandError},
     state::AppState,
     yuxi::{ProgressText, RunResult, ServerRunContext, terminal_status},
@@ -50,7 +51,13 @@ pub struct PendingRunSync {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+// rename_all 只作用于 enum 变体名；字段名必须用 rename_all_fields 才会输出
+// camelCase，否则前端读到的 runId/eventId 恒为 undefined。
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum RunEvent {
     Started {
         run_id: String,
@@ -470,8 +477,19 @@ async fn send_message_inner(
                     if !event.id.is_empty() {
                         last_event_id = Some(event.id.clone());
                     }
-                    let value = serde_json::from_str::<Value>(&event.data)
-                        .map_err(|error| AppError::Protocol(error.to_string()))?;
+                    // 心跳或代理注入的非 JSON 帧只跳过该帧，不终止整次对话；
+                    // 终态一致性由事件流与结果轮询共同兜底。
+                    let value = match serde_json::from_str::<Value>(&event.data) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            diagnostics::log(
+                                "WARN",
+                                "sse_frame_skipped",
+                                &format!("run={}: {error}", created.run_id),
+                            );
+                            continue;
+                        }
+                    };
                     let belongs_to_parent_thread = value
                         .get("thread_id")
                         .and_then(Value::as_str)
@@ -529,6 +547,7 @@ async fn send_message_inner(
         &api_key,
         &created.run_id,
         &cancellation,
+        &accumulated,
     )
     .await?;
     persist_run_context(state, &created.run_id, &final_result.context).await?;
@@ -665,11 +684,14 @@ async fn wait_for_result(
     api_key: &SecretString,
     run_id: &str,
     cancellation: &CancellationToken,
+    accumulated_text: &str,
 ) -> AppResult<RunResult> {
     let mut completed_without_output = 0;
     for _ in 0..400 {
         let result = tokio::select! {
-            _ = cancellation.cancelled() => return cancel_local_run(state, run_id, "").await,
+            _ = cancellation.cancelled() => {
+                return cancel_local_run(state, run_id, accumulated_text).await
+            }
             result = state.yuxi.result(gateway_url, agent_slug(), api_key, run_id) => result?,
         };
         if result.status == "completed" && result.output.is_empty() {
@@ -683,7 +705,9 @@ async fn wait_for_result(
             return Ok(result);
         }
         tokio::select! {
-            _ = cancellation.cancelled() => return cancel_local_run(state, run_id, "").await,
+            _ = cancellation.cancelled() => {
+                return cancel_local_run(state, run_id, accumulated_text).await
+            }
             _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
         }
     }
@@ -693,9 +717,12 @@ async fn wait_for_result(
 }
 
 async fn cancel_local_run<T>(state: &AppState, run_id: &str, text: &str) -> AppResult<T> {
+    // 本地只写非终态 cancel_requested：服务端可能已经完成（取消晚到），终态
+    // 一律交由 sync_pending_runs 对账权威结果。提前写终态 cancelled 会让该
+    // 行永久退出对账，服务端已生成的完整回答就此失联。
     let _ = state
         .database
-        .update_run_progress(run_id, "cancelled", None, text, None, true)
+        .update_run_progress(run_id, "cancel_requested", None, text, None, false)
         .await;
     Err(AppError::Cancelled)
 }
@@ -744,7 +771,43 @@ fn is_reasoning_protocol_failure(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SendMessageRequest, is_reasoning_protocol_failure, validate_send_request};
+    use super::{
+        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, validate_send_request,
+    };
+
+    #[test]
+    fn run_events_serialize_fields_as_camel_case() {
+        // 前端 RunEvent 类型按 camelCase 读取（event.runId）；字段名若保持
+        // snake_case，前端将拿到 undefined 且恢复轮询永不武装。
+        let started = serde_json::to_value(RunEvent::Started {
+            run_id: "run-1".into(),
+            thread_id: "thread-1".into(),
+            request_id: "request-1".into(),
+        })
+        .expect("serialize started");
+        assert_eq!(started["type"], "started");
+        assert_eq!(started["runId"], "run-1");
+        assert_eq!(started["threadId"], "thread-1");
+        assert_eq!(started["requestId"], "request-1");
+
+        let text = serde_json::to_value(RunEvent::Text {
+            text: "回答".into(),
+            event_id: Some("1-2".into()),
+        })
+        .expect("serialize text");
+        assert_eq!(text["type"], "text");
+        assert_eq!(text["eventId"], "1-2");
+
+        let done = serde_json::to_value(RunEvent::Done {
+            run_id: "run-1".into(),
+            status: "completed".into(),
+            text: "回答".into(),
+            context: Default::default(),
+        })
+        .expect("serialize done");
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["runId"], "run-1");
+    }
 
     #[test]
     fn accepts_gateway_compatible_request_ids() {

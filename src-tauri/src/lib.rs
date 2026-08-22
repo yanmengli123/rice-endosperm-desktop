@@ -20,6 +20,13 @@ use state::AppState;
 pub fn run() {
     diagnostics::install_panic_hook();
     let result = tauri::Builder::default()
+        // 单实例保护必须最先注册：双实例并发会竞争 Stronghold 快照
+        // （后写者胜出可能丢 Key）并重复触发更新器。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_process::init())

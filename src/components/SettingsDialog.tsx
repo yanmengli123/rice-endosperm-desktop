@@ -30,15 +30,25 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   }
 
   async function updateApp() {
-    await run(async () => {
+    setBusy(true);
+    setStatus("");
+    try {
       const update = await check();
       if (!update) {
         setStatus("当前已是最新版本");
         return;
       }
       await update.downloadAndInstall();
+      // 先给出可见提示再重启：relaunch 会立刻结束进程，成功提示放在
+      // relaunch 之后用户永远看不到，容易误以为更新失败。
+      setStatus("更新已安装，正在重启…");
+      await new Promise((resolve) => setTimeout(resolve, 800));
       await relaunch();
-    }, "更新已安装，正在重启");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function removeCredential() {
