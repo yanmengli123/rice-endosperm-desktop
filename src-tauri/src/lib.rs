@@ -10,8 +10,9 @@ mod yuxi;
 use tauri::Manager;
 
 use commands::{
-    cancel_run, create_thread, delete_api_key, delete_thread, get_public_settings, list_threads,
-    load_messages, rename_thread, save_connection, send_message, test_connection,
+    cancel_run, create_thread, delete_api_key, delete_thread, get_public_settings,
+    get_thread_run_context, list_threads, load_messages, rename_thread, save_connection,
+    send_message, sync_pending_runs, test_connection,
 };
 use state::AppState;
 
@@ -19,6 +20,13 @@ use state::AppState;
 pub fn run() {
     diagnostics::install_panic_hook();
     let result = tauri::Builder::default()
+        // 单实例保护必须最先注册：双实例并发会竞争 Stronghold 快照
+        // （后写者胜出可能丢 Key）并重复触发更新器。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_process::init())
@@ -42,6 +50,8 @@ pub fn run() {
             create_thread,
             list_threads,
             load_messages,
+            get_thread_run_context,
+            sync_pending_runs,
             rename_thread,
             delete_thread,
             send_message,

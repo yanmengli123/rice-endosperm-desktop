@@ -27,6 +27,74 @@ pub struct CreatedRun {
     pub thread_id: String,
     pub request_id: String,
     pub status: String,
+    #[serde(default)]
+    pub run_context: ServerRunContext,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct ServerRunContext {
+    pub protocol_version: Option<String>,
+    pub model_spec: Option<String>,
+    #[serde(default)]
+    pub knowledge_scope: KnowledgeScopeSummary,
+    #[serde(default)]
+    pub knowledge_retrievals: Vec<KnowledgeRetrievalSummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct KnowledgeScopeSummary {
+    pub scope_id: Option<String>,
+    pub scope_version: Option<i64>,
+    pub scope_mode: Option<String>,
+    pub knowledge_strategy: Option<String>,
+    pub retrieval_mode: Option<String>,
+    #[serde(default)]
+    pub allow_web: bool,
+    #[serde(default)]
+    pub kb_count: usize,
+    #[serde(default)]
+    pub members: Vec<KnowledgeScopeMember>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct KnowledgeScopeMember {
+    pub kb_id: Option<String>,
+    pub kb_name: Option<String>,
+    pub kb_type: Option<String>,
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub document_enabled: bool,
+    #[serde(default)]
+    pub graph_enabled: bool,
+    #[serde(default)]
+    pub structured_enabled: bool,
+    pub included_via: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct KnowledgeRetrievalSummary {
+    pub retrieval_id: Option<String>,
+    pub status: Option<String>,
+    pub intent: Option<String>,
+    pub query_mode: Option<String>,
+    pub planner_version: Option<String>,
+    pub entity_resolver_version: Option<String>,
+    pub retrieval_orchestrator_version: Option<String>,
+    pub claim_validator_version: Option<String>,
+    pub contract_schema_version: Option<String>,
+    #[serde(default)]
+    pub source_status: Vec<Value>,
+    pub returned_relation_count: Option<i64>,
+    pub returned_claim_count: Option<i64>,
+    pub returned_evidence_count: Option<i64>,
+    #[serde(default)]
+    pub warnings: Vec<Value>,
+    pub error_code: Option<String>,
+    pub finished_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +102,8 @@ pub struct RunResult {
     pub status: String,
     pub output: String,
     pub error: Option<String>,
+    pub error_code: Option<String>,
+    pub context: ServerRunContext,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,33 +202,48 @@ impl YuxiClient {
         request_id: &str,
     ) -> AppResult<CreatedRun> {
         let base = validate_gateway_url(gateway_url)?;
-        let response = self
-            .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
-            .header("X-Client-Request-ID", request_id)
-            .json(&CreateRunRequest {
-                agent_slug,
-                messages: [InputMessage {
-                    role: "user",
-                    content: question,
-                }],
-                thread_id: yuxi_thread_id,
-                request_id,
-                async_mode: true,
-            })
-            .timeout(Duration::from_secs(45))
-            .send()
-            .await?;
-        let response = ensure_success(response).await?;
-        let created = response
-            .json::<CreatedRun>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        if created.run_id.is_empty() || created.thread_id.is_empty() {
-            return Err(AppError::Protocol(
-                "创建运行响应缺少 run_id 或 thread_id".into(),
-            ));
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let response = self
+                .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
+                .header("X-Client-Request-ID", request_id)
+                .json(&CreateRunRequest {
+                    agent_slug,
+                    messages: [InputMessage {
+                        role: "user",
+                        content: question,
+                    }],
+                    thread_id: yuxi_thread_id,
+                    request_id,
+                    async_mode: true,
+                })
+                .timeout(Duration::from_secs(45))
+                .send()
+                .await;
+            match response.map_err(AppError::from) {
+                Ok(response) => {
+                    let response = ensure_success(response).await?;
+                    let created = response
+                        .json::<CreatedRun>()
+                        .await
+                        .map_err(|error| AppError::Protocol(error.to_string()))?;
+                    if created.run_id.is_empty() || created.thread_id.is_empty() {
+                        return Err(AppError::Protocol(
+                            "创建运行响应缺少 run_id 或 thread_id".into(),
+                        ));
+                    }
+                    return Ok(created);
+                }
+                // 超时/连接类失败时服务端大概率已建 run；借助 request_id 幂等
+                // 重试一次，避免远端孤儿 run 永久脱离本地对账。
+                Err(error) if attempt == 0 && connection_error_is_retryable(&error) => {
+                    last_error = Some(error);
+                    sleep(Duration::from_millis(800)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(created)
+        Err(last_error.unwrap_or(AppError::ServiceUnavailable))
     }
 
     pub async fn event_response(
@@ -202,18 +287,7 @@ impl YuxiClient {
             .json::<Value>()
             .await
             .map_err(|error| AppError::Protocol(error.to_string()))?;
-        Ok(RunResult {
-            status: value
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned(),
-            output: final_output(&value),
-            error: value
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
+        Ok(parse_run_result(&value))
     }
 
     pub async fn cancel_run(
@@ -248,10 +322,14 @@ fn connection_error_is_retryable(error: &AppError) -> bool {
 }
 
 fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError {
+    // Url::host_str() 对 IPv6 返回带方括号的形式（"[::1]"），必须去括号后再比较。
     let is_loopback = Url::parse(gateway_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+        .is_some_and(|host| {
+            let normalized = host.trim_start_matches('[').trim_end_matches(']');
+            matches!(normalized, "127.0.0.1" | "localhost" | "::1")
+        });
     if is_loopback && connection_error_is_retryable(&error) {
         AppError::LocalServiceUnavailable
     } else {
@@ -336,6 +414,35 @@ fn final_output(value: &Value) -> String {
         .to_owned()
 }
 
+fn parse_run_result(value: &Value) -> RunResult {
+    RunResult {
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        output: final_output(value),
+        error: value
+            .get("error")
+            .and_then(|error| {
+                error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+            })
+            .map(str::to_owned),
+        error_code: value
+            .pointer("/error/type")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/error/code").and_then(Value::as_str))
+            .map(str::to_owned),
+        context: value
+            .get("run_context")
+            .cloned()
+            .and_then(|context| serde_json::from_value(context).ok())
+            .unwrap_or_default(),
+    }
+}
+
 async fn ensure_success(response: Response) -> AppResult<Response> {
     if response.status().is_success() {
         Ok(response)
@@ -363,7 +470,9 @@ mod tests {
 
     use crate::error::AppError;
 
-    use super::{ProgressText, connection_error_for_gateway, final_output, terminal_status};
+    use super::{
+        ProgressText, connection_error_for_gateway, final_output, parse_run_result, terminal_status,
+    };
 
     #[test]
     fn groups_deltas_by_message_and_ignores_duplicate_legacy_response() {
@@ -405,6 +514,41 @@ mod tests {
         });
         assert_eq!(terminal_status(&value), Some("completed"));
         assert_eq!(final_output(&value), "最终回答");
+    }
+
+    #[test]
+    fn parses_structured_server_error_and_authoritative_run_context() {
+        let result = parse_run_result(&json!({
+            "status": "failed",
+            "error": {"type": "model_error", "message": "服务端模型调用失败"},
+            "run_context": {
+                "protocol_version": "1.1",
+                "model_spec": "minimax-cn:MiniMax-M3",
+                "knowledge_scope": {
+                    "scope_version": 11,
+                    "kb_count": 3,
+                    "members": [{"kb_id": "kb-1", "kb_name": "水稻胚乳发育neo4j"}]
+                },
+                "knowledge_retrievals": [{
+                    "status": "completed",
+                    "returned_claim_count": 11,
+                    "returned_evidence_count": 11
+                }]
+            }
+        }));
+
+        assert_eq!(result.error.as_deref(), Some("服务端模型调用失败"));
+        assert_eq!(result.error_code.as_deref(), Some("model_error"));
+        assert_eq!(result.context.protocol_version.as_deref(), Some("1.1"));
+        assert_eq!(
+            result.context.model_spec.as_deref(),
+            Some("minimax-cn:MiniMax-M3")
+        );
+        assert_eq!(result.context.knowledge_scope.kb_count, 3);
+        assert_eq!(
+            result.context.knowledge_retrievals[0].returned_claim_count,
+            Some(11)
+        );
     }
 
     #[test]

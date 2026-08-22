@@ -32,17 +32,23 @@ impl AppState {
     }
 
     pub fn register_request(&self, request_id: &str) -> AppResult<CancellationToken> {
-        let token = CancellationToken::new();
-        self.active_requests
+        let mut requests = self
+            .active_requests
             .lock()
-            .map_err(|_| AppError::Internal("取消任务状态锁已损坏".into()))?
-            .insert(
-                request_id.to_owned(),
-                ActiveRequest {
-                    cancellation: token.clone(),
-                    run_id: None,
-                },
-            );
+            .map_err(|_| AppError::Internal("取消任务状态锁已损坏".into()))?;
+        if requests.contains_key(request_id) {
+            // 无条件覆盖会让旧请求脱离跟踪：既不能被取消，其 run 行也会被
+            // ON CONFLICT(request_id) 改挂到新 run 上导致远端 run 失联。
+            return Err(AppError::Protocol("相同的请求仍在处理中".into()));
+        }
+        let token = CancellationToken::new();
+        requests.insert(
+            request_id.to_owned(),
+            ActiveRequest {
+                cancellation: token.clone(),
+                run_id: None,
+            },
+        );
         Ok(token)
     }
 

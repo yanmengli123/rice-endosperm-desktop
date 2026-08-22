@@ -13,13 +13,13 @@ import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, Square } from "lucide-react";
 import remarkGfm from "remark-gfm";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
-import type { LocalMessage } from "../types";
+import type { ChatCompletion, LocalMessage } from "../types";
 
 type Props = {
   threadId: string;
   messages: LocalMessage[];
-  onRunState: (state: { runId?: string; status: string; message?: string }) => void;
-  onCompleted: () => void;
+  onRunState: (state: { runId?: string; status: string; message?: string }, threadId: string) => void;
+  onCompleted: (completion: ChatCompletion, threadId: string) => void;
 };
 
 function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
@@ -142,7 +142,13 @@ function Composer() {
 
 function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
   const adapter = useMemo(
-    () => createYuxiAdapter(threadId, { onRunState, onCompleted }),
+    () =>
+      createYuxiAdapter(threadId, {
+        // 附带本组件的 threadId，让上层能区分完成事件来自哪个会话
+        //（切换会话后旧 run 的迟到回调不应污染新会话状态）。
+        onRunState: (state) => onRunState(state, threadId),
+        onCompleted: (completion) => onCompleted(completion, threadId),
+      }),
     [threadId, onRunState, onCompleted],
   );
   const runtime = useLocalRuntime(adapter, {

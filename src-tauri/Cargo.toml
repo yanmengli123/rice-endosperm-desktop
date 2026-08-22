@@ -1,6 +1,6 @@
 [package]
 name = "rice-endosperm-desktop"
-version = "0.1.4"
+version = "0.1.7"
 description = "稻芯智析——水稻胚乳科研智能问答桌面客户端"
 authors = ["Rice Endosperm AI"]
 edition = "2024"
@@ -26,6 +26,7 @@ tauri-plugin-stronghold = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 tokio = { version = "1", features = ["macros", "sync", "time", "rt-multi-thread"] }
 futures-util = "0.3.33"

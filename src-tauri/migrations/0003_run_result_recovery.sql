@@ -1,0 +1,1 @@
+ALTER TABLE runs ADD COLUMN result_poll_count INTEGER NOT NULL DEFAULT 0;

@@ -3,7 +3,9 @@ import type {
   ChatCompletion,
   LocalMessage,
   PublicSettings,
+  PendingRunSync,
   RunEvent,
+  ServerRunContext,
   SendMessageRequest,
   ThreadSummary,
 } from "../types";
@@ -25,6 +27,12 @@ export const listThreads = () => invoke<ThreadSummary[]>("list_threads");
 export const loadMessages = (threadId: string) =>
   invoke<LocalMessage[]>("load_messages", { threadId });
 
+export const getThreadRunContext = (threadId: string) =>
+  invoke<ServerRunContext | null>("get_thread_run_context", { threadId });
+
+export const syncPendingRuns = () =>
+  invoke<PendingRunSync>("sync_pending_runs");
+
 export const renameThread = (threadId: string, title: string) =>
   invoke<void>("rename_thread", { threadId, title });
 
@@ -39,13 +47,24 @@ export const sendMessage = (
 export const cancelRun = (requestId: string, runId?: string) =>
   invoke<void>("cancel_run", { requestId, runId });
 
-export function normalizeCommandError(error: unknown): Error & { code?: string } {
+export function normalizeCommandError(
+  error: unknown,
+): Error & { code?: string; retryable?: boolean; status?: number } {
   if (typeof error === "object" && error !== null && "message" in error) {
-    const commandError = error as { message: unknown; code?: unknown };
+    const commandError = error as {
+      message: unknown;
+      code?: unknown;
+      retryable?: unknown;
+      status?: unknown;
+    };
     const normalized = new Error(String(commandError.message)) as Error & {
       code?: string;
+      retryable?: boolean;
+      status?: number;
     };
     if (typeof commandError.code === "string") normalized.code = commandError.code;
+    if (typeof commandError.retryable === "boolean") normalized.retryable = commandError.retryable;
+    if (typeof commandError.status === "number") normalized.status = commandError.status;
     return normalized;
   }
   return new Error(typeof error === "string" ? error : "发生未知错误");

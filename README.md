@@ -87,8 +87,8 @@ Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.gi
 版本标签触发 GitHub Actions 构建并发布安装包：
 
 ```powershell
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.6
+git push origin v0.1.6
 ```
 
 发布所需更新签名私钥只保存在 GitHub Actions Secrets 中，仓库仅提交公钥。完整流程见 [发布指南](docs/RELEASING.md)。
