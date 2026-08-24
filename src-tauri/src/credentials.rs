@@ -70,13 +70,30 @@ impl CredentialStore {
     pub fn save_api_key(&self, api_key: &str) -> AppResult<()> {
         validate_api_key(api_key)?;
         let vault = self.lock()?;
+        let mut previous = vault
+            .store()
+            .get(API_KEY_RECORD)
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
         vault
             .store()
             .insert(API_KEY_RECORD.to_vec(), api_key.as_bytes().to_vec(), None)
             .map_err(|error| AppError::CredentialStore(error.to_string()))?;
-        vault
-            .save()
-            .map_err(|error| AppError::CredentialStore(error.to_string()))
+        if let Err(save_error) = vault.save() {
+            let rollback = match previous.take() {
+                Some(secret) => vault.store().insert(API_KEY_RECORD.to_vec(), secret, None),
+                None => vault.store().delete(API_KEY_RECORD),
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(AppError::CredentialStore(format!(
+                    "凭证落盘失败且内存回滚失败: {save_error}; {rollback_error}"
+                )));
+            }
+            return Err(AppError::CredentialStore(save_error.to_string()));
+        }
+        if let Some(secret) = previous.as_mut() {
+            secret.zeroize();
+        }
+        Ok(())
     }
 
     pub fn api_key(&self) -> AppResult<SecretString> {
@@ -100,13 +117,29 @@ impl CredentialStore {
 
     pub fn delete_api_key(&self) -> AppResult<()> {
         let vault = self.lock()?;
+        let mut previous = vault
+            .store()
+            .get(API_KEY_RECORD)
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
         vault
             .store()
             .delete(API_KEY_RECORD)
             .map_err(|error| AppError::CredentialStore(error.to_string()))?;
-        vault
-            .save()
-            .map_err(|error| AppError::CredentialStore(error.to_string()))
+        if let Err(save_error) = vault.save() {
+            if let Some(secret) = previous.take()
+                && let Err(rollback_error) =
+                    vault.store().insert(API_KEY_RECORD.to_vec(), secret, None)
+            {
+                return Err(AppError::CredentialStore(format!(
+                    "凭证删除落盘失败且内存回滚失败: {save_error}; {rollback_error}"
+                )));
+            }
+            return Err(AppError::CredentialStore(save_error.to_string()));
+        }
+        if let Some(secret) = previous.as_mut() {
+            secret.zeroize();
+        }
+        Ok(())
     }
 
     fn lock(&self) -> AppResult<std::sync::MutexGuard<'_, Stronghold>> {

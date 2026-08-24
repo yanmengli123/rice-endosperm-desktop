@@ -24,6 +24,8 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   const [busy, setBusy] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelSpec, setModelSpec] = useState<string>("");
+  const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
+  const [modelSaving, setModelSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -33,8 +35,11 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
         if (cancelled) return;
         setModels(items);
         setModelSpec(saved ?? "");
-      } catch {
-        // 模型列表加载失败不阻塞设置页；保存时仍可手动清空偏好
+        setModelState("ready");
+      } catch (error) {
+        if (cancelled) return;
+        setModelState("error");
+        setStatus(`模型偏好加载失败：${normalizeCommandError(error).message}`);
       }
     })();
     return () => {
@@ -43,12 +48,17 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   }, []);
 
   async function changeModel(spec: string) {
+    const previousSpec = modelSpec;
     setModelSpec(spec);
+    setModelSaving(true);
     try {
       await setChatModelPreference(spec || undefined);
       setStatus(spec ? `默认模型已设为 ${spec}` : "已清除默认模型偏好");
     } catch (error) {
+      setModelSpec(previousSpec);
       setStatus(normalizeCommandError(error).message);
+    } finally {
+      setModelSaving(false);
     }
   }
 
@@ -113,8 +123,15 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
               value={modelSpec}
               onChange={(event) => void changeModel(event.target.value)}
               aria-label="选择默认聊天模型"
+              disabled={modelState !== "ready" || modelSaving}
             >
-              <option value="">跟随智能体/系统默认</option>
+              <option value="">
+                {modelState === "loading"
+                  ? "正在加载模型偏好…"
+                  : modelState === "error"
+                    ? "模型偏好暂不可用"
+                    : "跟随智能体/系统默认"}
+              </option>
               {models.map((model) => (
                 <option key={model.spec} value={model.spec}>{model.label}</option>
               ))}
