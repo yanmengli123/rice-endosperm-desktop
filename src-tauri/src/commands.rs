@@ -841,6 +841,18 @@ pub struct DeviceLoginResult {
 }
 
 fn validate_device_login_urls(start: &CliSessionStart) -> AppResult<String> {
+    let user_code = start.user_code.as_bytes();
+    let valid_user_code = user_code.len() == 9
+        && user_code[4] == b'-'
+        && user_code.iter().enumerate().all(|(index, byte)| {
+            index == 4
+                || ((byte.is_ascii_uppercase() || matches!(byte, b'2'..=b'9'))
+                    && !matches!(byte, b'I' | b'O'))
+        });
+    if !valid_user_code {
+        return Err(AppError::Protocol("服务端返回的 user_code 格式无效".into()));
+    }
+
     let verification = Url::parse(&start.verification_uri)
         .map_err(|_| AppError::Protocol("服务端返回的网页授权地址无效".into()))?;
     let complete = Url::parse(&start.verification_uri_complete)
@@ -1123,5 +1135,21 @@ mod tests {
         insecure.verification_uri_complete =
             "http://rice.example.cn/auth/cli/authorize?user_code=ABCD-EFGH".into();
         assert!(validate_device_login_urls(&insecure).is_err());
+
+        let mut malformed_code = CliSessionStart {
+            device_code: "secret".into(),
+            user_code: "../../BAD".into(),
+            verification_uri: "https://rice.example.cn/auth/cli/authorize".into(),
+            verification_uri_complete:
+                "https://rice.example.cn/auth/cli/authorize?user_code=../../BAD".into(),
+            expires_in: 600,
+            interval: 2,
+        };
+        assert!(validate_device_login_urls(&malformed_code).is_err());
+
+        malformed_code.user_code = "ABCI-EFGH".into();
+        malformed_code.verification_uri_complete =
+            "https://rice.example.cn/auth/cli/authorize?user_code=ABCI-EFGH".into();
+        assert!(validate_device_login_urls(&malformed_code).is_err());
     }
 }
