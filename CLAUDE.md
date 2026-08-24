@@ -59,4 +59,4 @@ pnpm tauri build --bundles nsis,msi         # 打包；可用 $env:YUXI_BASE_URL
 
 ## 与服务端的契约
 
-桌面端依赖 Yuxi 服务端暴露的一组 API Key 认证接口（AgentRun 契约 v1.1）：`/api/agent-invocation/*` 与 `/api/agent/runs/{run_id}/*`，完整清单见 README「使用前提」。修改这些接口时，服务端（../Yuxi）与本仓库必须同步调整。
+桌面端依赖 Yuxi 服务端暴露的一组 API Key 认证接口（AgentRun 契约 v1.1）：`/api/agent-invocation/*` 与 `/api/agent/runs/{run_id}/*`；设备码登录走 `/api/auth/cli/sessions*`（token 响应携带服务端签发的不可逆 `account_scope_id`，本地 SQLite/Stronghold 数据按它隔离账号，不落盘原始 uid）；模型偏好统一存服务端 `GET/PUT /api/user/model-preference`，聊天发起时不带 `model_spec`、由服务端按「请求级 > 用户级 > 智能体级 > 系统级」解析。完整清单见 README「使用前提」。修改这些接口时，服务端（../Yuxi）与本仓库必须同步调整。
