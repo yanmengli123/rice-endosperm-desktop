@@ -16,6 +16,7 @@ use crate::{
 };
 
 const NEW_THREAD_TITLE: &str = "新对话";
+const LEGACY_ACCOUNT_SCOPE: &str = "legacy";
 const MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const V1_LF_CHECKSUM: &str = "6F2F8974DC2BC853D4B6273B0F0947A92164C68855109BF463515E9F20D440F8685DC005927DD751E2B1E863AF645738";
 const V1_LEGACY_CRLF_CHECKSUM: &str = "40B0BBD1ADEC82DD375EAA5DB004CC46DA34D740C3B6012DE181E8F692A2D2C0DE03A5B0B50C1777070F697489636415";
@@ -110,15 +111,64 @@ impl Database {
         self.setting("api_key_hint").await
     }
 
+    pub async fn current_account_scope(&self) -> AppResult<String> {
+        Ok(self
+            .setting("current_account_scope")
+            .await?
+            .unwrap_or_else(|| LEGACY_ACCOUNT_SCOPE.to_owned()))
+    }
+
+    pub async fn activate_account(
+        &self,
+        gateway_url: &str,
+        principal: &str,
+        api_key_hint: &str,
+        api_key_name: Option<&str>,
+    ) -> AppResult<()> {
+        let account_scope = format!("{}|{}", gateway_url.trim_end_matches('/'), principal);
+        let timestamp = now();
+        let mut transaction = self.pool.begin().await?;
+        for (key, value) in [
+            ("gateway_url", gateway_url),
+            ("current_account_scope", account_scope.as_str()),
+            ("api_key_hint", api_key_hint),
+        ] {
+            sqlx::query(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(&timestamp)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        if let Some(name) = api_key_name {
+            sqlx::query(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES('api_key_name', ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )
+            .bind(name)
+            .bind(&timestamp)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn create_thread(&self) -> AppResult<ThreadSummary> {
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
+        let account_scope = self.current_account_scope().await?;
         sqlx::query(
-            "INSERT INTO threads(id, title, agent_slug, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at) \
+             VALUES(?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(NEW_THREAD_TITLE)
         .bind(agent_slug())
+        .bind(account_scope)
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
@@ -132,10 +182,14 @@ impl Database {
     }
 
     pub async fn ensure_thread(&self, thread_id: &str) -> AppResult<()> {
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?)")
-            .bind(thread_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let account_scope = self.current_account_scope().await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ? AND account_scope = ?)",
+        )
+        .bind(thread_id)
+        .bind(account_scope)
+        .fetch_one(&self.pool)
+        .await?;
         if exists {
             Ok(())
         } else {
@@ -144,11 +198,13 @@ impl Database {
     }
 
     pub async fn list_threads(&self) -> AppResult<Vec<ThreadSummary>> {
+        let account_scope = self.current_account_scope().await?;
         sqlx::query_as::<_, ThreadSummary>(
             "SELECT t.id, t.title, t.updated_at, \
              COALESCE((SELECT content FROM messages m WHERE m.thread_id = t.id ORDER BY position DESC LIMIT 1), '') AS preview \
-             FROM threads t ORDER BY t.updated_at DESC",
+             FROM threads t WHERE t.account_scope = ? ORDER BY t.updated_at DESC",
         )
+        .bind(account_scope)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
@@ -159,12 +215,16 @@ impl Database {
         if cleaned.is_empty() {
             return Err(AppError::Internal("会话标题不能为空".into()));
         }
-        let result = sqlx::query("UPDATE threads SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(cleaned)
-            .bind(now())
-            .bind(thread_id)
-            .execute(&self.pool)
-            .await?;
+        let account_scope = self.current_account_scope().await?;
+        let result = sqlx::query(
+            "UPDATE threads SET title = ?, updated_at = ? WHERE id = ? AND account_scope = ?",
+        )
+        .bind(cleaned)
+        .bind(now())
+        .bind(thread_id)
+        .bind(account_scope)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::ThreadNotFound);
         }
@@ -172,8 +232,10 @@ impl Database {
     }
 
     pub async fn delete_thread(&self, thread_id: &str) -> AppResult<()> {
-        sqlx::query("DELETE FROM threads WHERE id = ?")
+        let account_scope = self.current_account_scope().await?;
+        sqlx::query("DELETE FROM threads WHERE id = ? AND account_scope = ?")
             .bind(thread_id)
+            .bind(account_scope)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -197,6 +259,7 @@ impl Database {
         role: &str,
         content: &str,
     ) -> AppResult<()> {
+        self.ensure_thread(thread_id).await?;
         let mut transaction = self.pool.begin().await?;
         // position 在 INSERT 内用标量子查询计算：单条语句在 SQLite 写锁下
         // 原生原子，避免"先查 MAX 再插入"在并发下撞 UNIQUE(thread_id, position)。
@@ -234,20 +297,29 @@ impl Database {
     }
 
     pub async fn yuxi_thread_id(&self, thread_id: &str) -> AppResult<Option<String>> {
-        sqlx::query_scalar("SELECT yuxi_thread_id FROM threads WHERE id = ?")
+        let account_scope = self.current_account_scope().await?;
+        sqlx::query_scalar("SELECT yuxi_thread_id FROM threads WHERE id = ? AND account_scope = ?")
             .bind(thread_id)
+            .bind(account_scope)
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::ThreadNotFound)
     }
 
     pub async fn set_yuxi_thread_id(&self, thread_id: &str, yuxi_thread_id: &str) -> AppResult<()> {
-        sqlx::query("UPDATE threads SET yuxi_thread_id = ?, updated_at = ? WHERE id = ?")
+        let account_scope = self.current_account_scope().await?;
+        let result = sqlx::query(
+            "UPDATE threads SET yuxi_thread_id = ?, updated_at = ? WHERE id = ? AND account_scope = ?",
+        )
             .bind(yuxi_thread_id)
             .bind(now())
             .bind(thread_id)
+            .bind(account_scope)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::ThreadNotFound);
+        }
         Ok(())
     }
 
@@ -259,6 +331,7 @@ impl Database {
         status: &str,
         server_context: &str,
     ) -> AppResult<()> {
+        self.ensure_thread(thread_id).await?;
         let timestamp = now();
         sqlx::query(
             "INSERT INTO runs(run_id, request_id, thread_id, status, server_context, created_at, updated_at) \
@@ -303,6 +376,7 @@ impl Database {
     }
 
     pub async fn latest_run_context(&self, thread_id: &str) -> AppResult<Option<String>> {
+        self.ensure_thread(thread_id).await?;
         sqlx::query_scalar(
             "SELECT server_context FROM runs WHERE thread_id = ? AND server_context IS NOT NULL \
              AND server_context != '' ORDER BY created_at DESC LIMIT 1",
@@ -314,11 +388,15 @@ impl Database {
     }
 
     pub async fn list_pending_runs(&self) -> AppResult<Vec<PendingRun>> {
+        let account_scope = self.current_account_scope().await?;
         sqlx::query_as::<_, PendingRun>(
-            "SELECT run_id, thread_id FROM runs \
-             WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted') \
-             ORDER BY created_at ASC",
+            "SELECT r.run_id, r.thread_id FROM runs r \
+             JOIN threads t ON t.id = r.thread_id \
+             WHERE t.account_scope = ? \
+             AND r.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted') \
+             ORDER BY r.created_at ASC",
         )
+        .bind(account_scope)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
@@ -566,6 +644,14 @@ mod migration_tests {
             .execute(&database.pool)
             .await
             .expect("remove v2 index");
+        sqlx::query("DROP INDEX IF EXISTS idx_threads_account_updated")
+            .execute(&database.pool)
+            .await
+            .expect("remove v4 index");
+        sqlx::query("ALTER TABLE threads DROP COLUMN account_scope")
+            .execute(&database.pool)
+            .await
+            .expect("remove v4 column");
         sqlx::query("ALTER TABLE runs DROP COLUMN server_context")
             .execute(&database.pool)
             .await
@@ -593,7 +679,7 @@ mod migration_tests {
                 .fetch_one(&repaired.pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest_version, 3);
+        assert_eq!(latest_version, 4);
         assert_eq!(
             repaired
                 .setting("migration_test")
@@ -672,6 +758,47 @@ mod migration_tests {
                 .expect("list completed runs")
                 .is_empty()
         );
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
+    async fn isolates_local_threads_between_server_accounts() {
+        let root =
+            std::env::temp_dir().join(format!("daoxin-account-scope-test-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        database
+            .activate_account("https://api.example.cn", "user-a", "yxkey_a", Some("A"))
+            .await
+            .expect("activate account A");
+        let thread_a = database
+            .create_thread()
+            .await
+            .expect("create account A thread");
+
+        database
+            .activate_account("https://api.example.cn", "user-b", "yxkey_b", Some("B"))
+            .await
+            .expect("activate account B");
+        assert!(
+            database
+                .list_threads()
+                .await
+                .expect("list B threads")
+                .is_empty()
+        );
+        assert!(database.ensure_thread(&thread_a.id).await.is_err());
+
+        database
+            .activate_account("https://api.example.cn", "user-a", "yxkey_a", Some("A"))
+            .await
+            .expect("restore account A");
+        assert_eq!(
+            database.list_threads().await.expect("list A threads").len(),
+            1
+        );
+
         database.pool.close().await;
         drop(database);
         remove_test_directory(&root).await;

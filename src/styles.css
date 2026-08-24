@@ -226,3 +226,102 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
   .spin { animation-duration: 1.8s; }
 }
+
+/* 设备码授权登录 */
+.device-login-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 14px;
+  border: 1px solid var(--gray-200);
+  border-radius: 14px;
+  background: var(--gray-50);
+  text-align: center;
+  color: var(--gray-700);
+}
+
+.device-login-lead {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.device-login-code {
+  font-family: var(--font-mono, monospace);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: 8px;
+  padding: 10px 22px;
+  border-radius: 12px;
+  background: var(--gray-100);
+  user-select: all;
+}
+
+.device-login-url {
+  font-size: 12px;
+  color: var(--gray-500);
+  word-break: break-all;
+}
+
+.device-login-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--gray-600);
+}
+
+.secondary-button {
+  border: 1px solid var(--gray-200);
+  border-radius: 10px;
+  padding: 8px 16px;
+  background: var(--gray-0);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.device-login-entry {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--main-color);
+  background: transparent;
+  color: var(--main-color);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.device-login-entry:hover {
+  background: color-mix(in srgb, var(--main-color) 8%, transparent);
+}
+
+/* 设置页模型选择 */
+.setting-row-stack {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.model-hint {
+  font-weight: 400;
+  color: var(--gray-500);
+  font-size: 12px;
+  margin-left: 6px;
+}
+
+.model-select {
+  width: 100%;
+  max-width: 420px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--gray-200);
+  background: var(--gray-0);
+  color: var(--gray-800);
+  font-size: 13px;
+}

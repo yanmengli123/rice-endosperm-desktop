@@ -2,6 +2,7 @@ use std::{path::Path, sync::Mutex};
 
 use chrono::Utc;
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use tauri_plugin_stronghold::stronghold::Stronghold;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -120,6 +121,13 @@ pub fn api_key_hint(api_key: &str) -> String {
     format!("{visible}••••••••")
 }
 
+/// 旧版服务端无法返回用户 UID 时，使用完整 API Key 的不可逆摘要隔离本地账号。
+/// 不能使用展示用 key_prefix：它只有很短的可见前缀，碰撞会把两个账号的会话混在一起。
+pub fn api_key_scope_id(api_key: &str) -> String {
+    let digest = Sha256::digest(api_key.as_bytes());
+    format!("api-key-sha256:{digest:x}")
+}
+
 pub fn validate_api_key(api_key: &str) -> AppResult<()> {
     let valid = api_key.starts_with("yxkey_")
         && (24..=256).contains(&api_key.len())
@@ -156,7 +164,7 @@ fn load_or_create_unlock_key() -> AppResult<(Vec<u8>, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_key_hint, validate_api_key};
+    use super::{api_key_hint, api_key_scope_id, validate_api_key};
 
     #[test]
     fn validates_expected_key_shape_without_exposing_it() {
@@ -166,5 +174,15 @@ mod tests {
             api_key_hint("yxkey_1234567890abcdefghijkl"),
             "yxkey_123456••••••••"
         );
+    }
+
+    #[test]
+    fn derives_collision_resistant_account_scope_without_exposing_key() {
+        let first = api_key_scope_id("yxkey_1234567890abcdefghijkl");
+        let second = api_key_scope_id("yxkey_1234567890abcdefghijkm");
+        assert!(first.starts_with("api-key-sha256:"));
+        assert_eq!(first.len(), "api-key-sha256:".len() + 64);
+        assert_ne!(first, second);
+        assert!(!first.contains("yxkey_"));
     }
 }

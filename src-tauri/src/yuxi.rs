@@ -114,6 +114,8 @@ struct CreateRunRequest<'a> {
     thread_id: Option<&'a str>,
     request_id: &'a str,
     async_mode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_spec: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +139,7 @@ impl YuxiClient {
         gateway_url: &str,
         agent_slug: &str,
         api_key: &SecretString,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<String>> {
         let base = validate_gateway_url(gateway_url)?;
         let mut last_error = None;
         for delay in [None, Some(Duration::from_millis(800))] {
@@ -145,7 +147,7 @@ impl YuxiClient {
                 sleep(delay).await;
             }
             match self.test_connection_once(&base, agent_slug, api_key).await {
-                Ok(()) => return Ok(()),
+                Ok(identity) => return Ok(identity),
                 Err(error) if connection_error_is_retryable(&error) => last_error = Some(error),
                 Err(error) => return Err(error),
             }
@@ -162,14 +164,22 @@ impl YuxiClient {
         base: &str,
         agent_slug: &str,
         api_key: &SecretString,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<String>> {
         let status_response = self
             .authorized_get(&format!("{base}{CREDENTIAL_STATUS_PATH}"), api_key)
             .timeout(Duration::from_secs(12))
             .send()
             .await?;
         if status_response.status().is_success() {
-            return Ok(());
+            let value = status_response
+                .json::<Value>()
+                .await
+                .map_err(|error| AppError::Protocol(error.to_string()))?;
+            return Ok(value
+                .get("account_scope_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned));
         }
         if status_response.status() != StatusCode::NOT_FOUND {
             return Err(response_error(status_response).await);
@@ -187,11 +197,12 @@ impl YuxiClient {
             .send()
             .await?;
         match probe.status().as_u16() {
-            200 | 404 => Ok(()),
+            200 | 404 => Ok(None),
             _ => Err(response_error(probe).await),
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // 网关契约字段逐一显式传参，避免引入参数对象
     pub async fn create_run(
         &self,
         gateway_url: &str,
@@ -200,6 +211,7 @@ impl YuxiClient {
         question: &str,
         yuxi_thread_id: Option<&str>,
         request_id: &str,
+        model_spec: Option<&str>,
     ) -> AppResult<CreatedRun> {
         let base = validate_gateway_url(gateway_url)?;
         let mut last_error = None;
@@ -216,6 +228,7 @@ impl YuxiClient {
                     thread_id: yuxi_thread_id,
                     request_id,
                     async_mode: true,
+                    model_spec,
                 })
                 .timeout(Duration::from_secs(45))
                 .send()
@@ -315,6 +328,263 @@ impl YuxiClient {
     fn authorized_post(&self, url: &str, key: &SecretString) -> reqwest::RequestBuilder {
         self.client.post(url).bearer_auth(key.expose_secret())
     }
+
+    fn authorized_put(&self, url: &str, key: &SecretString) -> reqwest::RequestBuilder {
+        self.client.put(url).bearer_auth(key.expose_secret())
+    }
+
+    fn authorized_delete(&self, url: &str, key: &SecretString) -> reqwest::RequestBuilder {
+        self.client.delete(url).bearer_auth(key.expose_secret())
+    }
+
+    /// 创建设备码登录会话（桌面端开户入口；批准后换取自动创建的 API Key）。
+    pub async fn create_cli_session(
+        &self,
+        gateway_url: &str,
+        key_name: Option<&str>,
+    ) -> AppResult<CliSessionStart> {
+        let base = validate_gateway_url(gateway_url)?;
+        let mut body = json!({"key_name": ""});
+        if let Some(name) = key_name.filter(|value| !value.trim().is_empty()) {
+            body["key_name"] = json!(name);
+        }
+        let response = self
+            .client
+            .post(format!("{base}/api/auth/cli/sessions"))
+            .json(&body)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let parsed = response
+            .json::<CliSessionStart>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        Ok(parsed)
+    }
+
+    /// 轮询设备码授权结果；返回 Pending 表示用户尚未在网页端批准。
+    pub async fn poll_cli_token(
+        &self,
+        gateway_url: &str,
+        device_code: &str,
+    ) -> AppResult<CliTokenPoll> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .client
+            .post(format!("{base}/api/auth/cli/sessions/token"))
+            .json(&json!({"device_code": device_code}))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let status = response.status();
+        if status.as_u16() == 400 {
+            // authorization_pending / expired 等都以 400 + detail.error 表达
+            let value = response.json::<Value>().await.unwrap_or(Value::Null);
+            let code = value
+                .pointer("/detail/error")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if code == "authorization_pending" {
+                return Ok(CliTokenPoll::Pending);
+            }
+            let message = value
+                .pointer("/detail/message")
+                .and_then(Value::as_str)
+                .unwrap_or("设备码授权失败")
+                .to_string();
+            return Err(AppError::Protocol(message));
+        }
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_cli_token_response(&value)
+    }
+
+    /// 设备登录本机持久化失败时，用新 Key 自撤销，避免服务器残留孤儿凭证。
+    pub async fn delete_api_key(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        api_key_id: i64,
+    ) -> AppResult<()> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_delete(&format!("{base}/api/user/apikey/{api_key_id}"), api_key)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// 拉取当前可用聊天模型列表（用户级模型选择器数据源）。
+    pub async fn list_chat_models(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+    ) -> AppResult<Vec<ModelOption>> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(
+                &format!("{base}/api/system/model-providers/models/v2?model_type=chat"),
+                api_key,
+            )
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let mut models: Vec<ModelOption> = Vec::new();
+        if let Some(providers) = value.get("data").and_then(Value::as_object) {
+            for (provider_id, provider) in providers {
+                let provider_name = provider
+                    .get("provider_display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(provider_id);
+                if let Some(items) = provider.get("models").and_then(Value::as_array) {
+                    for item in items {
+                        let spec = item.get("spec").and_then(Value::as_str).unwrap_or("");
+                        let display = item
+                            .get("display_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(spec);
+                        if spec.is_empty() {
+                            continue;
+                        }
+                        models.push(ModelOption {
+                            spec: spec.to_string(),
+                            label: format!("{display} · {provider_name}"),
+                        });
+                    }
+                }
+            }
+        }
+        models.sort_by(|a, b| a.label.cmp(&b.label));
+        Ok(models)
+    }
+
+    pub async fn get_chat_model_preference(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+    ) -> AppResult<Option<String>> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}/api/user/model-preference"), api_key)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        Ok(value
+            .get("chat_model_spec")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
+    pub async fn set_chat_model_preference(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        model_spec: Option<&str>,
+    ) -> AppResult<()> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_put(&format!("{base}/api/user/model-preference"), api_key)
+            .json(&json!({"chat_model_spec": model_spec}))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        ensure_success(response).await?;
+        Ok(())
+    }
+}
+
+/// 服务端设备码响应。Wire 格式严格匹配 FastAPI 的 snake_case JSON。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CliSessionStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum CliTokenPoll {
+    Pending,
+    Approved {
+        secret: String,
+        api_key_id: i64,
+        account_scope_id: String,
+        key_name: String,
+        user_name: String,
+        user_uid: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    pub spec: String,
+    pub label: String,
+}
+
+fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
+    let secret = value
+        .get("secret")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("授权响应缺少 API Key".into()))?
+        .to_string();
+    let api_key_id = value
+        .pointer("/api_key/id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Protocol("授权响应缺少 API Key ID".into()))?;
+    let account_scope_id = value
+        .get("account_scope_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("yxacct_") && value.len() >= 24)
+        .ok_or_else(|| AppError::Protocol("授权响应缺少账号作用域标识".into()))?
+        .to_string();
+    let key_name = value
+        .pointer("/api_key/name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let user_name = value
+        .pointer("/user/username")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let user_uid = value
+        .pointer("/user/uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("授权响应缺少用户 UID".into()))?
+        .to_string();
+    Ok(CliTokenPoll::Approved {
+        secret,
+        api_key_id,
+        account_scope_id,
+        key_name,
+        user_name,
+        user_uid,
+    })
 }
 
 fn connection_error_is_retryable(error: &AppError) -> bool {
@@ -471,8 +741,51 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        ProgressText, connection_error_for_gateway, final_output, parse_run_result, terminal_status,
+        CliSessionStart, CliTokenPoll, ProgressText, connection_error_for_gateway, final_output,
+        parse_cli_token_response, parse_run_result, terminal_status,
     };
+
+    #[test]
+    fn decodes_server_device_login_contract() {
+        let response: CliSessionStart = serde_json::from_value(json!({
+            "device_code": "device-secret",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://rice.example.com/auth/cli/authorize",
+            "verification_uri_complete": "https://rice.example.com/auth/cli/authorize?user_code=ABCD-EFGH",
+            "expires_in": 600,
+            "interval": 2
+        }))
+        .expect("decode FastAPI snake_case response");
+
+        assert_eq!(response.device_code, "device-secret");
+        assert_eq!(response.user_code, "ABCD-EFGH");
+        assert_eq!(response.expires_in, 600);
+        assert_eq!(response.interval, 2);
+    }
+
+    #[test]
+    fn decodes_device_token_contract_with_opaque_account_scope() {
+        let response = parse_cli_token_response(&json!({
+            "api_key": {"id": 12, "name": "desktop"},
+            "secret": "yxkey_1234567890abcdefghijkl",
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef",
+            "user": {"username": "Alice", "uid": "alice"}
+        }))
+        .expect("decode token response");
+
+        let CliTokenPoll::Approved {
+            api_key_id,
+            account_scope_id,
+            user_uid,
+            ..
+        } = response
+        else {
+            panic!("expected approved token response");
+        };
+        assert_eq!(api_key_id, 12);
+        assert_eq!(account_scope_id, "yxacct_0123456789abcdef0123456789abcdef");
+        assert_eq!(user_uid, "alice");
+    }
 
     #[test]
     fn groups_deltas_by_message_and_ignores_duplicate_legacy_response() {

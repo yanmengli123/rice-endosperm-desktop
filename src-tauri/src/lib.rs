@@ -10,9 +10,10 @@ mod yuxi;
 use tauri::Manager;
 
 use commands::{
-    cancel_run, create_thread, delete_api_key, delete_thread, get_public_settings,
-    get_thread_run_context, list_threads, load_messages, rename_thread, save_connection,
-    send_message, sync_pending_runs, test_connection,
+    cancel_run, create_thread, delete_api_key, delete_thread, get_chat_model_preference,
+    get_public_settings, get_thread_run_context, list_chat_models, list_threads, load_messages,
+    poll_device_login, rename_thread, save_connection, send_message, set_chat_model_preference,
+    start_device_login, sync_pending_runs, test_connection,
 };
 use state::AppState;
 
@@ -56,6 +57,11 @@ pub fn run() {
             delete_thread,
             send_message,
             cancel_run,
+            start_device_login,
+            poll_device_login,
+            list_chat_models,
+            get_chat_model_preference,
+            set_chat_model_preference,
         ])
         .run(tauri::generate_context!());
 

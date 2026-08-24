@@ -96,6 +96,26 @@ export type PendingRunSync = {
   lastError?: string;
 };
 
+export type DeviceLoginStart = {
+  deviceCode: string;
+  userCode: string;
+  verificationUrl: string;
+  webOrigin: string;
+  expiresIn: number;
+  interval: number;
+};
+
+export type DeviceLoginResult = {
+  approved: boolean;
+  userName?: string;
+  userUid?: string;
+};
+
+export type ModelOption = {
+  spec: string;
+  label: string;
+};
+
 export type RunEvent =
   | { type: "started"; runId: string; threadId: string; requestId: string }
   | { type: "status"; status: string; message: string }

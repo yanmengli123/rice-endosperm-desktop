@@ -26,7 +26,7 @@ cargo test    --manifest-path src-tauri/Cargo.toml <测试名>                  
 pnpm tauri build --bundles nsis,msi         # 打包；可用 $env:YUXI_BASE_URL / $env:YUXI_AGENT_SLUG 设置新用户首次默认值（仅默认值，不含 Key）
 ```
 
-**libsodium 环境变量**：`cargo check/clippy/test` 依赖 `SODIUM_LIB_DIR` 和 `SODIUM_SHARED=1`（否则 libsodium-sys 构建脚本会自行下载并可能失败）。prepare-libsodium.ps1 只在当前 PowerShell 会话设置这两个变量——**新开终端跑 cargo 命令前必须重新 export**（脚本下载的 dist 在 `%TEMP%\daoxin-libsodium-dist\extracted\libsodium\x64\Release\v143\dynamic`）。
+**libsodium 环境变量**：`cargo check/clippy/test` 依赖 `SODIUM_LIB_DIR` 和 `SODIUM_SHARED=1`（否则 libsodium-sys 构建脚本会自行下载并可能失败）。prepare-libsodium.ps1 只在当前 PowerShell 会话设置这两个变量——**新开终端跑 cargo 命令前必须重新 export**（脚本下载的 dist 在 `%TEMP%\daoxin-libsodium-dist\extracted\libsodium\x64\Release\v143\dynamic`）。两个坑：Windows TEMP 清理可能删掉该 dist，表现为 cargo test 链接期 `LNK1181: 无法打开输入文件"libsodium.lib"`（cargo check/clippy 不链接所以能过），重跑 prepare-libsodium.ps1 即恢复；Git Bash 会话中需手动 `export SODIUM_LIB_DIR='C:\...\dynamic' SODIUM_SHARED=1`。
 
 发布流程：打 tag `vX.Y.Z` 推送后由 GitHub Actions 构建并发布安装包，更新签名私钥只在 Actions Secrets；完整流程见 [docs/RELEASING.md](docs/RELEASING.md)。
 
