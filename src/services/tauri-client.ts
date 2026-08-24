@@ -1,7 +1,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ChatCompletion,
+  DeviceLoginResult,
+  DeviceLoginStart,
   LocalMessage,
+  ModelOption,
   PublicSettings,
   PendingRunSync,
   RunEvent,
@@ -46,6 +49,20 @@ export const sendMessage = (
 
 export const cancelRun = (requestId: string, runId?: string) =>
   invoke<void>("cancel_run", { requestId, runId });
+
+export const startDeviceLogin = (gatewayUrl: string, keyName?: string) =>
+  invoke<DeviceLoginStart>("start_device_login", { gatewayUrl, keyName });
+
+export const pollDeviceLogin = (gatewayUrl: string, deviceCode: string) =>
+  invoke<DeviceLoginResult>("poll_device_login", { gatewayUrl, deviceCode });
+
+export const listChatModels = () => invoke<ModelOption[]>("list_chat_models");
+
+export const getChatModelPreference = () =>
+  invoke<string | null>("get_chat_model_preference");
+
+export const setChatModelPreference = (modelSpec?: string) =>
+  invoke<void>("set_chat_model_preference", { modelSpec });
 
 export function normalizeCommandError(
   error: unknown,

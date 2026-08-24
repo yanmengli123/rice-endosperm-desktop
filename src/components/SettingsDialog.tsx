@@ -1,10 +1,17 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ExternalLink, KeyRound, LoaderCircle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { deleteApiKey, normalizeCommandError, testConnection } from "../services/tauri-client";
-import type { PublicSettings } from "../types";
+import {
+  deleteApiKey,
+  getChatModelPreference,
+  listChatModels,
+  normalizeCommandError,
+  setChatModelPreference,
+  testConnection,
+} from "../services/tauri-client";
+import type { ModelOption, PublicSettings } from "../types";
 
 type Props = {
   settings: PublicSettings;
@@ -15,6 +22,35 @@ type Props = {
 export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props) {
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelSpec, setModelSpec] = useState<string>("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [items, saved] = await Promise.all([listChatModels(), getChatModelPreference()]);
+        if (cancelled) return;
+        setModels(items);
+        setModelSpec(saved ?? "");
+      } catch {
+        // 模型列表加载失败不阻塞设置页；保存时仍可手动清空偏好
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function changeModel(spec: string) {
+    setModelSpec(spec);
+    try {
+      await setChatModelPreference(spec || undefined);
+      setStatus(spec ? `默认模型已设为 ${spec}` : "已清除默认模型偏好");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    }
+  }
 
   async function run(action: () => Promise<void>, success: string) {
     setBusy(true);
@@ -70,6 +106,20 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
           <div className="setting-row"><span>服务地址</span><strong>{settings.gatewayUrl}</strong></div>
           <div className="setting-row"><span>智能体</span><strong>{settings.agentSlug}</strong></div>
           <div className="setting-row"><span>API Key</span><strong className="key-hint"><KeyRound size={15} /> {settings.apiKeyHint || "已安全配置"}</strong></div>
+          <div className="setting-row setting-row-stack">
+            <span>账号默认模型<span className="model-hint">（同步保存到 Yuxi 服务端）</span></span>
+            <select
+              className="model-select"
+              value={modelSpec}
+              onChange={(event) => void changeModel(event.target.value)}
+              aria-label="选择默认聊天模型"
+            >
+              <option value="">跟随智能体/系统默认</option>
+              {models.map((model) => (
+                <option key={model.spec} value={model.spec}>{model.label}</option>
+              ))}
+            </select>
+          </div>
           <div className="settings-actions">
             <button onClick={() => run(testConnection, "连接正常，凭证有效")} disabled={busy}><RefreshCw size={17} /> 测试连接</button>
             <button onClick={updateApp} disabled={busy}><RefreshCw size={17} /> 检查更新</button>
