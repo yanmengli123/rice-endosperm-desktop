@@ -142,6 +142,111 @@ impl CredentialStore {
         Ok(())
     }
 
+    // ---- P2b 多账号：按作用域隔离的凭据与会话存储 ----
+    //
+    // ACTIVE 记录（b"yuxi-api-key"）只是"当前选中账号"的缓存；真源是
+    // b"yuxi-api-key:{scope}" / b"yuxi-session:{scope}"。切换账号 = 把
+    // 作用域记录拷回 ACTIVE + 更新 app_settings 指针。
+
+    fn api_key_record_for(scope: &str) -> Vec<u8> {
+        format!("yuxi-api-key:{scope}").into_bytes()
+    }
+
+    fn session_record_for(scope: &str) -> Vec<u8> {
+        format!("yuxi-session:{scope}").into_bytes()
+    }
+
+    pub fn save_api_key_for_scope(&self, scope: &str, api_key: &str) -> AppResult<()> {
+        validate_api_key(api_key)?;
+        let vault = self.lock()?;
+        vault
+            .store()
+            .insert(
+                Self::api_key_record_for(scope),
+                api_key.as_bytes().to_vec(),
+                None,
+            )
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+        vault
+            .save()
+            .map_err(|error| AppError::CredentialStore(error.to_string()))
+    }
+
+    pub fn api_key_for_scope(&self, scope: &str) -> AppResult<Option<SecretString>> {
+        let vault = self.lock()?;
+        match vault
+            .store()
+            .get(&Self::api_key_record_for(scope))
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?
+        {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(key) => Ok(Some(SecretString::from(key))),
+                Err(error) => {
+                    let mut raw = error.into_bytes();
+                    raw.zeroize();
+                    Err(AppError::CredentialStore("凭证内容损坏".into()))
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn save_session_blob(&self, scope: &str, json: &str) -> AppResult<()> {
+        let vault = self.lock()?;
+        vault
+            .store()
+            .insert(
+                Self::session_record_for(scope),
+                json.as_bytes().to_vec(),
+                None,
+            )
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+        vault
+            .save()
+            .map_err(|error| AppError::CredentialStore(error.to_string()))
+    }
+
+    pub fn session_blob(&self, scope: &str) -> AppResult<Option<String>> {
+        let vault = self.lock()?;
+        match vault
+            .store()
+            .get(&Self::session_record_for(scope))
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?
+        {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(json) => Ok(Some(json)),
+                Err(error) => {
+                    let mut raw = error.into_bytes();
+                    raw.zeroize();
+                    Err(AppError::CredentialStore("会话内容损坏".into()))
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_scope_records(&self, scope: &str) -> AppResult<()> {
+        let vault = self.lock()?;
+        for record in [
+            Self::api_key_record_for(scope),
+            Self::session_record_for(scope),
+        ] {
+            if vault
+                .store()
+                .contains_key(&record)
+                .map_err(|error| AppError::CredentialStore(error.to_string()))?
+            {
+                vault
+                    .store()
+                    .delete(&record)
+                    .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+            }
+        }
+        vault
+            .save()
+            .map_err(|error| AppError::CredentialStore(error.to_string()))
+    }
+
     fn lock(&self) -> AppResult<std::sync::MutexGuard<'_, Stronghold>> {
         self.vault
             .lock()

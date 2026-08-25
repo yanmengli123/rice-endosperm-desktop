@@ -6,12 +6,16 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   deleteApiKey,
   getChatModelPreference,
+  listAccounts,
   listChatModels,
   normalizeCommandError,
+  removeAccount,
+  switchAccount,
   setChatModelPreference,
   testConnection,
 } from "../services/tauri-client";
 import type { ModelOption, PublicSettings } from "../types";
+import type { AccountSummary } from "../services/tauri-client";
 
 type Props = {
   settings: PublicSettings;
@@ -26,6 +30,52 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   const [modelSpec, setModelSpec] = useState<string>("");
   const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
   const [modelSaving, setModelSaving] = useState(false);
+  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const rows = await listAccounts();
+        if (cancelled) return;
+        setAccounts(rows);
+      } catch {
+        // 账号目录读取失败不打断设置页，仅不展示切换区
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleSwitch(accountScope: string) {
+    setBusy(true);
+    try {
+      await switchAccount(accountScope);
+      setAccounts((rows) => rows.map((row) => ({ ...row, isActive: row.accountScope === accountScope })));
+      setStatus("已切换账号，正在刷新连接…");
+      onCredentialDeleted(); // 复用既有"凭据变化"回调触发全局重载
+      setStatus("已切换账号");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemove(accountScope: string) {
+    if (!window.confirm("移除该账号的本地登录信息？历史会话仍保留在本机。")) return;
+    setBusy(true);
+    try {
+      await removeAccount(accountScope);
+      setAccounts((rows) => rows.filter((row) => row.accountScope !== accountScope));
+      setStatus("已移除该账号");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -137,6 +187,35 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
               ))}
             </select>
           </div>
+          {accounts.length > 0 && (
+            <div className="settings-field">
+              <span>本机已登录账号</span>
+              <ul className="account-list">
+                {accounts.map((account) => (
+                  <li key={account.accountScope} className="account-row">
+                    <span className="account-name">
+                      {account.displayName || account.accountScope}
+                      {account.isActive && <em className="account-active">当前</em>}
+                    </span>
+                    {!account.isActive && (
+                      <span className="account-actions">
+                        <button onClick={() => void handleSwitch(account.accountScope)} disabled={busy}>
+                          切换
+                        </button>
+                        <button
+                          className="danger-button"
+                          onClick={() => void handleRemove(account.accountScope)}
+                          disabled={busy}
+                        >
+                          移除
+                        </button>
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="settings-actions">
             <button onClick={() => run(testConnection, "连接正常，凭证有效")} disabled={busy}><RefreshCw size={17} /> 测试连接</button>
             <button onClick={updateApp} disabled={busy}><RefreshCw size={17} /> 检查更新</button>

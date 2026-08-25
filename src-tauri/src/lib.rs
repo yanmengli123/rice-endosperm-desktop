@@ -4,6 +4,7 @@ mod credentials;
 mod database;
 mod diagnostics;
 mod error;
+mod session;
 mod state;
 mod yuxi;
 
@@ -11,9 +12,10 @@ use tauri::Manager;
 
 use commands::{
     cancel_run, create_thread, delete_api_key, delete_thread, get_chat_model_preference,
-    get_public_settings, get_thread_run_context, list_chat_models, list_threads, load_messages,
-    poll_device_login, rename_thread, save_connection, send_message, set_chat_model_preference,
-    start_device_login, sync_pending_runs, test_connection,
+    get_public_settings, get_thread_run_context, list_accounts, list_chat_models, list_threads,
+    load_messages, poll_device_login, remove_account, rename_thread, save_connection, send_message,
+    set_chat_model_preference, start_device_login, switch_account, sync_pending_runs,
+    test_connection,
 };
 use state::AppState;
 
@@ -62,6 +64,9 @@ pub fn run() {
             list_chat_models,
             get_chat_model_preference,
             set_chat_model_preference,
+            list_accounts,
+            switch_account,
+            remove_account,
         ])
         .run(tauri::generate_context!());
 

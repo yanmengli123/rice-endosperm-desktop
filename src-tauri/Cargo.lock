@@ -4033,8 +4033,9 @@ dependencies = [
 
 [[package]]
 name = "rice-endosperm-desktop"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "eventsource-stream",
  "futures-util",
