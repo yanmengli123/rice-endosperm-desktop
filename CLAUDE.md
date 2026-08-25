@@ -26,7 +26,7 @@ cargo test    --manifest-path src-tauri/Cargo.toml <测试名>                  
 pnpm tauri build --bundles nsis,msi         # 打包；可用 $env:YUXI_BASE_URL / $env:YUXI_AGENT_SLUG 设置新用户首次默认值（仅默认值，不含 Key）
 ```
 
-**libsodium 环境变量**：`cargo check/clippy/test` 依赖 `SODIUM_LIB_DIR` 和 `SODIUM_SHARED=1`（否则 libsodium-sys 构建脚本会自行下载并可能失败）。prepare-libsodium.ps1 只在当前 PowerShell 会话设置这两个变量——**新开终端跑 cargo 命令前必须重新 export**（脚本下载的 dist 在 `%TEMP%\daoxin-libsodium-dist\extracted\libsodium\x64\Release\v143\dynamic`）。两个坑：Windows TEMP 清理可能删掉该 dist，表现为 cargo test 链接期 `LNK1181: 无法打开输入文件"libsodium.lib"`（cargo check/clippy 不链接所以能过），重跑 prepare-libsodium.ps1 即恢复；Git Bash 会话中需手动 `export SODIUM_LIB_DIR='C:\...\dynamic' SODIUM_SHARED=1`。
+**libsodium 环境变量**：`cargo check/clippy/test` 依赖 `SODIUM_LIB_DIR` 和 `SODIUM_SHARED=1`（否则 libsodium-sys 构建脚本会自行下载并可能失败）。prepare-libsodium.ps1 只在当前 PowerShell 会话设置这两个变量——**新开终端跑 cargo 命令前必须重新 export**（脚本下载的 dist 在 `%TEMP%\daoxin-libsodium-dist\extracted\libsodium\x64\Release\v143\dynamic`）。三个坑：Windows TEMP 清理可能删掉该 dist，表现为 cargo test 链接期 `LNK1181: 无法打开输入文件"libsodium.lib"`（cargo check/clippy 不链接所以能过），重跑 prepare-libsodium.ps1 即恢复——TEMP 清理频繁时建议把 extracted 目录拷到仓库外固定路径（如 `.tooling/`，已 gitignore）并把 `SODIUM_LIB_DIR` 指过去；Git Bash 会话中需手动 `export SODIUM_LIB_DIR='C:\...\dynamic' SODIUM_SHARED=1`；新增 Rust 依赖后 `cargo test` 首次链接同样需要该变量。
 
 发布流程：打 tag `vX.Y.Z` 推送后由 GitHub Actions 构建并发布安装包，更新签名私钥只在 Actions Secrets；完整流程见 [docs/RELEASING.md](docs/RELEASING.md)。
 
@@ -44,10 +44,11 @@ pnpm tauri build --bundles nsis,msi         # 打包；可用 $env:YUXI_BASE_URL
 **Tauri/Rust 后端（src-tauri/src/）**
 
 - `lib.rs` 注册全部 invoke 命令与插件；新增命令必须在 `generate_handler![]` 中注册。
-- `commands.rs` 命令层；`state.rs` 全局 AppState（启动时打开 SQLite 并初始化诊断）。
-- `yuxi.rs` 与 Yuxi 网关的 HTTP/SSE 客户端（reqwest + eventsource-stream）：创建 run、拉取事件流、取消、恢复结果。
-- `credentials.rs` 凭据管理：Stronghold 加密 vault + OS keyring 保存 API Key——Key 绝不能进 SQLite、浏览器存储或日志。
-- `database.rs` + `migrations/`：sqlx SQLite 存会话、消息和运行恢复状态；schema 变更加新迁移文件。
+- `commands.rs` 命令层；`state.rs` 全局 AppState（启动时打开 SQLite 并初始化诊断）。发起网关请求的命令一律先经 `ensure_active_bearer` 取 Bearer 凭证（会话令牌主用 + 临近过期自动轮换 + 过渡 Key 回退），不要直接调 `credentials.api_key()`。
+- `yuxi.rs` 与 Yuxi 网关的 HTTP/SSE 客户端（reqwest + eventsource-stream）：创建 run、拉取事件流、取消、恢复结果、旋转会话。
+- `credentials.rs` 凭据管理：Stronghold 加密 vault + OS keyring。**多账号存储模型**——`b"yuxi-api-key:{scope}"` / `b"yuxi-session:{scope}"` 是按账号作用域隔离的真源；`b"yuxi-api-key"`（无后缀）只是"当前选中账号"的缓存，切换账号即拷贝作用域记录到 ACTIVE。Key 绝不能进 SQLite、浏览器存储或日志。
+- `session.rs` 会话令牌本地结构（access/refresh/family + 过期时间）与 JWT exp 解析；过期判断不做签名校验（服务端负责），仅用于触发轮换。
+- `database.rs` + `migrations/`：sqlx SQLite 存会话、消息和运行恢复状态；迁移 v5 起含 `accounts` 账号目录表（切换器数据源）；schema 变更加新迁移文件。
 - `config.rs` 编译期默认值（`YUXI_BASE_URL` 等）；`diagnostics.rs` 日志与 panic hook。
 
 ## 关键约束
@@ -59,4 +60,4 @@ pnpm tauri build --bundles nsis,msi         # 打包；可用 $env:YUXI_BASE_URL
 
 ## 与服务端的契约
 
-桌面端依赖 Yuxi 服务端暴露的一组 API Key 认证接口（AgentRun 契约 v1.1）：`/api/agent-invocation/*` 与 `/api/agent/runs/{run_id}/*`；设备码登录走 `/api/auth/cli/sessions*`（token 响应携带服务端签发的不可逆 `account_scope_id`，本地 SQLite/Stronghold 数据按它隔离账号，不落盘原始 uid）；模型偏好统一存服务端 `GET/PUT /api/user/model-preference`，聊天发起时不带 `model_spec`、由服务端按「请求级 > 用户级 > 智能体级 > 系统级」解析。完整清单见 README「使用前提」。修改这些接口时，服务端（../Yuxi）与本仓库必须同步调整。
+桌面端依赖 Yuxi 服务端暴露的一组 API Key 认证接口（AgentRun 契约 v1.1）：`/api/agent-invocation/*` 与 `/api/agent/runs/{run_id}/*`；设备码登录走 `/api/auth/cli/sessions*`（token 响应携带服务端签发的不可逆 `account_scope_id` 与可选 `session` 会话对——短时访问令牌 + 旋转刷新令牌 + `session_id`，本地 SQLite/Stronghold 数据按 `account_scope_id` 隔离账号，不落盘原始 uid）；会话续期走 `POST /api/auth/cli/token/refresh`（重放检测由服务端会话族承担）；模型偏好统一存服务端 `GET/PUT /api/user/model-preference`，聊天发起时不带 `model_spec`、由服务端解析。完整清单见 README「使用前提」。修改这些接口时，服务端（../Yuxi）与本仓库必须同步调整。
