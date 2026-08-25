@@ -64,6 +64,22 @@ export const getChatModelPreference = () =>
 export const setChatModelPreference = (modelSpec?: string) =>
   invoke<void>("set_chat_model_preference", { modelSpec });
 
+// P2b 多账号：目录、切换与移除
+export interface AccountSummary {
+  accountScope: string;
+  displayName: string;
+  gatewayUrl: string;
+  isActive: boolean;
+}
+
+export const listAccounts = () => invoke<AccountSummary[]>("list_accounts");
+
+export const switchAccount = (accountScope: string) =>
+  invoke<void>("switch_account", { accountScope });
+
+export const removeAccount = (accountScope: string) =>
+  invoke<void>("remove_account", { accountScope });
+
 export function normalizeCommandError(
   error: unknown,
 ): Error & { code?: string; retryable?: boolean; status?: number } {

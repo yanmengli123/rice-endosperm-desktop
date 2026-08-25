@@ -325,3 +325,42 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   color: var(--gray-800);
   font-size: 13px;
 }
+
+/* P2b 多账号：设置页账号切换列表 */
+.account-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.account-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-active {
+  font-style: normal;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(34, 139, 84, 0.16));
+  color: var(--accent, #228b54);
+}
+
+.account-actions button {
+  margin-left: 6px;
+}

@@ -404,6 +404,46 @@ impl YuxiClient {
         parse_cli_token_response(&value)
     }
 
+    /// P2b：旋转设备会话刷新令牌。重放/撤销/过期都以 401 表达，
+    /// 由调用方决定是回退过渡 Key 还是提示重新登录。
+    pub async fn refresh_cli_session(
+        &self,
+        gateway_url: &str,
+        refresh_token: &SecretString,
+    ) -> AppResult<RotatedSession> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .client
+            .post(format!("{base}/api/auth/cli/token/refresh"))
+            .json(&json!({"refresh_token": refresh_token.expose_secret()}))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let access_token = value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::Protocol("刷新响应缺少访问令牌".into()))?
+            .to_string();
+        let refresh_token = value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::Protocol("刷新响应缺少刷新令牌".into()))?
+            .to_string();
+        Ok(RotatedSession {
+            access_token,
+            refresh_token,
+        })
+    }
+
     /// 设备登录本机持久化失败时，用新 Key 自撤销，避免服务器残留孤儿凭证。
     pub async fn delete_api_key(
         &self,
@@ -534,9 +574,25 @@ pub enum CliTokenPoll {
         key_name: String,
         user_name: String,
         user_uid: String,
+        /// P2b：服务端签发的可旋转会话对；旧服务端无此字段时为 None（回退 Key 流）。
+        session: Option<ExchangeSession>,
     },
 }
 
+/// 设备码 exchange 返回的会话对。
+#[derive(Debug, Clone)]
+pub struct ExchangeSession {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub family_id: String,
+}
+
+/// 刷新端点返回的轮换结果。
+#[derive(Debug, Clone)]
+pub struct RotatedSession {
+    pub access_token: String,
+    pub refresh_token: String,
+}
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
@@ -577,6 +633,18 @@ fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Protocol("授权响应缺少用户 UID".into()))?
         .to_string();
+    // P2b：会话对为可选字段——旧服务端缺失时桌面端回退过渡 Key 流
+    let session = value.get("session").and_then(|session| {
+        let access_token = session.get("access_token")?.as_str()?.to_string();
+        let refresh_token = session.get("refresh_token")?.as_str()?.to_string();
+        let family_id = session.get("session_id")?.as_str()?.to_string();
+        Some(ExchangeSession {
+            access_token,
+            refresh_token,
+            family_id,
+        })
+    });
+
     Ok(CliTokenPoll::Approved {
         secret,
         api_key_id,
@@ -584,6 +652,7 @@ fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
         key_name,
         user_name,
         user_uid,
+        session,
     })
 }
 

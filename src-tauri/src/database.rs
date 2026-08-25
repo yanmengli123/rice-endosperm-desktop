@@ -17,6 +17,18 @@ use crate::{
 
 const NEW_THREAD_TITLE: &str = "新对话";
 const LEGACY_ACCOUNT_SCOPE: &str = "legacy";
+
+/// 切换器可见的账号摘要。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    pub account_scope: String,
+    pub display_name: String,
+    pub gateway_url: String,
+    #[serde(default)]
+    pub is_active: bool,
+}
+
 const MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 const V1_LF_CHECKSUM: &str = "6F2F8974DC2BC853D4B6273B0F0947A92164C68855109BF463515E9F20D440F8685DC005927DD751E2B1E863AF645738";
 const V1_LEGACY_CRLF_CHECKSUM: &str = "40B0BBD1ADEC82DD375EAA5DB004CC46DA34D740C3B6012DE181E8F692A2D2C0DE03A5B0B50C1777070F697489636415";
@@ -116,6 +128,55 @@ impl Database {
             .setting("current_account_scope")
             .await?
             .unwrap_or_else(|| LEGACY_ACCOUNT_SCOPE.to_owned()))
+    }
+
+    /// P2b 多账号：登记/更新账号目录行（凭据本体在 Stronghold，按作用域隔离）。
+    pub async fn upsert_account(
+        &self,
+        account_scope: &str,
+        display_name: &str,
+        gateway_url: &str,
+    ) -> AppResult<()> {
+        let now = now();
+        sqlx::query(
+            "INSERT INTO accounts(account_scope, display_name, gateway_url, created_at)              VALUES(?, ?, ?, ?)              ON CONFLICT(account_scope) DO UPDATE SET                display_name = excluded.display_name, gateway_url = excluded.gateway_url",
+        )
+        .bind(account_scope)
+        .bind(display_name)
+        .bind(gateway_url)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// P2b 多账号：列出全部已登录账号（按创建时间）。
+    pub async fn list_accounts(&self) -> AppResult<Vec<AccountSummary>> {
+        let rows = sqlx::query(
+            "SELECT account_scope, display_name, gateway_url FROM accounts ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut accounts = Vec::with_capacity(rows.len());
+        for row in rows {
+            use sqlx::Row as _;
+            accounts.push(AccountSummary {
+                account_scope: row.try_get(0)?,
+                display_name: row.try_get(1)?,
+                gateway_url: row.try_get(2)?,
+                is_active: false,
+            });
+        }
+        Ok(accounts)
+    }
+
+    /// P2b 多账号：移除账号目录行（历史会话保留但不再出现在切换列表）。
+    pub async fn delete_account(&self, account_scope: &str) -> AppResult<()> {
+        sqlx::query("DELETE FROM accounts WHERE account_scope = ?")
+            .bind(account_scope)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn activate_account(
@@ -679,7 +740,7 @@ mod migration_tests {
                 .fetch_one(&repaired.pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest_version, 4);
+        assert_eq!(latest_version, 5);
         assert_eq!(
             repaired
                 .setting("migration_test")

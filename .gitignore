@@ -36,3 +36,4 @@ src-tauri/resources/libsodium.dll
 *.njsproj
 *.sln
 *.sw?
+.tooling/

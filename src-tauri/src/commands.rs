@@ -155,6 +155,55 @@ async fn save_connection_inner(
     })
 }
 
+/// P2b：返回当前应使用的 Bearer 凭证。
+///
+/// 会话访问令牌仍有效时优先使用；临近过期（<120s）自动旋转一次，
+/// 旋转失败回落过渡 API Key 并记录告警，绝不阻塞用户操作。
+async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
+    use crate::session::{StoredSession, parse_jwt_exp};
+
+    let gateway = state.database.gateway_url().await?;
+    let scope = state.database.current_account_scope().await?;
+    let blob = match state.credentials.session_blob(&scope)? {
+        Some(blob) => blob,
+        None => return state.credentials.api_key(),
+    };
+    let Ok(stored) = serde_json::from_str::<StoredSession>(&blob) else {
+        return state.credentials.api_key();
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = parse_jwt_exp(&stored.access_token).unwrap_or(stored.access_expires_at);
+    if expires_at.saturating_sub(now) > 120 {
+        return Ok(SecretString::from(stored.access_token));
+    }
+
+    let refresh_secret = SecretString::from(stored.refresh_token.clone());
+    match state
+        .yuxi
+        .refresh_cli_session(&gateway, &refresh_secret)
+        .await
+    {
+        Ok(rotated) => {
+            let new_expires = parse_jwt_exp(&rotated.access_token).unwrap_or(now + 30 * 60);
+            let updated = StoredSession {
+                access_token: rotated.access_token.clone(),
+                refresh_token: rotated.refresh_token,
+                family_id: stored.family_id,
+                access_expires_at: new_expires,
+            };
+            if let Ok(json) = serde_json::to_string(&updated) {
+                state.credentials.save_session_blob(&scope, &json)?;
+            }
+            Ok(SecretString::from(rotated.access_token))
+        }
+        Err(error) => {
+            diagnostics::log("WARN", "session_refresh_failed", &error.to_string());
+            state.credentials.api_key()
+        }
+    }
+}
+
 /// Stronghold 与 SQLite 无法组成同一个物理事务，因此显式保留旧凭证并补偿回滚。
 /// SQLite 的 activate_account 自身是事务性的；失败时只需把 Stronghold 恢复到旧值。
 async fn persist_local_connection(
@@ -287,7 +336,7 @@ async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> 
     }
 
     let gateway_url = state.database.gateway_url().await?;
-    let api_key = state.credentials.api_key()?;
+    let api_key = ensure_active_bearer(state).await?;
     let mut summary = PendingRunSync {
         recovered: 0,
         pending: 0,
@@ -444,7 +493,7 @@ async fn send_message_inner(
         .await?;
 
     let gateway_url = state.database.gateway_url().await?;
-    let api_key = state.credentials.api_key()?;
+    let api_key = ensure_active_bearer(state).await?;
     let yuxi_thread_id = state.database.yuxi_thread_id(&request.thread_id).await?;
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
@@ -720,7 +769,9 @@ pub async fn cancel_run(
             .gateway_url()
             .await
             .map_err(CommandError::from)?;
-        let api_key = state.credentials.api_key().map_err(CommandError::from)?;
+        let api_key = ensure_active_bearer(&state)
+            .await
+            .map_err(CommandError::from)?;
         state
             .yuxi
             .cancel_run(&gateway_url, &api_key, &run_id)
@@ -944,6 +995,7 @@ pub async fn poll_device_login(
             key_name,
             user_name,
             user_uid,
+            session: session_pair,
         } => {
             let gateway_url = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
             let hint = api_key_hint(&secret);
@@ -978,6 +1030,55 @@ pub async fn poll_device_login(
                 }
                 return Err(CommandError::from(error));
             }
+
+            // P2b：同时落一份作用域凭据，供"切换账号"回到此账号时使用
+            if let Err(error) = state
+                .credentials
+                .save_api_key_for_scope(&account_scope_id, secure_secret.expose_secret())
+            {
+                diagnostics::log("WARN", "scoped_key_save_failed", &error.to_string());
+            }
+
+            // P2b：登记账号目录 + 持久化可旋转会话对（服务端未签发时跳过）
+            if let Err(error) = state
+                .database
+                .upsert_account(
+                    &account_scope_id,
+                    if user_name.is_empty() {
+                        &user_uid
+                    } else {
+                        &user_name
+                    },
+                    &gateway_url,
+                )
+                .await
+            {
+                diagnostics::log("WARN", "account_upsert_failed", &error.to_string());
+            }
+            if let Some(pair) = session_pair {
+                let expires_at = crate::session::parse_jwt_exp(&pair.access_token)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp() + 30 * 60);
+                let stored = crate::session::StoredSession {
+                    access_token: pair.access_token,
+                    refresh_token: pair.refresh_token,
+                    family_id: pair.family_id,
+                    access_expires_at: expires_at,
+                };
+                match serde_json::to_string(&stored) {
+                    Ok(json) => {
+                        if let Err(error) = state
+                            .credentials
+                            .save_session_blob(&account_scope_id, &json)
+                        {
+                            diagnostics::log("WARN", "session_store_failed", &error.to_string());
+                        }
+                    }
+                    Err(error) => {
+                        diagnostics::log("WARN", "session_serialize_failed", &error.to_string());
+                    }
+                }
+            }
+
             Ok(DeviceLoginResult {
                 approved: true,
                 user_name: Some(user_name),
@@ -985,6 +1086,105 @@ pub async fn poll_device_login(
             })
         }
     }
+}
+
+#[tauri::command]
+pub async fn list_accounts(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::database::AccountSummary>, CommandError> {
+    let accounts = state
+        .database
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?;
+    let active = state
+        .database
+        .current_account_scope()
+        .await
+        .unwrap_or_default();
+    Ok(accounts
+        .into_iter()
+        .map(|mut account| {
+            account.is_active = account.account_scope == active;
+            account
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn switch_account(
+    account_scope: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    // 1) 目标账号必须存在于目录中（同时取回网关地址与显示名）
+    let accounts = state
+        .database
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?;
+    let target = accounts
+        .iter()
+        .find(|account| account.account_scope == account_scope)
+        .cloned()
+        .ok_or_else(|| CommandError::from(AppError::MissingCredential))?;
+
+    // 2) 从 Stronghold 取该作用域的 Key，拷贝为 ACTIVE 记录；失败不触碰现有指针
+    let key = state
+        .credentials
+        .api_key_for_scope(&account_scope)?
+        .ok_or(AppError::MissingCredential)?;
+    let hint = api_key_hint(key.expose_secret());
+
+    let previous_active = if state.credentials.has_api_key()? {
+        Some(state.credentials.api_key()?)
+    } else {
+        None
+    };
+    state.credentials.save_api_key(key.expose_secret())?;
+    if let Err(database_error) = state
+        .database
+        .activate_account(
+            &target.gateway_url,
+            &account_scope,
+            &hint,
+            None, // 切换不改 Key 名称
+        )
+        .await
+    {
+        let rollback = match previous_active {
+            Some(previous) => state.credentials.save_api_key(previous.expose_secret()),
+            None => state.credentials.delete_api_key(),
+        };
+        if let Err(rollback_error) = rollback {
+            diagnostics::log(
+                "ERROR",
+                "credential_switch_rollback_failed",
+                &format!("{database_error}; {rollback_error}"),
+            );
+        }
+        return Err(CommandError::from(database_error));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_account(
+    account_scope: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let active = state
+        .database
+        .current_account_scope()
+        .await
+        .unwrap_or_default();
+    if account_scope == active {
+        return Err(CommandError::from(AppError::CredentialStore(
+            "不能移除当前登录中的账号，请先切换到其他账号".into(),
+        )));
+    }
+    state.credentials.delete_scope_records(&account_scope)?;
+    state.database.delete_account(&account_scope).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -996,7 +1196,9 @@ pub async fn list_chat_models(
         .gateway_url()
         .await
         .map_err(CommandError::from)?;
-    let api_key = state.credentials.api_key().map_err(CommandError::from)?;
+    let api_key = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
     let models = state
         .yuxi
         .list_chat_models(&gateway_url, &api_key)
@@ -1014,7 +1216,9 @@ pub async fn get_chat_model_preference(
         .gateway_url()
         .await
         .map_err(CommandError::from)?;
-    let api_key = state.credentials.api_key().map_err(CommandError::from)?;
+    let api_key = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
     state
         .yuxi
         .get_chat_model_preference(&gateway_url, &api_key)
@@ -1032,7 +1236,9 @@ pub async fn set_chat_model_preference(
         .gateway_url()
         .await
         .map_err(CommandError::from)?;
-    let api_key = state.credentials.api_key().map_err(CommandError::from)?;
+    let api_key = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
     let normalized = model_spec
         .as_deref()
         .map(str::trim)
