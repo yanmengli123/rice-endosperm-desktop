@@ -4,7 +4,7 @@ import {
   activateWithCode,
   normalizeCommandError,
   pollDeviceLogin,
-  saveConnection,
+  saveConnectionWithLogin,
   startDeviceLogin,
 } from "../services/tauri-client";
 import type { DeviceLoginStart, PublicSettings } from "../types";
@@ -16,6 +16,8 @@ type Props = {
 
 export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
   const [apiKey, setApiKey] = useState("");
+  const [loginName, setLoginName] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
   const [gatewayUrl, setGatewayUrl] = useState(defaultGatewayUrl);
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -101,12 +103,22 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (!loginName.trim() || !loginPassword) {
+      setError("请填写管理员发放的登录名与初始密码");
+      return;
+    }
     setSaving(true);
     setError("");
     try {
-      const settings = await saveConnection(apiKey.trim(), gatewayUrl.trim());
+      // P5 三字段登录：姓名+密码验证通过且与密钥属主一致才绑定本机
+      await saveConnectionWithLogin(
+        apiKey.trim(),
+        gatewayUrl.trim(),
+        loginName.trim(),
+        loginPassword,
+      );
       setApiKey("");
-      onConnected(settings);
+      setLoginPassword("");
     } catch (reason) {
       setError(normalizeCommandError(reason).message);
     } finally {
@@ -191,6 +203,27 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
             </details>
 
             <form onSubmit={submit} className="connection-form">
+              <label>
+                <span>登录名</span>
+                <input
+                  value={loginName}
+                  onChange={(event) => setLoginName(event.target.value)}
+                  placeholder="管理员发放的登录 ID"
+                  autoComplete="username"
+                  required
+                />
+              </label>
+              <label>
+                <span>初始密码</span>
+                <input
+                  type="password"
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  placeholder="管理员发放的初始密码"
+                  autoComplete="current-password"
+                  required
+                />
+              </label>
               <label>
                 <span><KeyRound size={16} /> API Key</span>
                 <div className="secure-input">

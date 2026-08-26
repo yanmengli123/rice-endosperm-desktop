@@ -18,6 +18,19 @@ import type {
 export const getPublicSettings = () =>
   invoke<PublicSettings>("get_public_settings");
 
+export const saveConnectionWithLogin = (
+  apiKey: string,
+  gatewayUrl: string,
+  username: string,
+  password: string,
+) =>
+  invoke<PublicSettings>("save_connection_with_login", {
+    apiKey,
+    gatewayUrl,
+    username,
+    password,
+  });
+
 export const saveConnection = (apiKey: string, gatewayUrl: string) =>
   invoke<PublicSettings>("save_connection", { apiKey, gatewayUrl });
 

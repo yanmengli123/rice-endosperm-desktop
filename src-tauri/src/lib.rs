@@ -15,8 +15,8 @@ use commands::{
     get_chat_model_preference, get_public_settings, get_thread_run_context, list_accounts,
     list_byok_credentials, list_chat_models, list_threads, load_messages, poll_device_login,
     remove_account, remove_byok_credential, rename_thread, save_byok_credential, save_connection,
-    send_message, set_chat_model_preference, start_device_login, switch_account, sync_pending_runs,
-    test_connection,
+    save_connection_with_login, send_message, set_chat_model_preference, start_device_login,
+    switch_account, sync_pending_runs, test_connection,
 };
 use state::AppState;
 
@@ -49,6 +49,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_public_settings,
             save_connection,
+            save_connection_with_login,
             test_connection,
             delete_api_key,
             create_thread,
