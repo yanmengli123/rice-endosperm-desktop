@@ -444,6 +444,75 @@ impl YuxiClient {
         })
     }
 
+    /// P5 三字段登录校验：证明「姓名+密码」与「API Key」属于同一账号。
+    /// ① 用姓名/密码走 /api/auth/token 换取登录态并取得其 uid；
+    /// ② 用 API Key 调 /api/auth/me 取得密钥属主 uid；
+    /// ③ 两者一致才算通过，返回该账号显示名。
+    pub async fn verify_desktop_login(
+        &self,
+        gateway_url: &str,
+        username: &str,
+        password: &SecretString,
+        api_key: &SecretString,
+    ) -> AppResult<String> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+
+        let login_response = self
+            .client
+            .post(format!("{base}/api/auth/token"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!(
+                "username={}&password={}",
+                urlencode_component(username),
+                urlencode_component(password.expose_secret())
+            ))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        if !login_response.status().is_success() {
+            return Err(AppError::Unauthorized);
+        }
+        let login_value = login_response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let credential_uid = login_value
+            .get("uid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Protocol("登录响应缺少用户标识".into()))?
+            .to_string();
+
+        let me_response = self
+            .authorized_get(&format!("{base}/api/auth/me"), api_key)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        if !me_response.status().is_success() {
+            return Err(AppError::InvalidCredential);
+        }
+        let me_value = me_response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let key_uid = me_value
+            .get("uid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Protocol("凭证响应缺少用户标识".into()))?;
+
+        if key_uid != credential_uid {
+            return Err(AppError::Protocol(
+                "API Key 与登录账号不匹配，请核对开箱信息".into(),
+            ));
+        }
+        Ok(me_value
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or(username)
+            .to_string())
+    }
+
     /// P5：一次性激活凭证兑换设备会话对（公开端点，无静态 Key 签发）。
     pub async fn exchange_onboarding_activation(
         &self,
@@ -768,6 +837,21 @@ pub struct ByokCredential {
 pub struct ModelOption {
     pub spec: String,
     pub label: String,
+}
+
+fn urlencode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
 }
 
 fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {

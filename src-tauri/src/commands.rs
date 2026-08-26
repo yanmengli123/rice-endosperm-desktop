@@ -169,6 +169,69 @@ async fn save_connection_inner(
     })
 }
 
+/// P5 三字段登录：姓名 + 密码 + API Key 联合校验后绑定本机。
+/// 密码对经 /api/auth/token 验证；密钥属主经 /api/auth/me 比对；
+/// 两者一致才落盘，显示名使用账号名，密钥 90 天过期由服务端签发时间决定。
+#[tauri::command]
+pub async fn save_connection_with_login(
+    api_key: String,
+    gateway_url: String,
+    username: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<PublicSettings, CommandError> {
+    let result = save_connection_with_login_inner(
+        &api_key,
+        &gateway_url,
+        username.trim(),
+        &password,
+        &state,
+    )
+    .await;
+    result.map_err(CommandError::from)
+}
+
+async fn save_connection_with_login_inner(
+    api_key: &str,
+    gateway_url: &str,
+    username: &str,
+    password: &str,
+    state: &AppState,
+) -> AppResult<PublicSettings> {
+    validate_api_key(api_key)?;
+    let gateway = validate_gateway_url(gateway_url)?;
+    let secret = SecretString::from(api_key.to_owned());
+    let password_secret = SecretString::from(password.to_owned());
+
+    // 三要素联合校验：密码对 + 密钥属主一致，任一不符即拒绝绑定
+    let display_name = state
+        .yuxi
+        .verify_desktop_login(&gateway, username, &password_secret, &secret)
+        .await?;
+
+    state.credentials.save_api_key(secret.expose_secret())?;
+    let hint = api_key_hint(secret.expose_secret());
+    state
+        .database
+        .activate_account(
+            &gateway,
+            &display_name,
+            &hint,
+            Some(device_label(username).as_str()),
+        )
+        .await?;
+    Ok(PublicSettings {
+        gateway_url: gateway.to_string(),
+        agent_slug: agent_slug().to_owned(),
+        has_api_key: true,
+        api_key_hint: Some(hint),
+    })
+}
+
+fn device_label(username: &str) -> String {
+    format!("桌面端-{username}")
+}
+
 /// P2b：返回当前应使用的 Bearer 凭证。
 ///
 /// 会话访问令牌仍有效时优先使用；临近过期（<120s）自动旋转一次。
