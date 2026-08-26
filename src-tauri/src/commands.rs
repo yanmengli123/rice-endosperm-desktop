@@ -17,6 +17,7 @@ use crate::{
     database::{LocalMessage, PublicSettings, ThreadSummary},
     diagnostics,
     error::{AppError, AppResult, CommandError},
+    session::StoredSession,
     state::AppState,
     yuxi::{
         CliSessionStart, CliTokenPoll, ModelOption, ProgressText, RunResult, ServerRunContext,
@@ -89,10 +90,23 @@ pub enum RunEvent {
 pub async fn get_public_settings(
     state: State<'_, AppState>,
 ) -> Result<PublicSettings, CommandError> {
+    // P5：纯会话账号（激活码开通，无静态 Key）也算已连接
     let has_api_key = state
         .credentials
         .has_api_key()
         .map_err(CommandError::from)?;
+    let scope = state
+        .database
+        .current_account_scope()
+        .await
+        .unwrap_or_else(|_| "legacy".into());
+    let has_session = !state
+        .credentials
+        .session_blob(&scope)
+        .map_err(CommandError::from)?
+        .unwrap_or_default()
+        .is_empty();
+    let connected = has_api_key || has_session;
     Ok(PublicSettings {
         gateway_url: state
             .database
@@ -100,7 +114,7 @@ pub async fn get_public_settings(
             .await
             .map_err(CommandError::from)?,
         agent_slug: agent_slug().to_owned(),
-        has_api_key,
+        has_api_key: connected,
         api_key_hint: if has_api_key {
             state
                 .database
@@ -157,8 +171,11 @@ async fn save_connection_inner(
 
 /// P2b：返回当前应使用的 Bearer 凭证。
 ///
-/// 会话访问令牌仍有效时优先使用；临近过期（<120s）自动旋转一次，
-/// 旋转失败回落过渡 API Key 并记录告警，绝不阻塞用户操作。
+/// 会话访问令牌仍有效时优先使用；临近过期（<120s）自动旋转一次。
+///
+/// P5 fail-closed：会话型账号（存在会话 blob）在旋转失败时**禁止回退静态 API Key**——
+/// 管理员撤销设备后静态 Key 不能成为旁路。返回 SessionRequiresRelogin 让前端引导
+/// 重新登录；仅"无任何会话记录"的传统手动 Key 账号继续走 api_key() 路径。
 async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
     use crate::session::{StoredSession, parse_jwt_exp};
 
@@ -168,9 +185,10 @@ async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
         Some(blob) => blob,
         None => return state.credentials.api_key(),
     };
-    let Ok(stored) = serde_json::from_str::<StoredSession>(&blob) else {
-        return state.credentials.api_key();
-    };
+    let stored = serde_json::from_str::<StoredSession>(&blob).map_err(|error| {
+        diagnostics::log("ERROR", "session_blob_corrupted", &error.to_string());
+        AppError::SessionRequiresRelogin
+    })?;
 
     let now = chrono::Utc::now().timestamp();
     let expires_at = parse_jwt_exp(&stored.access_token).unwrap_or(stored.access_expires_at);
@@ -199,7 +217,7 @@ async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
         }
         Err(error) => {
             diagnostics::log("WARN", "session_refresh_failed", &error.to_string());
-            state.credentials.api_key()
+            Err(AppError::SessionRequiresRelogin)
         }
     }
 }
@@ -968,6 +986,65 @@ pub async fn start_device_login(
         web_origin,
         expires_in: start.expires_in,
         interval: start.interval,
+    })
+}
+
+/// P5 激活结果：纯会话账号（无静态 Key），前端据此提示完成。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivationOutcome {
+    pub account_scope: String,
+    pub user_name: String,
+}
+
+#[tauri::command]
+pub async fn activate_with_code(
+    gateway_url: String,
+    activation_code: String,
+    device_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ActivationOutcome, CommandError> {
+    let gateway = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
+    let device = {
+        let trimmed = device_name.as_deref().unwrap_or("桌面端").trim();
+        if trimmed.is_empty() {
+            "桌面端"
+        } else {
+            trimmed
+        }
+    };
+
+    let exchange = state
+        .yuxi
+        .exchange_onboarding_activation(&gateway, activation_code.trim(), device)
+        .await?;
+
+    // 仅保存会话对（无静态 Key 可写）；ensure_active_bearer 会话优先，
+    // 纯会话账号在刷新失败时 fail-closed 引导重新激活。
+    let scope = exchange.account_scope_id.clone();
+    let now = chrono::Utc::now().timestamp();
+    let stored = StoredSession {
+        access_token: exchange.access_token.clone(),
+        refresh_token: exchange.refresh_token.clone(),
+        family_id: exchange.family_id.clone(),
+        access_expires_at: now + 30 * 60,
+    };
+    let blob =
+        serde_json::to_string(&stored).map_err(|error| AppError::Protocol(error.to_string()))?;
+    state
+        .credentials
+        .save_session_blob(&scope, &blob)
+        .map_err(CommandError::from)?;
+
+    state
+        .database
+        .activate_account(&gateway, &scope, "设备会话", Some(device))
+        .await
+        .map_err(CommandError::from)?;
+
+    Ok(ActivationOutcome {
+        account_scope: scope,
+        user_name: exchange.user_name,
     })
 }
 

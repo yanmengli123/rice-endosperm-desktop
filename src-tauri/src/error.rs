@@ -36,6 +36,8 @@ pub enum AppError {
     ServerUpgradeRequired,
     #[error("请求已取消")]
     Cancelled,
+    #[error("登录会话已失效，请在连接设置中重新登录")]
+    SessionRequiresRelogin,
     #[error("找不到本地会话")]
     ThreadNotFound,
     #[error("网络请求失败：{0}")]
@@ -73,6 +75,7 @@ impl AppError {
             Self::LocalServiceUnavailable => "local_service_unavailable",
             Self::ServerUpgradeRequired => "server_upgrade_required",
             Self::Cancelled => "cancelled",
+            Self::SessionRequiresRelogin => "session_requires_relogin",
             Self::ThreadNotFound => "thread_not_found",
             Self::Network(_) => "network_error",
             Self::Protocol(_) => "protocol_error",

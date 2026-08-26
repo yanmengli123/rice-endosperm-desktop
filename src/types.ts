@@ -111,6 +111,11 @@ export type DeviceLoginResult = {
   userUid?: string;
 };
 
+export type ActivationOutcome = {
+  accountScope: string;
+  userName: string;
+};
+
 export type ModelOption = {
   spec: string;
   label: string;

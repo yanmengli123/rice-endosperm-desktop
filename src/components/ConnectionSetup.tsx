@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, MonitorSmartphone, Server } from "lucide-react";
+import { Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, MonitorSmartphone, Server, Ticket } from "lucide-react";
 import {
+  activateWithCode,
   normalizeCommandError,
   pollDeviceLogin,
   saveConnection,
@@ -22,6 +23,9 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
   const [deviceLogin, setDeviceLogin] = useState<DeviceLoginStart | null>(null);
   const [deviceStatus, setDeviceStatus] = useState("正在等待网页端授权…");
   const [deviceError, setDeviceError] = useState("");
+  const [activationCode, setActivationCode] = useState("");
+  const [activating, setActivating] = useState(false);
+  const [activationOpen, setActivationOpen] = useState(false);
   const pollTimer = useRef<number | undefined>(undefined);
   const pollActive = useRef(false);
 
@@ -76,6 +80,22 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
       );
     } catch (reason) {
       setError(normalizeCommandError(reason).message);
+    }
+  }
+
+  // P5：一次性激活码登录——管理员开户后发放，兑换纯会话凭证（无静态 Key）
+  async function submitActivation(event: React.FormEvent) {
+    event.preventDefault();
+    setActivating(true);
+    setError("");
+    try {
+      await activateWithCode(gatewayUrl.trim(), activationCode.trim());
+      const settings = await import("../services/tauri-client").then((m) => m.getPublicSettings());
+      onConnected(settings);
+    } catch (reason) {
+      setError(normalizeCommandError(reason).message);
+    } finally {
+      setActivating(false);
     }
   }
 
@@ -147,6 +167,28 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
             <button type="button" className="device-login-entry" onClick={() => void startLogin()}>
               <MonitorSmartphone size={17} /> 使用账号登录（设备码授权）
             </button>
+
+            <details className="activation-panel" open={activationOpen} onToggle={(event) => setActivationOpen((event.target as HTMLDetailsElement).open)}>
+              <summary><Ticket size={16} /> 使用激活码登录</summary>
+              <form onSubmit={submitActivation} className="activation-form">
+                <label>
+                  <span>激活码</span>
+                  <input
+                    value={activationCode}
+                    onChange={(event) => setActivationCode(event.target.value)}
+                    placeholder="yxact_..."
+                    autoComplete="off"
+                    spellCheck={false}
+                    required
+                  />
+                  <small>管理员开户时发放的一次性激活码；激活后本机绑定该账号并使用安全会话。</small>
+                </label>
+                <button className="primary-button" disabled={activating || !activationCode.trim()}>
+                  {activating ? <LoaderCircle className="spin" size={18} /> : <Ticket size={18} />}
+                  {activating ? "正在激活…" : "激活并登录"}
+                </button>
+              </form>
+            </details>
 
             <form onSubmit={submit} className="connection-form">
               <label>
