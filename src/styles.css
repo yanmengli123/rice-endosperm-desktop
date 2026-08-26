@@ -393,3 +393,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   flex-direction: column;
   gap: 4px;
 }
+
+/* P5 BYOK：自有模型密钥表单 */
+.byok-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.byok-form input,
+.byok-form select {
+  width: 100%;
+}

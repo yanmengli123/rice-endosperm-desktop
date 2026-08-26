@@ -1284,6 +1284,91 @@ pub async fn list_chat_models(
     Ok(models)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByokCredentialView {
+    pub credential_id: i64,
+    pub provider_id: String,
+    pub label: String,
+    pub masked_hint: String,
+    pub status: String,
+}
+
+#[tauri::command]
+pub async fn list_byok_credentials(
+    state: State<'_, AppState>,
+) -> Result<Vec<ByokCredentialView>, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    let items = state
+        .yuxi
+        .list_byok_credentials(&gateway_url, &bearer)
+        .await
+        .map_err(CommandError::from)?;
+    Ok(items
+        .into_iter()
+        .map(|item| ByokCredentialView {
+            credential_id: item.credential_id,
+            provider_id: item.provider_id,
+            label: item.label,
+            masked_hint: item.masked_hint,
+            status: item.status,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn save_byok_credential(
+    provider_id: String,
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .save_byok_credential(
+            &gateway_url,
+            &bearer,
+            provider_id.trim(),
+            &SecretString::from(api_key),
+        )
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn remove_byok_credential(
+    credential_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .delete_byok_credential(&gateway_url, &bearer, credential_id)
+        .await
+        .map_err(CommandError::from)
+}
+
 #[tauri::command]
 pub async fn get_chat_model_preference(
     state: State<'_, AppState>,
