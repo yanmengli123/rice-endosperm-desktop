@@ -444,6 +444,58 @@ impl YuxiClient {
         })
     }
 
+    /// P5：一次性激活凭证兑换设备会话对（公开端点，无静态 Key 签发）。
+    pub async fn exchange_onboarding_activation(
+        &self,
+        gateway_url: &str,
+        activation_code: &str,
+        device_name: &str,
+    ) -> AppResult<OnboardingExchange> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .client
+            .post(format!("{base}/api/auth/onboarding/exchange"))
+            .json(&json!({
+                "activation_code": activation_code,
+                "device_name": device_name,
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let session = value
+            .get("session")
+            .ok_or_else(|| AppError::Protocol("激活响应缺少会话对".into()))?;
+        let session_field = |name: &str| -> AppResult<String> {
+            session
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| AppError::Protocol(format!("激活响应缺少会话字段 {name}")))
+        };
+        Ok(OnboardingExchange {
+            account_scope_id: value
+                .get("account_scope_id")
+                .and_then(Value::as_str)
+                .filter(|item| item.starts_with("yxacct_"))
+                .ok_or_else(|| AppError::Protocol("激活响应缺少账号作用域标识".into()))?
+                .to_string(),
+            user_name: value
+                .pointer("/user/username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            access_token: session_field("access_token")?,
+            refresh_token: session_field("refresh_token")?,
+            family_id: session_field("session_id")?,
+        })
+    }
+
     /// 设备登录本机持久化失败时，用新 Key 自撤销，避免服务器残留孤儿凭证。
     pub async fn delete_api_key(
         &self,
@@ -592,6 +644,16 @@ pub struct ExchangeSession {
 pub struct RotatedSession {
     pub access_token: String,
     pub refresh_token: String,
+}
+
+/// P5 激活码兑换结果：纯会话账号（无静态 Key）。
+#[derive(Debug, Clone)]
+pub struct OnboardingExchange {
+    pub account_scope_id: String,
+    pub user_name: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub family_id: String,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

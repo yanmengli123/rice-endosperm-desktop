@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  ActivationOutcome,
   ChatCompletion,
   DeviceLoginResult,
   DeviceLoginStart,
@@ -55,6 +56,13 @@ export const startDeviceLogin = (gatewayUrl: string, keyName?: string) =>
 
 export const pollDeviceLogin = (gatewayUrl: string, deviceCode: string) =>
   invoke<DeviceLoginResult>("poll_device_login", { gatewayUrl, deviceCode });
+
+export const activateWithCode = (gatewayUrl: string, activationCode: string, deviceName?: string) =>
+  invoke<ActivationOutcome>("activate_with_code", {
+    gatewayUrl,
+    activationCode,
+    deviceName: deviceName ?? null,
+  });
 
 export const listChatModels = () => invoke<ModelOption[]>("list_chat_models");
 
