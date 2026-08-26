@@ -116,6 +116,14 @@ export type ActivationOutcome = {
   userName: string;
 };
 
+export type ByokCredential = {
+  credentialId: number;
+  providerId: string;
+  label: string;
+  maskedHint: string;
+  status: string;
+};
+
 export type ModelOption = {
   spec: string;
   label: string;

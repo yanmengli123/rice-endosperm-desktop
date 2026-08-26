@@ -513,6 +513,103 @@ impl YuxiClient {
         Ok(())
     }
 
+    /// P5 BYOK：列出当前用户的自有模型凭据（仅掩码，无明文）。
+    pub async fn list_byok_credentials(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+    ) -> AppResult<Vec<ByokCredential>> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}/api/user/model-credentials"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let items = value
+            .get("credentials")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
+            .iter()
+            .map(|item| ByokCredential {
+                credential_id: item
+                    .get("credential_id")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                provider_id: item
+                    .get("provider_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                label: item
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                masked_hint: item
+                    .get("masked_hint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                status: item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect())
+    }
+
+    /// P5 BYOK：保存/替换某供应商下的自有密钥（服务端版本化，明文不落盘）。
+    pub async fn save_byok_credential(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        provider_id: &str,
+        api_key: &SecretString,
+    ) -> AppResult<()> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_put(&format!("{base}/api/user/model-credentials"), bearer)
+            .json(&json!({
+                "provider_id": provider_id,
+                "api_key": api_key.expose_secret(),
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// P5 BYOK：逻辑撤销自有凭据；进行中任务由服务端 fail-closed 处理。
+    pub async fn delete_byok_credential(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        credential_id: i64,
+    ) -> AppResult<()> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_delete(
+                &format!("{base}/api/user/model-credentials/{credential_id}"),
+                bearer,
+            )
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        ensure_success(response).await?;
+        Ok(())
+    }
+
     /// 拉取当前可用聊天模型列表（用户级模型选择器数据源）。
     pub async fn list_chat_models(
         &self,
@@ -654,6 +751,17 @@ pub struct OnboardingExchange {
     pub access_token: String,
     pub refresh_token: String,
     pub family_id: String,
+}
+
+/// P5 BYOK：用户自有模型凭据（服务端仅返回掩码，无明文）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByokCredential {
+    pub credential_id: i64,
+    pub provider_id: String,
+    pub label: String,
+    pub masked_hint: String,
+    pub status: String,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

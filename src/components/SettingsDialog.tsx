@@ -7,14 +7,17 @@ import {
   deleteApiKey,
   getChatModelPreference,
   listAccounts,
+  listByokCredentials,
   listChatModels,
   normalizeCommandError,
   removeAccount,
+  removeByokCredential,
+  saveByokCredential,
   switchAccount,
   setChatModelPreference,
   testConnection,
 } from "../services/tauri-client";
-import type { ModelOption, PublicSettings } from "../types";
+import type { ByokCredential, ModelOption, PublicSettings } from "../types";
 import type { AccountSummary } from "../services/tauri-client";
 
 type Props = {
@@ -31,6 +34,49 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
   const [modelSaving, setModelSaving] = useState(false);
   const [accounts, setAccounts] = useState<AccountSummary[]>([]);
+  // P5 BYOK：自有模型密钥管理（服务端加密存储，本机仅经 Rust 请求发送，不落盘）
+  const [byokList, setByokList] = useState<ByokCredential[]>([]);
+  const [byokProvider, setByokProvider] = useState("");
+  const [byokKey, setByokKey] = useState("");
+
+  const byokProviders = Array.from(new Set(models.map((model) => model.spec.split(":")[0])));
+
+  async function reloadByok() {
+    const rows = await listByokCredentials();
+    setByokList(rows.filter((row) => row.status === "active"));
+  }
+
+  async function saveByok() {
+    if (!byokProvider || !byokKey.trim()) {
+      setStatus("请选择供应商并填写 API Key");
+      return;
+    }
+    setBusy(true);
+    try {
+      await saveByokCredential(byokProvider, byokKey.trim());
+      setByokKey("");
+      setStatus(`已保存 ${byokProvider} 的自有密钥；该供应商的对话将优先使用你的密钥`);
+      await reloadByok();
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeByok(credentialId: number) {
+    if (!window.confirm("移除后使用该密钥的对话将回到企业模型轨道，确定吗？")) return;
+    setBusy(true);
+    try {
+      await removeByokCredential(credentialId);
+      await reloadByok();
+      setStatus("已移除自有密钥");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -41,6 +87,13 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
         setAccounts(rows);
       } catch {
         // 账号目录读取失败不打断设置页，仅不展示切换区
+      }
+      try {
+        const rows = await listByokCredentials();
+        if (cancelled) return;
+        setByokList(rows.filter((row) => row.status === "active"));
+      } catch {
+        // BYOK 加载失败不打断设置页
       }
     })();
     return () => {
@@ -214,6 +267,51 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+          {byokProviders.length > 0 && (
+            <div className="settings-field setting-row-stack">
+              <span>我的模型密钥<span className="model-hint">（BYOK：自带厂商密钥，服务端加密保存，仅显示掩码）</span></span>
+              <ul className="account-list">
+                {byokList.map((cred) => (
+                  <li key={cred.credentialId} className="account-row">
+                    <span className="account-name">
+                      {cred.providerId} · {cred.label || "自有密钥"} · {cred.maskedHint}
+                    </span>
+                    <span className="account-actions">
+                      <button className="danger-button" onClick={() => void removeByok(cred.credentialId)} disabled={busy}>
+                        移除
+                      </button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <div className="byok-form">
+                <select
+                  className="model-select"
+                  value={byokProvider}
+                  onChange={(event) => setByokProvider(event.target.value)}
+                  aria-label="选择供应商"
+                  disabled={busy}
+                >
+                  <option value="">选择供应商…</option>
+                  {byokProviders.map((provider) => (
+                    <option key={provider} value={provider}>{provider}</option>
+                  ))}
+                </select>
+                <input
+                  type="password"
+                  value={byokKey}
+                  onChange={(event) => setByokKey(event.target.value)}
+                  placeholder="粘贴你在厂商处购买的 API Key"
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={busy}
+                />
+                <button onClick={() => void saveByok()} disabled={busy || !byokProvider || !byokKey.trim()}>
+                  保存
+                </button>
+              </div>
             </div>
           )}
           <div className="settings-actions">

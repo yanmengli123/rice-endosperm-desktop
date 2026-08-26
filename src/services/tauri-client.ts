@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ActivationOutcome,
+  ByokCredential,
   ChatCompletion,
   DeviceLoginResult,
   DeviceLoginStart,
@@ -65,6 +66,14 @@ export const activateWithCode = (gatewayUrl: string, activationCode: string, dev
   });
 
 export const listChatModels = () => invoke<ModelOption[]>("list_chat_models");
+
+export const listByokCredentials = () => invoke<ByokCredential[]>("list_byok_credentials");
+
+export const saveByokCredential = (providerId: string, apiKey: string) =>
+  invoke<void>("save_byok_credential", { providerId, apiKey });
+
+export const removeByokCredential = (credentialId: number) =>
+  invoke<void>("remove_byok_credential", { credentialId });
 
 export const getChatModelPreference = () =>
   invoke<string | null>("get_chat_model_preference");
