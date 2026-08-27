@@ -21,7 +21,7 @@ use crate::{
     state::AppState,
     yuxi::{
         CliSessionStart, CliTokenPoll, ModelOption, ProgressText, RunResult, ServerRunContext,
-        terminal_status,
+        sanitize_visible_model_text, terminal_status,
     },
 };
 
@@ -402,11 +402,18 @@ pub async fn create_thread(state: State<'_, AppState>) -> Result<ThreadSummary, 
 
 #[tauri::command]
 pub async fn list_threads(state: State<'_, AppState>) -> Result<Vec<ThreadSummary>, CommandError> {
-    state
+    let mut threads = state
         .database
         .list_threads()
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+    // Legacy rows persisted before reasoning redaction may still contain
+    // chain-of-thought inside messages.content, which feeds this preview.  The
+    // sidebar preview must never surface it.
+    for thread in &mut threads {
+        thread.preview = sanitize_visible_model_text(&thread.preview);
+    }
+    Ok(threads)
 }
 
 #[tauri::command]
@@ -414,11 +421,17 @@ pub async fn load_messages(
     thread_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<LocalMessage>, CommandError> {
-    state
+    let mut messages = state
         .database
         .load_messages(&thread_id)
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+    for message in &mut messages {
+        if message.role == "assistant" {
+            message.content = sanitize_visible_model_text(&message.content);
+        }
+    }
+    Ok(messages)
 }
 
 #[tauri::command]

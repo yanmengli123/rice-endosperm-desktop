@@ -71,4 +71,44 @@ describe("createYuxiAdapter", () => {
       }),
     );
   });
+
+  it("从流式预览、最终结果和完成回调中移除 think 内容", async () => {
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "text", text: "<think>private chain" });
+      channel.onmessage({ type: "text", text: "<think>private chain</think>你好！" });
+      return {
+        runId: "run-2",
+        threadId: "yuxi-thread-2",
+        requestId: "desktop-request-2",
+        status: "completed",
+        text: "\\<think>private final chain</think>你好！我是稻芯智析。",
+        context: {
+          protocolVersion: "1.1",
+          knowledgeScope: { allowWeb: false, kbCount: 0, members: [] },
+          knowledgeRetrievals: [],
+        },
+      };
+    });
+    const onCompleted = vi.fn();
+    const adapter = createYuxiAdapter("local-thread-2", { onCompleted });
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ] as unknown as ThreadMessage[];
+    const stream = adapter.run({
+      messages,
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+
+    const rendered: string[] = [];
+    for await (const update of stream) {
+      const part = update.content?.[0];
+      if (part?.type === "text") rendered.push(part.text);
+    }
+
+    expect(rendered).not.toContain(expect.stringContaining("private"));
+    expect(rendered[rendered.length - 1]).toBe("你好！我是稻芯智析。");
+    expect(onCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "你好！我是稻芯智析。" }),
+    );
+  });
 });

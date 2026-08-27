@@ -914,7 +914,162 @@ fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError 
 #[derive(Default)]
 pub struct ProgressText {
     message_id: Option<String>,
+    raw_text: String,
     text: String,
+}
+
+fn ascii_tag_at(text: &str, start: usize) -> Option<(usize, bool)> {
+    let remaining = text.get(start..)?;
+    let bytes = remaining.as_bytes();
+    let mut pos = bytes.iter().take_while(|&&byte| byte == b'\\').count();
+
+    let left = ["<", "&lt;", "&#60;", "&#x3c;"].into_iter().find(|token| {
+        remaining
+            .get(pos..pos + token.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
+    })?;
+    pos += left.len();
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let is_open = bytes.get(pos) != Some(&b'/');
+    if !is_open {
+        pos += 1;
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+    }
+    const THINK: &str = "think";
+    if !remaining
+        .get(pos..pos + THINK.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(THINK))
+    {
+        return None;
+    }
+    pos += THINK.len();
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let right = [">", "&gt;", "&#62;", "&#x3e;"].into_iter().find(|token| {
+        remaining
+            .get(pos..pos + token.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
+    })?;
+    pos += right.len();
+    Some((pos, is_open))
+}
+
+fn hold_partial_opening_tag(text: &str) -> &str {
+    let pending = pending_tag_prefix_len(text);
+    &text[..text.len() - pending]
+}
+
+/// Length in bytes of the trailing span of `text` that could still become a
+/// reasoning tag once more characters arrive: a bracket token ("<", "&lt",
+/// "&#60", "&#x3c"), one run of backslashes, or the whole of "<", "< t",
+/// "< / t", "&lt; think " etc.  Streaming emitters hold this suffix back so a
+/// provider tag split across many deltas never flashes on screen; a complete
+/// message reports 0.
+fn pending_tag_prefix_len(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    // A trailing backslash run may still open an escaped tag.
+    let backslash_run = text.bytes().rev().take_while(|&b| b == b'\\').count();
+    if backslash_run > 0 {
+        return backslash_run;
+    }
+    let indices: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    for &start in indices.iter().rev() {
+        let tail = &text[start..];
+        if let Some(token_len) = bracket_token_len(tail)
+            && is_tag_progress(&tail[token_len..])
+        {
+            return tail.len();
+        }
+    }
+    0
+}
+
+fn is_tag_progress(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    let skip_whitespace = |pos: &mut usize| {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+            *pos += 1;
+        }
+    };
+    skip_whitespace(&mut pos);
+    if pos < bytes.len() && bytes[pos] == b'/' {
+        pos += 1;
+        skip_whitespace(&mut pos);
+    }
+    const THINK: [u8; 5] = *b"think";
+    let mut letter_index = 0;
+    while pos < bytes.len()
+        && letter_index < THINK.len()
+        && bytes[pos].to_ascii_lowercase() == THINK[letter_index]
+    {
+        pos += 1;
+        letter_index += 1;
+    }
+    skip_whitespace(&mut pos);
+    pos == bytes.len()
+}
+
+/// Length of a reasoning open/close bracket token at the start of `s`, if any.
+/// Mirrors the bracket alternation of the Python/TS `TAG_PATTERN`.
+fn bracket_token_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let backslashes = bytes.iter().take_while(|&&b| b == b'\\').count();
+    let rest = &s[backslashes..];
+    for token in ["<", "&lt;", "&#60;", "&#x3c;"] {
+        let comparable_len = rest.len().min(token.len());
+        if rest
+            .get(..comparable_len)
+            .zip(token.get(..comparable_len))
+            .is_some_and(|(value, prefix)| value.eq_ignore_ascii_case(prefix))
+            && (rest.len() <= token.len()
+                || rest
+                    .get(..token.len())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(token)))
+        {
+            return Some(backslashes + comparable_len);
+        }
+    }
+    None
+}
+
+/// Return only user-facing answer text. Unclosed reasoning fails closed.
+pub fn sanitize_visible_model_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut visible = String::new();
+    let mut cursor = 0;
+    let mut depth = 0_u32;
+    let mut position = 0;
+    while position < text.len() {
+        if let Some((length, is_open)) = ascii_tag_at(text, position) {
+            if depth == 0 {
+                visible.push_str(&text[cursor..position]);
+            }
+            if is_open {
+                depth = depth.saturating_add(1);
+            } else {
+                depth = depth.saturating_sub(1);
+            }
+            position += length;
+            cursor = position;
+            continue;
+        }
+        position += text[position..].chars().next().map_or(1, char::len_utf8);
+    }
+    if depth == 0 {
+        visible.push_str(&text[cursor..]);
+    }
+    visible
 }
 
 impl ProgressText {
@@ -942,10 +1097,16 @@ impl ProgressText {
                     .filter(|id| !id.is_empty());
                 if incoming_message_id != self.message_id.as_deref() {
                     self.message_id = incoming_message_id.map(str::to_owned);
+                    self.raw_text.clear();
                     self.text.clear();
                 }
-                self.text.push_str(delta);
-                changed = true;
+                self.raw_text.push_str(delta);
+                let visible = sanitize_visible_model_text(&self.raw_text);
+                let emit = hold_partial_opening_tag(&visible);
+                if emit != self.text {
+                    self.text = emit.to_owned();
+                    changed = true;
+                }
                 continue;
             }
 
@@ -955,8 +1116,13 @@ impl ProgressText {
                     .and_then(Value::as_str)
                     .filter(|content| !content.is_empty())
             {
-                self.text.push_str(delta);
-                changed = true;
+                self.raw_text.push_str(delta);
+                let visible = sanitize_visible_model_text(&self.raw_text);
+                let emit = hold_partial_opening_tag(&visible);
+                if emit != self.text {
+                    self.text = emit.to_owned();
+                    changed = true;
+                }
             }
         }
 
@@ -984,8 +1150,8 @@ fn final_output(value: &Value) -> String {
                 .pointer("/choices/0/messages/0/content")
                 .and_then(Value::as_str)
         })
+        .map(sanitize_visible_model_text)
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn parse_run_result(value: &Value) -> RunResult {
@@ -1046,7 +1212,8 @@ mod tests {
 
     use super::{
         CliSessionStart, CliTokenPoll, ProgressText, connection_error_for_gateway, final_output,
-        parse_cli_token_response, parse_desktop_login_response, parse_run_result, terminal_status,
+        parse_cli_token_response, parse_desktop_login_response, parse_run_result,
+        sanitize_visible_model_text, terminal_status,
     };
 
     #[test]
@@ -1143,6 +1310,57 @@ mod tests {
     }
 
     #[test]
+    fn redacts_tagged_reasoning_across_stream_boundaries() {
+        let mut progress = ProgressText::default();
+        let first = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "<th"}
+        }}});
+        assert_eq!(progress.apply(&first), None);
+
+        let second = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "ink>private chain"}
+        }}});
+        assert_eq!(progress.apply(&second), None);
+
+        let third = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "</think>你好！"}
+        }}});
+        assert_eq!(progress.apply(&third).as_deref(), Some("你好！"));
+    }
+
+    #[test]
+    fn sanitizes_escaped_entity_and_unclosed_reasoning() {
+        assert_eq!(
+            sanitize_visible_model_text(r"\\\<think>private</think>公开答案"),
+            "公开答案"
+        );
+        assert_eq!(
+            sanitize_visible_model_text("&lt;think&gt;private&lt;/think&gt;公开答案"),
+            "公开答案"
+        );
+        assert_eq!(
+            sanitize_visible_model_text("<  THINK  >private< / think >公开答案"),
+            "公开答案"
+        );
+        assert_eq!(sanitize_visible_model_text("<think>private"), "");
+    }
+
+    #[test]
+    fn holds_partial_entity_tag_during_streaming() {
+        let mut progress = ProgressText::default();
+        for delta in ["&", "lt", ";thi", "nk&gt;private"] {
+            let value = json!({"payload": {"chunk": {
+                "stream_event": {"type": "message_delta", "message_id": "message-1", "content": delta}
+            }}});
+            assert_eq!(progress.apply(&value), None);
+        }
+        let answer = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "&lt;/think&gt;公开答案"}
+        }}});
+        assert_eq!(progress.apply(&answer).as_deref(), Some("公开答案"));
+    }
+
+    #[test]
     fn extracts_terminal_and_authoritative_output() {
         let value = json!({
             "status": "completed",
@@ -1151,6 +1369,12 @@ mod tests {
         });
         assert_eq!(terminal_status(&value), Some("completed"));
         assert_eq!(final_output(&value), "最终回答");
+
+        let legacy = json!({
+            "status": "completed",
+            "output": "<think>private chain</think>最终回答"
+        });
+        assert_eq!(final_output(&legacy), "最终回答");
     }
 
     #[test]

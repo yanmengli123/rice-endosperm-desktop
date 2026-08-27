@@ -10,10 +10,11 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, Square } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, LoaderCircle, Square } from "lucide-react";
 import remarkGfm from "remark-gfm";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
 import type { ChatCompletion, LocalMessage } from "../types";
+import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 
 type Props = {
   threadId: string;
@@ -26,7 +27,12 @@ function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
   return messages.map((message) => ({
     id: message.id,
     role: message.role,
-    content: [{ type: "text", text: message.content }],
+    content: [
+      {
+        type: "text",
+        text: message.role === "assistant" ? sanitizeVisibleModelText(message.content) : message.content,
+      },
+    ],
     createdAt: new Date(message.createdAt),
   }));
 }
@@ -161,6 +167,12 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
         <ThreadPrimitive.Viewport className="thread-viewport">
           <Welcome />
           <ThreadPrimitive.Messages components={{ Message: ChatMessage }} />
+          <AuiIf condition={(state) => state.thread.isRunning}>
+            <div className="thinking-status" role="status" aria-live="polite">
+              <LoaderCircle size={16} />
+              <span>思考中…</span>
+            </div>
+          </AuiIf>
           <ThreadPrimitive.ScrollToBottom className="scroll-bottom" aria-label="滚动到底部">
             <ArrowDown size={18} />
           </ThreadPrimitive.ScrollToBottom>

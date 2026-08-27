@@ -1,6 +1,6 @@
 [package]
 name = "rice-endosperm-desktop"
-version = "0.3.2"
+version = "0.3.3"
 description = "稻芯智析——水稻胚乳科研智能问答桌面客户端"
 authors = ["Rice Endosperm AI"]
 edition = "2024"
