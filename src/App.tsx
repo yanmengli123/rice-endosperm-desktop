@@ -238,7 +238,7 @@ export default function App() {
           </div>
           <div className={`connection-badge ${runState.status === "failed" ? "error" : ""}`}>
             {runState.status === "failed" ? <WifiOff size={15} /> : <Wifi size={15} />}
-            {runState.message || (runState.status === "running" ? "正在分析" : "服务已连接")}
+            {runState.message || (runState.status === "running" ? "思考中…" : "服务已连接")}
           </div>
         </header>
         <RunContextBar context={runContext} />

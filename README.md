@@ -2,9 +2,9 @@
 
 <img src="public/brand-logo.png" width="180" alt="稻芯智析徽标">
 
-稻芯智析是面向水稻胚乳发育、灌浆调控、基因功能与组学分析的科研智能问答桌面客户端。客户端以 [Yuxi](https://github.com/xerrors/Yuxi) 作为 Agent 业务内核，通过 Yuxi API Key 连接用户指定的 APISIX/Yuxi 网关。
+稻芯智析是面向水稻胚乳发育、灌浆调控、基因功能与组学分析的科研智能问答桌面客户端。客户端以 [Yuxi](https://github.com/xerrors/Yuxi) 作为 Agent 业务内核，通过管理员签发的账号与 Yuxi API Key 连接用户指定的 APISIX/Yuxi 网关。
 
-> 当前公开版是自托管客户端：首次启动时填写你的 Yuxi API Key 和网关地址。本地默认地址为 `http://127.0.0.1:9088`；远程网关必须使用 HTTPS。
+> 当前公开版是自托管客户端：首次启动时填写管理员发放的登录 ID（或用户名）、初始密码、Yuxi API Key 和网关地址。三项凭据会由服务端原子校验，客户端不会自行拼接身份。本地默认地址为 `http://127.0.0.1:9088`；远程网关必须使用 HTTPS。
 
 ## 下载与安装
 
@@ -32,13 +32,21 @@
 
 你的 Yuxi/APISIX 实例需要开放以下经过 API Key 认证的接口：
 
+- `POST /api/auth/desktop/login`：桌面端首次绑定时原子校验登录标识、密码和 API Key 归属（该端点自身不使用 Bearer Key，由网关限速保护）；
+
 ```text
 GET  /api/agent-invocation/credential-status
-POST /api/agent-invocation/agent-call/runs
-POST /api/agent-invocation/agent-call/runs/result
+GET  /api/agent/default
+POST /api/chat/thread
+POST /api/agent/runs
 GET  /api/agent/runs/{run_id}/events?verbose=false
+GET  /api/agent/runs/{run_id}/result
 POST /api/agent/runs/{run_id}/cancel
 ```
+
+从 v0.3.4 起，桌面端不再使用 `agent-call` 兼容包装。智能体、模型策略、知识范围、
+会话历史和最终答案均由 Yuxi 原生 AgentRun 链路决定；桌面安装包中的
+`YUXI_AGENT_SLUG` 只作为首次连接前的展示回退值，不参与已连接用户的实际问答路由。
 
 配套 Yuxi 改造位于 [rice-endosperm-agent](https://github.com/yanmengli123/rice-endosperm-agent)。
 
@@ -62,7 +70,7 @@ $env:YUXI_AGENT_SLUG = "default-chatbot"
 pnpm tauri build --bundles nsis,msi
 ```
 
-未配置变量时默认连接 `http://127.0.0.1:9088` 和 `default-chatbot`。变量只决定首次默认值，不包含任何 API Key。
+未配置变量时默认连接 `http://127.0.0.1:9088`。`YUXI_AGENT_SLUG` 仅决定连接服务端前的展示回退值；连接后始终以服务端默认智能体及线程绑定为准。变量中不包含任何 API Key。
 
 ## 质量检查
 

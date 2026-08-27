@@ -2,6 +2,7 @@ import { Channel } from "@tauri-apps/api/core";
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
 import { cancelRun, normalizeCommandError, sendMessage } from "../services/tauri-client";
 import type { ChatCompletion, RunEvent } from "../types";
+import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 
 type AdapterCallbacks = {
   onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
@@ -107,14 +108,18 @@ export function createYuxiAdapter(
           } else if (event.type === "status") {
             callbacks.onRunState?.({ runId: activeRunId, status: event.status, message: event.message });
           } else if (event.type === "text") {
-            accumulatedText = event.text;
+            accumulatedText = sanitizeVisibleModelText(event.text);
             yield { content: [{ type: "text", text: accumulatedText }] };
           } else if (event.type === "done") {
-            accumulatedText = event.text;
+            accumulatedText = sanitizeVisibleModelText(event.text);
             yield { content: [{ type: "text", text: accumulatedText }] };
           }
         }
-        const completion = await invocation;
+        const rawCompletion = await invocation;
+        const completion = {
+          ...rawCompletion,
+          text: sanitizeVisibleModelText(rawCompletion.text),
+        };
         if (completion.text !== accumulatedText) {
           accumulatedText = completion.text;
           yield { content: [{ type: "text", text: accumulatedText }] };

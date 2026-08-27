@@ -21,7 +21,7 @@ use crate::{
     state::AppState,
     yuxi::{
         CliSessionStart, CliTokenPoll, ModelOption, ProgressText, RunResult, ServerRunContext,
-        terminal_status,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -113,7 +113,11 @@ pub async fn get_public_settings(
             .gateway_url()
             .await
             .map_err(CommandError::from)?,
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: state
+            .database
+            .server_agent_slug()
+            .await
+            .map_err(CommandError::from)?,
         has_api_key: connected,
         api_key_hint: if has_api_key {
             state
@@ -150,6 +154,7 @@ async fn save_connection_inner(
         .yuxi
         .test_connection(&gateway_url, agent_slug(), &secret)
         .await?;
+    let server_agent_slug = refresh_server_agent_slug(state, &gateway_url, &secret).await?;
     let hint = api_key_hint(secret.expose_secret());
     let principal = user_uid.unwrap_or_else(|| api_key_scope_id(secret.expose_secret()));
     persist_local_connection(
@@ -163,21 +168,21 @@ async fn save_connection_inner(
     .await?;
     Ok(PublicSettings {
         gateway_url,
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: server_agent_slug,
         has_api_key: true,
         api_key_hint: Some(hint),
     })
 }
 
-/// P5 三字段登录：姓名 + 密码 + API Key 联合校验后绑定本机。
-/// 密码对经 /api/auth/token 验证；密钥属主经 /api/auth/me 比对；
-/// 两者一致才落盘，显示名使用账号名，密钥 90 天过期由服务端签发时间决定。
+/// P5 三字段登录：登录标识 + 密码 + API Key 由服务端原子校验后绑定本机。
+/// 服务端同时校验账号状态、Key 归属及租户/部门边界，并返回固化的账号作用域；
+/// 客户端只在整组凭据通过后落盘，密钥有效期由服务端签发策略决定。
 #[tauri::command]
 pub async fn save_connection_with_login(
-    api_key: String,
+    mut api_key: String,
     gateway_url: String,
     username: String,
-    password: String,
+    mut password: String,
     state: State<'_, AppState>,
 ) -> Result<PublicSettings, CommandError> {
     let result = save_connection_with_login_inner(
@@ -188,6 +193,8 @@ pub async fn save_connection_with_login(
         &state,
     )
     .await;
+    api_key.zeroize();
+    password.zeroize();
     result.map_err(CommandError::from)
 }
 
@@ -204,25 +211,40 @@ async fn save_connection_with_login_inner(
     let password_secret = SecretString::from(password.to_owned());
 
     // 三要素联合校验：密码对 + 密钥属主一致，任一不符即拒绝绑定
-    let display_name = state
+    let identity = state
         .yuxi
         .verify_desktop_login(&gateway, username, &password_secret, &secret)
         .await?;
+    let server_agent_slug = refresh_server_agent_slug(state, &gateway, &secret).await?;
 
-    state.credentials.save_api_key(secret.expose_secret())?;
     let hint = api_key_hint(secret.expose_secret());
-    state
+    persist_local_connection(
+        state,
+        &gateway,
+        &identity.account_scope_id,
+        &hint,
+        Some(device_label(&identity.user_uid).as_str()),
+        &secret,
+    )
+    .await?;
+
+    let local_scope = local_account_scope(&gateway, &identity.account_scope_id);
+    if let Err(error) = state
+        .credentials
+        .save_api_key_for_scope(&local_scope, secret.expose_secret())
+    {
+        diagnostics::log("WARN", "desktop_scoped_key_save_failed", &error.to_string());
+    }
+    if let Err(error) = state
         .database
-        .activate_account(
-            &gateway,
-            &display_name,
-            &hint,
-            Some(device_label(username).as_str()),
-        )
-        .await?;
+        .upsert_account(&local_scope, &identity.user_name, &gateway)
+        .await
+    {
+        diagnostics::log("WARN", "desktop_account_upsert_failed", &error.to_string());
+    }
     Ok(PublicSettings {
         gateway_url: gateway.to_string(),
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: server_agent_slug,
         has_api_key: true,
         api_key_hint: Some(hint),
     })
@@ -230,6 +252,36 @@ async fn save_connection_with_login_inner(
 
 fn device_label(username: &str) -> String {
     format!("桌面端-{username}")
+}
+
+/// Stronghold、账号目录和会话统一使用「规范网关|服务端账号作用域」。
+/// 兼容已经采用该格式的记录，避免账号切换时重复拼接网关。
+fn local_account_scope(gateway_url: &str, principal: &str) -> String {
+    let gateway = gateway_url.trim_end_matches('/');
+    let prefix = format!("{gateway}|");
+    if principal.starts_with(&prefix) {
+        principal.to_owned()
+    } else {
+        format!("{prefix}{principal}")
+    }
+}
+
+/// SQLite::activate_account 仍接收服务端原始 principal；切换新格式账号时先解包。
+fn remote_principal_for_scope<'a>(gateway_url: &str, account_scope: &'a str) -> &'a str {
+    let gateway = gateway_url.trim_end_matches('/');
+    account_scope
+        .strip_prefix(&format!("{gateway}|"))
+        .unwrap_or(account_scope)
+}
+
+async fn refresh_server_agent_slug(
+    state: &AppState,
+    gateway_url: &str,
+    bearer: &SecretString,
+) -> AppResult<String> {
+    let slug = state.yuxi.default_agent_slug(gateway_url, bearer).await?;
+    state.database.save_server_agent_slug(&slug).await?;
+    Ok(slug)
 }
 
 /// P2b：返回当前应使用的 Bearer 凭证。
@@ -339,6 +391,9 @@ pub async fn test_connection(state: State<'_, AppState>) -> Result<(), CommandEr
         .test_connection(&gateway_url, agent_slug(), &api_key)
         .await
         .map_err(CommandError::from)?;
+    refresh_server_agent_slug(&state, &gateway_url, &api_key)
+        .await
+        .map_err(CommandError::from)?;
     Ok(())
 }
 
@@ -366,11 +421,18 @@ pub async fn create_thread(state: State<'_, AppState>) -> Result<ThreadSummary, 
 
 #[tauri::command]
 pub async fn list_threads(state: State<'_, AppState>) -> Result<Vec<ThreadSummary>, CommandError> {
-    state
+    let mut threads = state
         .database
         .list_threads()
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+    // Legacy rows persisted before reasoning redaction may still contain
+    // chain-of-thought inside messages.content, which feeds this preview.  The
+    // sidebar preview must never surface it.
+    for thread in &mut threads {
+        thread.preview = sanitize_visible_model_text(&thread.preview);
+    }
+    Ok(threads)
 }
 
 #[tauri::command]
@@ -378,11 +440,17 @@ pub async fn load_messages(
     thread_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<LocalMessage>, CommandError> {
-    state
+    let mut messages = state
         .database
         .load_messages(&thread_id)
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+    for message in &mut messages {
+        if message.role == "assistant" {
+            message.content = sanitize_visible_model_text(&message.content);
+        }
+    }
+    Ok(messages)
 }
 
 #[tauri::command]
@@ -427,7 +495,7 @@ async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> 
     for pending_run in pending_runs {
         let result = match state
             .yuxi
-            .result(&gateway_url, agent_slug(), &api_key, &pending_run.run_id)
+            .result(&gateway_url, &api_key, &pending_run.run_id)
             .await
         {
             Ok(result) => result,
@@ -575,25 +643,63 @@ async fn send_message_inner(
 
     let gateway_url = state.database.gateway_url().await?;
     let api_key = ensure_active_bearer(state).await?;
-    let yuxi_thread_id = state.database.yuxi_thread_id(&request.thread_id).await?;
+    let existing_yuxi_thread_id = state.database.yuxi_thread_id(&request.thread_id).await?;
+    let (yuxi_thread_id, run_agent_slug) = if let Some(yuxi_thread_id) = existing_yuxi_thread_id {
+        let bound_agent_slug = state.database.thread_agent_slug(&request.thread_id).await?;
+        (yuxi_thread_id, bound_agent_slug)
+    } else {
+        let server_agent_slug = refresh_server_agent_slug(state, &gateway_url, &api_key).await?;
+        let title = question.chars().take(80).collect::<String>();
+        let server_thread = state
+            .yuxi
+            .create_thread(
+                &gateway_url,
+                &api_key,
+                &server_agent_slug,
+                &request.thread_id,
+                &title,
+            )
+            .await?;
+        state
+            .database
+            .bind_server_thread(
+                &request.thread_id,
+                &server_thread.id,
+                &server_thread.agent_id,
+            )
+            .await?;
+        (server_thread.id, server_thread.agent_id)
+    };
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
         result = state.yuxi.create_run(
             &gateway_url,
-            agent_slug(),
+            &run_agent_slug,
             &api_key,
             question,
-            yuxi_thread_id.as_deref(),
+            &yuxi_thread_id,
             &request.request_id,
             None,
         ) => result?,
     };
     state.set_request_run_id(&request.request_id, &created.run_id)?;
 
-    state
-        .database
-        .set_yuxi_thread_id(&request.thread_id, &created.thread_id)
-        .await?;
+    if created.thread_id != yuxi_thread_id {
+        return Err(AppError::Protocol(
+            "服务端 run 返回的线程与已绑定会话不一致".into(),
+        ));
+    }
+    if created.request_id != request.request_id {
+        return Err(AppError::Protocol(
+            "服务端 run 返回的 request_id 与桌面请求不一致".into(),
+        ));
+    }
+    validate_authoritative_run_context(
+        &created.run_context,
+        &run_agent_slug,
+        &yuxi_thread_id,
+        &request.request_id,
+    )?;
     state
         .database
         .insert_run(
@@ -732,6 +838,12 @@ async fn send_message_inner(
         &accumulated,
     )
     .await?;
+    validate_authoritative_run_context(
+        &final_result.context,
+        &run_agent_slug,
+        &yuxi_thread_id,
+        &request.request_id,
+    )?;
     persist_run_context(state, &created.run_id, &final_result.context).await?;
     let context = final_result.context.clone();
     let final_text = final_result.output;
@@ -876,7 +988,7 @@ async fn wait_for_result(
             _ = cancellation.cancelled() => {
                 return cancel_local_run(state, run_id, accumulated_text).await
             }
-            result = state.yuxi.result(gateway_url, agent_slug(), api_key, run_id) => result?,
+            result = state.yuxi.result(gateway_url, api_key, run_id) => result?,
         };
         if result.status == "completed" && result.output.is_empty() {
             completed_without_output += 1;
@@ -1085,6 +1197,7 @@ pub async fn activate_with_code(
     // 仅保存会话对（无静态 Key 可写）；ensure_active_bearer 会话优先，
     // 纯会话账号在刷新失败时 fail-closed 引导重新激活。
     let scope = exchange.account_scope_id.clone();
+    let local_scope = local_account_scope(&gateway, &scope);
     let now = chrono::Utc::now().timestamp();
     let stored = StoredSession {
         access_token: exchange.access_token.clone(),
@@ -1096,7 +1209,7 @@ pub async fn activate_with_code(
         serde_json::to_string(&stored).map_err(|error| AppError::Protocol(error.to_string()))?;
     state
         .credentials
-        .save_session_blob(&scope, &blob)
+        .save_session_blob(&local_scope, &blob)
         .map_err(CommandError::from)?;
 
     state
@@ -1104,9 +1217,20 @@ pub async fn activate_with_code(
         .activate_account(&gateway, &scope, "设备会话", Some(device))
         .await
         .map_err(CommandError::from)?;
+    if let Err(error) = state
+        .database
+        .upsert_account(&local_scope, &exchange.user_name, &gateway)
+        .await
+    {
+        diagnostics::log(
+            "WARN",
+            "activation_account_upsert_failed",
+            &error.to_string(),
+        );
+    }
 
     Ok(ActivationOutcome {
-        account_scope: scope,
+        account_scope: local_scope,
         user_name: exchange.user_name,
     })
 }
@@ -1138,6 +1262,7 @@ pub async fn poll_device_login(
             session: session_pair,
         } => {
             let gateway_url = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
+            let local_scope = local_account_scope(&gateway_url, &account_scope_id);
             let hint = api_key_hint(&secret);
             let secure_secret = SecretString::from(secret.clone());
             secret.zeroize();
@@ -1174,7 +1299,7 @@ pub async fn poll_device_login(
             // P2b：同时落一份作用域凭据，供"切换账号"回到此账号时使用
             if let Err(error) = state
                 .credentials
-                .save_api_key_for_scope(&account_scope_id, secure_secret.expose_secret())
+                .save_api_key_for_scope(&local_scope, secure_secret.expose_secret())
             {
                 diagnostics::log("WARN", "scoped_key_save_failed", &error.to_string());
             }
@@ -1183,7 +1308,7 @@ pub async fn poll_device_login(
             if let Err(error) = state
                 .database
                 .upsert_account(
-                    &account_scope_id,
+                    &local_scope,
                     if user_name.is_empty() {
                         &user_uid
                     } else {
@@ -1206,9 +1331,7 @@ pub async fn poll_device_login(
                 };
                 match serde_json::to_string(&stored) {
                     Ok(json) => {
-                        if let Err(error) = state
-                            .credentials
-                            .save_session_blob(&account_scope_id, &json)
+                        if let Err(error) = state.credentials.save_session_blob(&local_scope, &json)
                         {
                             diagnostics::log("WARN", "session_store_failed", &error.to_string());
                         }
@@ -1245,7 +1368,8 @@ pub async fn list_accounts(
     Ok(accounts
         .into_iter()
         .map(|mut account| {
-            account.is_active = account.account_scope == active;
+            account.is_active =
+                local_account_scope(&account.gateway_url, &account.account_scope) == active;
             account
         })
         .collect())
@@ -1281,11 +1405,12 @@ pub async fn switch_account(
         None
     };
     state.credentials.save_api_key(key.expose_secret())?;
+    let remote_principal = remote_principal_for_scope(&target.gateway_url, &account_scope);
     if let Err(database_error) = state
         .database
         .activate_account(
             &target.gateway_url,
-            &account_scope,
+            remote_principal,
             &hint,
             None, // 切换不改 Key 名称
         )
@@ -1317,7 +1442,16 @@ pub async fn remove_account(
         .current_account_scope()
         .await
         .unwrap_or_default();
-    if account_scope == active {
+    let selected_scope = state
+        .database
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .find(|account| account.account_scope == account_scope)
+        .map(|account| local_account_scope(&account.gateway_url, &account.account_scope))
+        .unwrap_or_else(|| account_scope.clone());
+    if selected_scope == active {
         return Err(CommandError::from(AppError::CredentialStore(
             "不能移除当前登录中的账号，请先切换到其他账号".into(),
         )));
@@ -1478,8 +1612,8 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, validate_device_login_urls,
-        validate_send_request,
+        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, local_account_scope,
+        remote_principal_for_scope, validate_device_login_urls, validate_send_request,
     };
     use crate::yuxi::CliSessionStart;
 
@@ -1525,6 +1659,18 @@ mod tests {
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
         };
         assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn normalizes_local_account_scope_without_double_gateway_prefix() {
+        let gateway = "https://api.example.cn/";
+        let remote = "yxacct_0123456789abcdef0123456789abcdef";
+        let local = local_account_scope(gateway, remote);
+
+        assert_eq!(local, format!("https://api.example.cn|{remote}"));
+        assert_eq!(local_account_scope(gateway, &local), local);
+        assert_eq!(remote_principal_for_scope(gateway, &local), remote);
+        assert_eq!(remote_principal_for_scope(gateway, remote), remote);
     }
 
     #[test]

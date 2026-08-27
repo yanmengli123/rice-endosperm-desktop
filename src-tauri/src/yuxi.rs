@@ -12,8 +12,10 @@ use crate::{
     error::{AppError, AppResult},
 };
 
-const CREATE_RUN_PATH: &str = "/api/agent-invocation/agent-call/runs";
-const RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
+const DEFAULT_AGENT_PATH: &str = "/api/agent/default";
+const CREATE_THREAD_PATH: &str = "/api/chat/thread";
+const CREATE_RUN_PATH: &str = "/api/agent/runs";
+const LEGACY_RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
 const CREDENTIAL_STATUS_PATH: &str = "/api/agent-invocation/credential-status";
 
 #[derive(Clone)]
@@ -31,10 +33,20 @@ pub struct CreatedRun {
     pub run_context: ServerRunContext,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerThread {
+    pub id: String,
+    pub agent_id: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ServerRunContext {
     pub protocol_version: Option<String>,
+    pub agent_slug: Option<String>,
+    pub thread_id: Option<String>,
+    pub request_id: Option<String>,
+    pub result_authority: Option<String>,
     pub model_spec: Option<String>,
     #[serde(default)]
     pub knowledge_scope: KnowledgeScopeSummary,
@@ -107,21 +119,27 @@ pub struct RunResult {
 }
 
 #[derive(Debug, Serialize)]
+struct CreateThreadRequest<'a> {
+    agent_id: &'a str,
+    thread_id: &'a str,
+    title: &'a str,
+    metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
 struct CreateRunRequest<'a> {
+    query: &'a str,
     agent_slug: &'a str,
-    messages: [InputMessage<'a>; 1],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<&'a str>,
-    request_id: &'a str,
-    async_mode: bool,
+    thread_id: &'a str,
+    meta: RunRequestMeta<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_spec: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
-struct InputMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+struct RunRequestMeta<'a> {
+    request_id: &'a str,
+    client: &'static str,
 }
 
 impl YuxiClient {
@@ -188,7 +206,7 @@ impl YuxiClient {
         // 兼容尚未部署 credential-status 的 Yuxi：查询一个必然不存在的 run。
         // 该请求不会启动模型，也不会产生计费；401/403 仍能准确验证凭证。
         let probe = self
-            .authorized_post(&format!("{base}{RUN_RESULT_PATH}"), api_key)
+            .authorized_post(&format!("{base}{LEGACY_RUN_RESULT_PATH}"), api_key)
             .json(&json!({
                 "run_id": "desktop-connection-test",
                 "agent_slug": agent_slug,
@@ -209,7 +227,7 @@ impl YuxiClient {
         agent_slug: &str,
         api_key: &SecretString,
         question: &str,
-        yuxi_thread_id: Option<&str>,
+        yuxi_thread_id: &str,
         request_id: &str,
         model_spec: Option<&str>,
     ) -> AppResult<CreatedRun> {
@@ -220,14 +238,13 @@ impl YuxiClient {
                 .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
                 .header("X-Client-Request-ID", request_id)
                 .json(&CreateRunRequest {
+                    query: question,
                     agent_slug,
-                    messages: [InputMessage {
-                        role: "user",
-                        content: question,
-                    }],
                     thread_id: yuxi_thread_id,
-                    request_id,
-                    async_mode: true,
+                    meta: RunRequestMeta {
+                        request_id,
+                        client: "rice-endosperm-desktop",
+                    },
                     model_spec,
                 })
                 .timeout(Duration::from_secs(45))
@@ -259,6 +276,72 @@ impl YuxiClient {
         Err(last_error.unwrap_or(AppError::ServiceUnavailable))
     }
 
+    /// 从服务端读取当前用户可访问的权威默认智能体。
+    ///
+    /// 桌面端不得把编译期 slug 当作运行时真源；服务端返回值会被固化到本地线程，
+    /// 后续所有 run 都使用该线程实际绑定的智能体。
+    pub async fn default_agent_slug(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+    ) -> AppResult<String> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{DEFAULT_AGENT_PATH}"), api_key)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_default_agent_slug(&value)
+    }
+
+    /// 创建与 Web 端相同的原生 Yuxi Conversation。
+    /// 客户端线程 ID 同时作为幂等键，连接超时后可安全重试而不产生孤儿会话。
+    pub async fn create_thread(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        agent_slug: &str,
+        requested_thread_id: &str,
+        title: &str,
+    ) -> AppResult<ServerThread> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_post(&format!("{base}{CREATE_THREAD_PATH}"), api_key)
+            .json(&CreateThreadRequest {
+                agent_id: agent_slug,
+                thread_id: requested_thread_id,
+                title,
+                metadata: json!({"client": "rice-endosperm-desktop"}),
+            })
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let thread = response
+            .json::<ServerThread>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        if thread.id.is_empty() || thread.agent_id.is_empty() {
+            return Err(AppError::Protocol("创建会话响应缺少 id 或 agent_id".into()));
+        }
+        if thread.id != requested_thread_id {
+            return Err(AppError::Protocol(
+                "服务端返回的会话 ID 与客户端幂等 ID 不一致".into(),
+            ));
+        }
+        if thread.agent_id != agent_slug {
+            return Err(AppError::Protocol(
+                "服务端创建的会话绑定了非预期智能体".into(),
+            ));
+        }
+        Ok(thread)
+    }
+
     pub async fn event_response(
         &self,
         gateway_url: &str,
@@ -284,14 +367,12 @@ impl YuxiClient {
     pub async fn result(
         &self,
         gateway_url: &str,
-        agent_slug: &str,
         api_key: &SecretString,
         run_id: &str,
     ) -> AppResult<RunResult> {
         let base = validate_gateway_url(gateway_url)?;
         let response = self
-            .authorized_post(&format!("{base}{RUN_RESULT_PATH}"), api_key)
-            .json(&json!({ "run_id": run_id, "agent_slug": agent_slug }))
+            .authorized_get(&format!("{base}/api/agent/runs/{run_id}/result"), api_key)
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
@@ -444,73 +525,35 @@ impl YuxiClient {
         })
     }
 
-    /// P5 三字段登录校验：证明「姓名+密码」与「API Key」属于同一账号。
-    /// ① 用姓名/密码走 /api/auth/token 换取登录态并取得其 uid；
-    /// ② 用 API Key 调 /api/auth/me 取得密钥属主 uid；
-    /// ③ 两者一致才算通过，返回该账号显示名。
+    /// 三字段登录由服务端在单个请求中原子校验，避免客户端分别取得 JWT 与
+    /// Key 身份后再拼接判断；响应返回服务端固化的账号作用域作为本地隔离真源。
     pub async fn verify_desktop_login(
         &self,
         gateway_url: &str,
         username: &str,
         password: &SecretString,
         api_key: &SecretString,
-    ) -> AppResult<String> {
+    ) -> AppResult<DesktopLoginIdentity> {
         use secrecy::ExposeSecret as _;
 
         let base = validate_gateway_url(gateway_url)?;
-
-        let login_response = self
+        let response = self
             .client
-            .post(format!("{base}/api/auth/token"))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!(
-                "username={}&password={}",
-                urlencode_component(username),
-                urlencode_component(password.expose_secret())
-            ))
-            .timeout(Duration::from_secs(15))
+            .post(format!("{base}/api/auth/desktop/login"))
+            .json(&json!({
+                "login_id": username,
+                "password": password.expose_secret(),
+                "api_key": api_key.expose_secret(),
+            }))
+            .timeout(Duration::from_secs(20))
             .send()
             .await?;
-        if !login_response.status().is_success() {
-            return Err(AppError::Unauthorized);
-        }
-        let login_value = login_response
+        let response = ensure_success(response).await?;
+        let value = response
             .json::<Value>()
             .await
             .map_err(|error| AppError::Protocol(error.to_string()))?;
-        let credential_uid = login_value
-            .get("uid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Protocol("登录响应缺少用户标识".into()))?
-            .to_string();
-
-        let me_response = self
-            .authorized_get(&format!("{base}/api/auth/me"), api_key)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?;
-        if !me_response.status().is_success() {
-            return Err(AppError::InvalidCredential);
-        }
-        let me_value = me_response
-            .json::<Value>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        let key_uid = me_value
-            .get("uid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Protocol("凭证响应缺少用户标识".into()))?;
-
-        if key_uid != credential_uid {
-            return Err(AppError::Protocol(
-                "API Key 与登录账号不匹配，请核对开箱信息".into(),
-            ));
-        }
-        Ok(me_value
-            .get("username")
-            .and_then(Value::as_str)
-            .unwrap_or(username)
-            .to_string())
+        parse_desktop_login_response(&value)
     }
 
     /// P5：一次性激活凭证兑换设备会话对（公开端点，无静态 Key 签发）。
@@ -822,6 +865,14 @@ pub struct OnboardingExchange {
     pub family_id: String,
 }
 
+/// 账号、密码和 API Key 联合认证后的服务端权威身份。
+#[derive(Debug, Clone)]
+pub struct DesktopLoginIdentity {
+    pub account_scope_id: String,
+    pub user_name: String,
+    pub user_uid: String,
+}
+
 /// P5 BYOK：用户自有模型凭据（服务端仅返回掩码，无明文）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -839,19 +890,30 @@ pub struct ModelOption {
     pub label: String,
 }
 
-fn urlencode_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
-            }
-            _ => {
-                out.push_str(&format!("%{byte:02X}"));
-            }
-        }
-    }
-    out
+fn parse_desktop_login_response(value: &Value) -> AppResult<DesktopLoginIdentity> {
+    let account_scope_id = value
+        .get("account_scope_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("yxacct_") && value.len() >= 24)
+        .ok_or_else(|| AppError::Protocol("登录响应缺少账号作用域标识".into()))?
+        .to_string();
+    let user_name = value
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("登录响应缺少用户名".into()))?
+        .to_string();
+    let user_uid = value
+        .get("uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("登录响应缺少用户 UID".into()))?
+        .to_string();
+    Ok(DesktopLoginIdentity {
+        account_scope_id,
+        user_name,
+        user_uid,
+    })
 }
 
 fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
@@ -933,7 +995,162 @@ fn connection_error_for_gateway(gateway_url: &str, error: AppError) -> AppError 
 #[derive(Default)]
 pub struct ProgressText {
     message_id: Option<String>,
+    raw_text: String,
     text: String,
+}
+
+fn ascii_tag_at(text: &str, start: usize) -> Option<(usize, bool)> {
+    let remaining = text.get(start..)?;
+    let bytes = remaining.as_bytes();
+    let mut pos = bytes.iter().take_while(|&&byte| byte == b'\\').count();
+
+    let left = ["<", "&lt;", "&#60;", "&#x3c;"].into_iter().find(|token| {
+        remaining
+            .get(pos..pos + token.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
+    })?;
+    pos += left.len();
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let is_open = bytes.get(pos) != Some(&b'/');
+    if !is_open {
+        pos += 1;
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+    }
+    const THINK: &str = "think";
+    if !remaining
+        .get(pos..pos + THINK.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(THINK))
+    {
+        return None;
+    }
+    pos += THINK.len();
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let right = [">", "&gt;", "&#62;", "&#x3e;"].into_iter().find(|token| {
+        remaining
+            .get(pos..pos + token.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(token))
+    })?;
+    pos += right.len();
+    Some((pos, is_open))
+}
+
+fn hold_partial_opening_tag(text: &str) -> &str {
+    let pending = pending_tag_prefix_len(text);
+    &text[..text.len() - pending]
+}
+
+/// Length in bytes of the trailing span of `text` that could still become a
+/// reasoning tag once more characters arrive: a bracket token ("<", "&lt",
+/// "&#60", "&#x3c"), one run of backslashes, or the whole of "<", "< t",
+/// "< / t", "&lt; think " etc.  Streaming emitters hold this suffix back so a
+/// provider tag split across many deltas never flashes on screen; a complete
+/// message reports 0.
+fn pending_tag_prefix_len(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    // A trailing backslash run may still open an escaped tag.
+    let backslash_run = text.bytes().rev().take_while(|&b| b == b'\\').count();
+    if backslash_run > 0 {
+        return backslash_run;
+    }
+    let indices: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    for &start in indices.iter().rev() {
+        let tail = &text[start..];
+        if let Some(token_len) = bracket_token_len(tail)
+            && is_tag_progress(&tail[token_len..])
+        {
+            return tail.len();
+        }
+    }
+    0
+}
+
+fn is_tag_progress(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    let skip_whitespace = |pos: &mut usize| {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+            *pos += 1;
+        }
+    };
+    skip_whitespace(&mut pos);
+    if pos < bytes.len() && bytes[pos] == b'/' {
+        pos += 1;
+        skip_whitespace(&mut pos);
+    }
+    const THINK: [u8; 5] = *b"think";
+    let mut letter_index = 0;
+    while pos < bytes.len()
+        && letter_index < THINK.len()
+        && bytes[pos].to_ascii_lowercase() == THINK[letter_index]
+    {
+        pos += 1;
+        letter_index += 1;
+    }
+    skip_whitespace(&mut pos);
+    pos == bytes.len()
+}
+
+/// Length of a reasoning open/close bracket token at the start of `s`, if any.
+/// Mirrors the bracket alternation of the Python/TS `TAG_PATTERN`.
+fn bracket_token_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let backslashes = bytes.iter().take_while(|&&b| b == b'\\').count();
+    let rest = &s[backslashes..];
+    for token in ["<", "&lt;", "&#60;", "&#x3c;"] {
+        let comparable_len = rest.len().min(token.len());
+        if rest
+            .get(..comparable_len)
+            .zip(token.get(..comparable_len))
+            .is_some_and(|(value, prefix)| value.eq_ignore_ascii_case(prefix))
+            && (rest.len() <= token.len()
+                || rest
+                    .get(..token.len())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(token)))
+        {
+            return Some(backslashes + comparable_len);
+        }
+    }
+    None
+}
+
+/// Return only user-facing answer text. Unclosed reasoning fails closed.
+pub fn sanitize_visible_model_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut visible = String::new();
+    let mut cursor = 0;
+    let mut depth = 0_u32;
+    let mut position = 0;
+    while position < text.len() {
+        if let Some((length, is_open)) = ascii_tag_at(text, position) {
+            if depth == 0 {
+                visible.push_str(&text[cursor..position]);
+            }
+            if is_open {
+                depth = depth.saturating_add(1);
+            } else {
+                depth = depth.saturating_sub(1);
+            }
+            position += length;
+            cursor = position;
+            continue;
+        }
+        position += text[position..].chars().next().map_or(1, char::len_utf8);
+    }
+    if depth == 0 {
+        visible.push_str(&text[cursor..]);
+    }
+    visible
 }
 
 impl ProgressText {
@@ -961,10 +1178,16 @@ impl ProgressText {
                     .filter(|id| !id.is_empty());
                 if incoming_message_id != self.message_id.as_deref() {
                     self.message_id = incoming_message_id.map(str::to_owned);
+                    self.raw_text.clear();
                     self.text.clear();
                 }
-                self.text.push_str(delta);
-                changed = true;
+                self.raw_text.push_str(delta);
+                let visible = sanitize_visible_model_text(&self.raw_text);
+                let emit = hold_partial_opening_tag(&visible);
+                if emit != self.text {
+                    self.text = emit.to_owned();
+                    changed = true;
+                }
                 continue;
             }
 
@@ -974,8 +1197,13 @@ impl ProgressText {
                     .and_then(Value::as_str)
                     .filter(|content| !content.is_empty())
             {
-                self.text.push_str(delta);
-                changed = true;
+                self.raw_text.push_str(delta);
+                let visible = sanitize_visible_model_text(&self.raw_text);
+                let emit = hold_partial_opening_tag(&visible);
+                if emit != self.text {
+                    self.text = emit.to_owned();
+                    changed = true;
+                }
             }
         }
 
@@ -1003,8 +1231,44 @@ fn final_output(value: &Value) -> String {
                 .pointer("/choices/0/messages/0/content")
                 .and_then(Value::as_str)
         })
+        .map(sanitize_visible_model_text)
         .unwrap_or_default()
-        .to_owned()
+}
+
+fn parse_default_agent_slug(value: &Value) -> AppResult<String> {
+    value
+        .pointer("/agent/slug")
+        .or_else(|| value.pointer("/agent/agent_id"))
+        .and_then(Value::as_str)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Protocol("默认智能体响应缺少 slug".into()))
+}
+
+pub fn validate_authoritative_run_context(
+    context: &ServerRunContext,
+    expected_agent_slug: &str,
+    expected_thread_id: &str,
+    expected_request_id: &str,
+) -> AppResult<()> {
+    let compatible_protocol = context
+        .protocol_version
+        .as_deref()
+        .and_then(|version| version.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?)))
+        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 2));
+    if !compatible_protocol
+        || context.result_authority.as_deref() != Some("yuxi_server")
+        || context.agent_slug.as_deref() != Some(expected_agent_slug)
+        || context.thread_id.as_deref() != Some(expected_thread_id)
+        || context.request_id.as_deref() != Some(expected_request_id)
+    {
+        return Err(AppError::Protocol(
+            "服务端 AgentRun 权威上下文与桌面请求不一致；请更新并重启 rice-endosperm-agent 与 APISIX"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_run_result(value: &Value) -> RunResult {
@@ -1064,9 +1328,69 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CliSessionStart, CliTokenPoll, ProgressText, connection_error_for_gateway, final_output,
-        parse_cli_token_response, parse_run_result, terminal_status,
+        CliSessionStart, CliTokenPoll, CreateRunRequest, ProgressText, RunRequestMeta,
+        connection_error_for_gateway, final_output, parse_cli_token_response,
+        parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
+
+    #[test]
+    fn serializes_the_same_native_agent_run_contract_as_web() {
+        let value = serde_json::to_value(CreateRunRequest {
+            query: "水稻胚乳发育的关键调控基因有哪些？",
+            agent_slug: "default-chatbot",
+            thread_id: "thread-1",
+            meta: RunRequestMeta {
+                request_id: "desktop-request-123456",
+                client: "rice-endosperm-desktop",
+            },
+            model_spec: None,
+        })
+        .expect("serialize native AgentRun request");
+
+        assert_eq!(value["agent_slug"], "default-chatbot");
+        assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["meta"]["request_id"], "desktop-request-123456");
+        assert_eq!(value["meta"]["client"], "rice-endosperm-desktop");
+        assert!(value.get("messages").is_none());
+        assert!(value.get("async_mode").is_none());
+        assert!(value.get("model_spec").is_none());
+    }
+
+    #[test]
+    fn parses_authoritative_default_agent_from_server() {
+        assert_eq!(
+            parse_default_agent_slug(&json!({"agent": {"slug": "default-chatbot"}}))
+                .expect("parse default agent"),
+            "default-chatbot"
+        );
+        assert!(parse_default_agent_slug(&json!({"agent": {}})).is_err());
+    }
+
+    #[test]
+    fn validates_server_owned_agent_run_context() {
+        let context = serde_json::from_value(json!({
+            "protocol_version": "1.2",
+            "agent_slug": "default-chatbot",
+            "thread_id": "thread-1",
+            "request_id": "request-1",
+            "result_authority": "yuxi_server"
+        }))
+        .expect("decode authoritative context");
+        assert!(
+            validate_authoritative_run_context(
+                &context,
+                "default-chatbot",
+                "thread-1",
+                "request-1"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_authoritative_run_context(&context, "another-agent", "thread-1", "request-1")
+                .is_err()
+        );
+    }
 
     #[test]
     fn decodes_server_device_login_contract() {
@@ -1111,6 +1435,26 @@ mod tests {
     }
 
     #[test]
+    fn decodes_atomic_desktop_login_contract() {
+        let identity = parse_desktop_login_response(&json!({
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef",
+            "username": "Rice Researcher",
+            "uid": "rice_researcher",
+            "api_key_id": 42,
+            "key_prefix": "yxkey_123456",
+            "expires_at": "2026-11-24T00:00:00"
+        }))
+        .expect("decode desktop login response");
+
+        assert_eq!(
+            identity.account_scope_id,
+            "yxacct_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(identity.user_name, "Rice Researcher");
+        assert_eq!(identity.user_uid, "rice_researcher");
+    }
+
+    #[test]
     fn groups_deltas_by_message_and_ignores_duplicate_legacy_response() {
         let mut progress = ProgressText::default();
         let first = json!({"payload": {"items": [{
@@ -1142,6 +1486,57 @@ mod tests {
     }
 
     #[test]
+    fn redacts_tagged_reasoning_across_stream_boundaries() {
+        let mut progress = ProgressText::default();
+        let first = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "<th"}
+        }}});
+        assert_eq!(progress.apply(&first), None);
+
+        let second = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "ink>private chain"}
+        }}});
+        assert_eq!(progress.apply(&second), None);
+
+        let third = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "</think>你好！"}
+        }}});
+        assert_eq!(progress.apply(&third).as_deref(), Some("你好！"));
+    }
+
+    #[test]
+    fn sanitizes_escaped_entity_and_unclosed_reasoning() {
+        assert_eq!(
+            sanitize_visible_model_text(r"\\\<think>private</think>公开答案"),
+            "公开答案"
+        );
+        assert_eq!(
+            sanitize_visible_model_text("&lt;think&gt;private&lt;/think&gt;公开答案"),
+            "公开答案"
+        );
+        assert_eq!(
+            sanitize_visible_model_text("<  THINK  >private< / think >公开答案"),
+            "公开答案"
+        );
+        assert_eq!(sanitize_visible_model_text("<think>private"), "");
+    }
+
+    #[test]
+    fn holds_partial_entity_tag_during_streaming() {
+        let mut progress = ProgressText::default();
+        for delta in ["&", "lt", ";thi", "nk&gt;private"] {
+            let value = json!({"payload": {"chunk": {
+                "stream_event": {"type": "message_delta", "message_id": "message-1", "content": delta}
+            }}});
+            assert_eq!(progress.apply(&value), None);
+        }
+        let answer = json!({"payload": {"chunk": {
+            "stream_event": {"type": "message_delta", "message_id": "message-1", "content": "&lt;/think&gt;公开答案"}
+        }}});
+        assert_eq!(progress.apply(&answer).as_deref(), Some("公开答案"));
+    }
+
+    #[test]
     fn extracts_terminal_and_authoritative_output() {
         let value = json!({
             "status": "completed",
@@ -1150,6 +1545,12 @@ mod tests {
         });
         assert_eq!(terminal_status(&value), Some("completed"));
         assert_eq!(final_output(&value), "最终回答");
+
+        let legacy = json!({
+            "status": "completed",
+            "output": "<think>private chain</think>最终回答"
+        });
+        assert_eq!(final_output(&legacy), "最终回答");
     }
 
     #[test]

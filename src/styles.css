@@ -406,3 +406,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .byok-form select {
   width: 100%;
 }
+
+.thinking-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 12px 52px;
+  color: var(--gray-600);
+  font-size: 14px;
+}
+
+.thinking-status svg {
+  animation: spin 1s linear infinite;
+}

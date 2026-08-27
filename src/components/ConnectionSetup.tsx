@@ -110,8 +110,8 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
     setSaving(true);
     setError("");
     try {
-      // P5 三字段登录：姓名+密码验证通过且与密钥属主一致才绑定本机
-      await saveConnectionWithLogin(
+      // P5 三字段登录：服务端原子校验登录标识、密码与密钥归属后才绑定本机
+      const settings = await saveConnectionWithLogin(
         apiKey.trim(),
         gatewayUrl.trim(),
         loginName.trim(),
@@ -119,6 +119,7 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
       );
       setApiKey("");
       setLoginPassword("");
+      onConnected(settings);
     } catch (reason) {
       setError(normalizeCommandError(reason).message);
     } finally {
@@ -141,7 +142,7 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
         <div className="connection-heading">
           <span className="connection-icon"><Leaf size={22} /></span>
           <h1>连接科研智能服务</h1>
-          <p>输入你的 Yuxi API Key，或使用账号在网页端一键授权。凭证由系统安全存储保护，不会写入网页存储、SQLite 或日志。</p>
+          <p>使用管理员发放的登录 ID、初始密码和 API Key 联合登录，或在网页端完成设备码授权。凭证由系统安全存储保护，不会写入网页存储、SQLite 或日志。</p>
         </div>
 
         {deviceLogin ? (
