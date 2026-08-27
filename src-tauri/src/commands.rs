@@ -169,15 +169,15 @@ async fn save_connection_inner(
     })
 }
 
-/// P5 三字段登录：姓名 + 密码 + API Key 联合校验后绑定本机。
-/// 密码对经 /api/auth/token 验证；密钥属主经 /api/auth/me 比对；
-/// 两者一致才落盘，显示名使用账号名，密钥 90 天过期由服务端签发时间决定。
+/// P5 三字段登录：登录标识 + 密码 + API Key 由服务端原子校验后绑定本机。
+/// 服务端同时校验账号状态、Key 归属及租户/部门边界，并返回固化的账号作用域；
+/// 客户端只在整组凭据通过后落盘，密钥有效期由服务端签发策略决定。
 #[tauri::command]
 pub async fn save_connection_with_login(
-    api_key: String,
+    mut api_key: String,
     gateway_url: String,
     username: String,
-    password: String,
+    mut password: String,
     state: State<'_, AppState>,
 ) -> Result<PublicSettings, CommandError> {
     let result = save_connection_with_login_inner(
@@ -188,6 +188,8 @@ pub async fn save_connection_with_login(
         &state,
     )
     .await;
+    api_key.zeroize();
+    password.zeroize();
     result.map_err(CommandError::from)
 }
 
@@ -204,22 +206,36 @@ async fn save_connection_with_login_inner(
     let password_secret = SecretString::from(password.to_owned());
 
     // 三要素联合校验：密码对 + 密钥属主一致，任一不符即拒绝绑定
-    let display_name = state
+    let identity = state
         .yuxi
         .verify_desktop_login(&gateway, username, &password_secret, &secret)
         .await?;
 
-    state.credentials.save_api_key(secret.expose_secret())?;
     let hint = api_key_hint(secret.expose_secret());
-    state
+    persist_local_connection(
+        state,
+        &gateway,
+        &identity.account_scope_id,
+        &hint,
+        Some(device_label(&identity.user_uid).as_str()),
+        &secret,
+    )
+    .await?;
+
+    let local_scope = local_account_scope(&gateway, &identity.account_scope_id);
+    if let Err(error) = state
+        .credentials
+        .save_api_key_for_scope(&local_scope, secret.expose_secret())
+    {
+        diagnostics::log("WARN", "desktop_scoped_key_save_failed", &error.to_string());
+    }
+    if let Err(error) = state
         .database
-        .activate_account(
-            &gateway,
-            &display_name,
-            &hint,
-            Some(device_label(username).as_str()),
-        )
-        .await?;
+        .upsert_account(&local_scope, &identity.user_name, &gateway)
+        .await
+    {
+        diagnostics::log("WARN", "desktop_account_upsert_failed", &error.to_string());
+    }
     Ok(PublicSettings {
         gateway_url: gateway.to_string(),
         agent_slug: agent_slug().to_owned(),
@@ -230,6 +246,26 @@ async fn save_connection_with_login_inner(
 
 fn device_label(username: &str) -> String {
     format!("桌面端-{username}")
+}
+
+/// Stronghold、账号目录和会话统一使用「规范网关|服务端账号作用域」。
+/// 兼容已经采用该格式的记录，避免账号切换时重复拼接网关。
+fn local_account_scope(gateway_url: &str, principal: &str) -> String {
+    let gateway = gateway_url.trim_end_matches('/');
+    let prefix = format!("{gateway}|");
+    if principal.starts_with(&prefix) {
+        principal.to_owned()
+    } else {
+        format!("{prefix}{principal}")
+    }
+}
+
+/// SQLite::activate_account 仍接收服务端原始 principal；切换新格式账号时先解包。
+fn remote_principal_for_scope<'a>(gateway_url: &str, account_scope: &'a str) -> &'a str {
+    let gateway = gateway_url.trim_end_matches('/');
+    account_scope
+        .strip_prefix(&format!("{gateway}|"))
+        .unwrap_or(account_scope)
 }
 
 /// P2b：返回当前应使用的 Bearer 凭证。
@@ -1085,6 +1121,7 @@ pub async fn activate_with_code(
     // 仅保存会话对（无静态 Key 可写）；ensure_active_bearer 会话优先，
     // 纯会话账号在刷新失败时 fail-closed 引导重新激活。
     let scope = exchange.account_scope_id.clone();
+    let local_scope = local_account_scope(&gateway, &scope);
     let now = chrono::Utc::now().timestamp();
     let stored = StoredSession {
         access_token: exchange.access_token.clone(),
@@ -1096,7 +1133,7 @@ pub async fn activate_with_code(
         serde_json::to_string(&stored).map_err(|error| AppError::Protocol(error.to_string()))?;
     state
         .credentials
-        .save_session_blob(&scope, &blob)
+        .save_session_blob(&local_scope, &blob)
         .map_err(CommandError::from)?;
 
     state
@@ -1104,9 +1141,20 @@ pub async fn activate_with_code(
         .activate_account(&gateway, &scope, "设备会话", Some(device))
         .await
         .map_err(CommandError::from)?;
+    if let Err(error) = state
+        .database
+        .upsert_account(&local_scope, &exchange.user_name, &gateway)
+        .await
+    {
+        diagnostics::log(
+            "WARN",
+            "activation_account_upsert_failed",
+            &error.to_string(),
+        );
+    }
 
     Ok(ActivationOutcome {
-        account_scope: scope,
+        account_scope: local_scope,
         user_name: exchange.user_name,
     })
 }
@@ -1138,6 +1186,7 @@ pub async fn poll_device_login(
             session: session_pair,
         } => {
             let gateway_url = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
+            let local_scope = local_account_scope(&gateway_url, &account_scope_id);
             let hint = api_key_hint(&secret);
             let secure_secret = SecretString::from(secret.clone());
             secret.zeroize();
@@ -1174,7 +1223,7 @@ pub async fn poll_device_login(
             // P2b：同时落一份作用域凭据，供"切换账号"回到此账号时使用
             if let Err(error) = state
                 .credentials
-                .save_api_key_for_scope(&account_scope_id, secure_secret.expose_secret())
+                .save_api_key_for_scope(&local_scope, secure_secret.expose_secret())
             {
                 diagnostics::log("WARN", "scoped_key_save_failed", &error.to_string());
             }
@@ -1183,7 +1232,7 @@ pub async fn poll_device_login(
             if let Err(error) = state
                 .database
                 .upsert_account(
-                    &account_scope_id,
+                    &local_scope,
                     if user_name.is_empty() {
                         &user_uid
                     } else {
@@ -1206,9 +1255,7 @@ pub async fn poll_device_login(
                 };
                 match serde_json::to_string(&stored) {
                     Ok(json) => {
-                        if let Err(error) = state
-                            .credentials
-                            .save_session_blob(&account_scope_id, &json)
+                        if let Err(error) = state.credentials.save_session_blob(&local_scope, &json)
                         {
                             diagnostics::log("WARN", "session_store_failed", &error.to_string());
                         }
@@ -1245,7 +1292,8 @@ pub async fn list_accounts(
     Ok(accounts
         .into_iter()
         .map(|mut account| {
-            account.is_active = account.account_scope == active;
+            account.is_active =
+                local_account_scope(&account.gateway_url, &account.account_scope) == active;
             account
         })
         .collect())
@@ -1281,11 +1329,12 @@ pub async fn switch_account(
         None
     };
     state.credentials.save_api_key(key.expose_secret())?;
+    let remote_principal = remote_principal_for_scope(&target.gateway_url, &account_scope);
     if let Err(database_error) = state
         .database
         .activate_account(
             &target.gateway_url,
-            &account_scope,
+            remote_principal,
             &hint,
             None, // 切换不改 Key 名称
         )
@@ -1317,7 +1366,16 @@ pub async fn remove_account(
         .current_account_scope()
         .await
         .unwrap_or_default();
-    if account_scope == active {
+    let selected_scope = state
+        .database
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .find(|account| account.account_scope == account_scope)
+        .map(|account| local_account_scope(&account.gateway_url, &account.account_scope))
+        .unwrap_or_else(|| account_scope.clone());
+    if selected_scope == active {
         return Err(CommandError::from(AppError::CredentialStore(
             "不能移除当前登录中的账号，请先切换到其他账号".into(),
         )));
@@ -1478,8 +1536,8 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, validate_device_login_urls,
-        validate_send_request,
+        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, local_account_scope,
+        remote_principal_for_scope, validate_device_login_urls, validate_send_request,
     };
     use crate::yuxi::CliSessionStart;
 
@@ -1525,6 +1583,18 @@ mod tests {
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
         };
         assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn normalizes_local_account_scope_without_double_gateway_prefix() {
+        let gateway = "https://api.example.cn/";
+        let remote = "yxacct_0123456789abcdef0123456789abcdef";
+        let local = local_account_scope(gateway, remote);
+
+        assert_eq!(local, format!("https://api.example.cn|{remote}"));
+        assert_eq!(local_account_scope(gateway, &local), local);
+        assert_eq!(remote_principal_for_scope(gateway, &local), remote);
+        assert_eq!(remote_principal_for_scope(gateway, remote), remote);
     }
 
     #[test]

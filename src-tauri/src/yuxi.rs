@@ -444,73 +444,35 @@ impl YuxiClient {
         })
     }
 
-    /// P5 三字段登录校验：证明「姓名+密码」与「API Key」属于同一账号。
-    /// ① 用姓名/密码走 /api/auth/token 换取登录态并取得其 uid；
-    /// ② 用 API Key 调 /api/auth/me 取得密钥属主 uid；
-    /// ③ 两者一致才算通过，返回该账号显示名。
+    /// 三字段登录由服务端在单个请求中原子校验，避免客户端分别取得 JWT 与
+    /// Key 身份后再拼接判断；响应返回服务端固化的账号作用域作为本地隔离真源。
     pub async fn verify_desktop_login(
         &self,
         gateway_url: &str,
         username: &str,
         password: &SecretString,
         api_key: &SecretString,
-    ) -> AppResult<String> {
+    ) -> AppResult<DesktopLoginIdentity> {
         use secrecy::ExposeSecret as _;
 
         let base = validate_gateway_url(gateway_url)?;
-
-        let login_response = self
+        let response = self
             .client
-            .post(format!("{base}/api/auth/token"))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!(
-                "username={}&password={}",
-                urlencode_component(username),
-                urlencode_component(password.expose_secret())
-            ))
-            .timeout(Duration::from_secs(15))
+            .post(format!("{base}/api/auth/desktop/login"))
+            .json(&json!({
+                "login_id": username,
+                "password": password.expose_secret(),
+                "api_key": api_key.expose_secret(),
+            }))
+            .timeout(Duration::from_secs(20))
             .send()
             .await?;
-        if !login_response.status().is_success() {
-            return Err(AppError::Unauthorized);
-        }
-        let login_value = login_response
+        let response = ensure_success(response).await?;
+        let value = response
             .json::<Value>()
             .await
             .map_err(|error| AppError::Protocol(error.to_string()))?;
-        let credential_uid = login_value
-            .get("uid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Protocol("登录响应缺少用户标识".into()))?
-            .to_string();
-
-        let me_response = self
-            .authorized_get(&format!("{base}/api/auth/me"), api_key)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?;
-        if !me_response.status().is_success() {
-            return Err(AppError::InvalidCredential);
-        }
-        let me_value = me_response
-            .json::<Value>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        let key_uid = me_value
-            .get("uid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Protocol("凭证响应缺少用户标识".into()))?;
-
-        if key_uid != credential_uid {
-            return Err(AppError::Protocol(
-                "API Key 与登录账号不匹配，请核对开箱信息".into(),
-            ));
-        }
-        Ok(me_value
-            .get("username")
-            .and_then(Value::as_str)
-            .unwrap_or(username)
-            .to_string())
+        parse_desktop_login_response(&value)
     }
 
     /// P5：一次性激活凭证兑换设备会话对（公开端点，无静态 Key 签发）。
@@ -822,6 +784,14 @@ pub struct OnboardingExchange {
     pub family_id: String,
 }
 
+/// 账号、密码和 API Key 联合认证后的服务端权威身份。
+#[derive(Debug, Clone)]
+pub struct DesktopLoginIdentity {
+    pub account_scope_id: String,
+    pub user_name: String,
+    pub user_uid: String,
+}
+
 /// P5 BYOK：用户自有模型凭据（服务端仅返回掩码，无明文）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -839,19 +809,30 @@ pub struct ModelOption {
     pub label: String,
 }
 
-fn urlencode_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
-            }
-            _ => {
-                out.push_str(&format!("%{byte:02X}"));
-            }
-        }
-    }
-    out
+fn parse_desktop_login_response(value: &Value) -> AppResult<DesktopLoginIdentity> {
+    let account_scope_id = value
+        .get("account_scope_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("yxacct_") && value.len() >= 24)
+        .ok_or_else(|| AppError::Protocol("登录响应缺少账号作用域标识".into()))?
+        .to_string();
+    let user_name = value
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("登录响应缺少用户名".into()))?
+        .to_string();
+    let user_uid = value
+        .get("uid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("登录响应缺少用户 UID".into()))?
+        .to_string();
+    Ok(DesktopLoginIdentity {
+        account_scope_id,
+        user_name,
+        user_uid,
+    })
 }
 
 fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
@@ -1065,7 +1046,7 @@ mod tests {
 
     use super::{
         CliSessionStart, CliTokenPoll, ProgressText, connection_error_for_gateway, final_output,
-        parse_cli_token_response, parse_run_result, terminal_status,
+        parse_cli_token_response, parse_desktop_login_response, parse_run_result, terminal_status,
     };
 
     #[test]
@@ -1108,6 +1089,26 @@ mod tests {
         assert_eq!(api_key_id, 12);
         assert_eq!(account_scope_id, "yxacct_0123456789abcdef0123456789abcdef");
         assert_eq!(user_uid, "alice");
+    }
+
+    #[test]
+    fn decodes_atomic_desktop_login_contract() {
+        let identity = parse_desktop_login_response(&json!({
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef",
+            "username": "Rice Researcher",
+            "uid": "rice_researcher",
+            "api_key_id": 42,
+            "key_prefix": "yxkey_123456",
+            "expires_at": "2026-11-24T00:00:00"
+        }))
+        .expect("decode desktop login response");
+
+        assert_eq!(
+            identity.account_scope_id,
+            "yxacct_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(identity.user_name, "Rice Researcher");
+        assert_eq!(identity.user_uid, "rice_researcher");
     }
 
     #[test]
