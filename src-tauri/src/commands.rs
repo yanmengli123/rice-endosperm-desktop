@@ -21,7 +21,7 @@ use crate::{
     state::AppState,
     yuxi::{
         CliSessionStart, CliTokenPoll, ModelOption, ProgressText, RunResult, ServerRunContext,
-        sanitize_visible_model_text, terminal_status,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -113,7 +113,11 @@ pub async fn get_public_settings(
             .gateway_url()
             .await
             .map_err(CommandError::from)?,
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: state
+            .database
+            .server_agent_slug()
+            .await
+            .map_err(CommandError::from)?,
         has_api_key: connected,
         api_key_hint: if has_api_key {
             state
@@ -150,6 +154,7 @@ async fn save_connection_inner(
         .yuxi
         .test_connection(&gateway_url, agent_slug(), &secret)
         .await?;
+    let server_agent_slug = refresh_server_agent_slug(state, &gateway_url, &secret).await?;
     let hint = api_key_hint(secret.expose_secret());
     let principal = user_uid.unwrap_or_else(|| api_key_scope_id(secret.expose_secret()));
     persist_local_connection(
@@ -163,7 +168,7 @@ async fn save_connection_inner(
     .await?;
     Ok(PublicSettings {
         gateway_url,
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: server_agent_slug,
         has_api_key: true,
         api_key_hint: Some(hint),
     })
@@ -210,6 +215,7 @@ async fn save_connection_with_login_inner(
         .yuxi
         .verify_desktop_login(&gateway, username, &password_secret, &secret)
         .await?;
+    let server_agent_slug = refresh_server_agent_slug(state, &gateway, &secret).await?;
 
     let hint = api_key_hint(secret.expose_secret());
     persist_local_connection(
@@ -238,7 +244,7 @@ async fn save_connection_with_login_inner(
     }
     Ok(PublicSettings {
         gateway_url: gateway.to_string(),
-        agent_slug: agent_slug().to_owned(),
+        agent_slug: server_agent_slug,
         has_api_key: true,
         api_key_hint: Some(hint),
     })
@@ -266,6 +272,16 @@ fn remote_principal_for_scope<'a>(gateway_url: &str, account_scope: &'a str) -> 
     account_scope
         .strip_prefix(&format!("{gateway}|"))
         .unwrap_or(account_scope)
+}
+
+async fn refresh_server_agent_slug(
+    state: &AppState,
+    gateway_url: &str,
+    bearer: &SecretString,
+) -> AppResult<String> {
+    let slug = state.yuxi.default_agent_slug(gateway_url, bearer).await?;
+    state.database.save_server_agent_slug(&slug).await?;
+    Ok(slug)
 }
 
 /// P2b：返回当前应使用的 Bearer 凭证。
@@ -375,6 +391,9 @@ pub async fn test_connection(state: State<'_, AppState>) -> Result<(), CommandEr
         .test_connection(&gateway_url, agent_slug(), &api_key)
         .await
         .map_err(CommandError::from)?;
+    refresh_server_agent_slug(&state, &gateway_url, &api_key)
+        .await
+        .map_err(CommandError::from)?;
     Ok(())
 }
 
@@ -476,7 +495,7 @@ async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> 
     for pending_run in pending_runs {
         let result = match state
             .yuxi
-            .result(&gateway_url, agent_slug(), &api_key, &pending_run.run_id)
+            .result(&gateway_url, &api_key, &pending_run.run_id)
             .await
         {
             Ok(result) => result,
@@ -624,25 +643,63 @@ async fn send_message_inner(
 
     let gateway_url = state.database.gateway_url().await?;
     let api_key = ensure_active_bearer(state).await?;
-    let yuxi_thread_id = state.database.yuxi_thread_id(&request.thread_id).await?;
+    let existing_yuxi_thread_id = state.database.yuxi_thread_id(&request.thread_id).await?;
+    let (yuxi_thread_id, run_agent_slug) = if let Some(yuxi_thread_id) = existing_yuxi_thread_id {
+        let bound_agent_slug = state.database.thread_agent_slug(&request.thread_id).await?;
+        (yuxi_thread_id, bound_agent_slug)
+    } else {
+        let server_agent_slug = refresh_server_agent_slug(state, &gateway_url, &api_key).await?;
+        let title = question.chars().take(80).collect::<String>();
+        let server_thread = state
+            .yuxi
+            .create_thread(
+                &gateway_url,
+                &api_key,
+                &server_agent_slug,
+                &request.thread_id,
+                &title,
+            )
+            .await?;
+        state
+            .database
+            .bind_server_thread(
+                &request.thread_id,
+                &server_thread.id,
+                &server_thread.agent_id,
+            )
+            .await?;
+        (server_thread.id, server_thread.agent_id)
+    };
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
         result = state.yuxi.create_run(
             &gateway_url,
-            agent_slug(),
+            &run_agent_slug,
             &api_key,
             question,
-            yuxi_thread_id.as_deref(),
+            &yuxi_thread_id,
             &request.request_id,
             None,
         ) => result?,
     };
     state.set_request_run_id(&request.request_id, &created.run_id)?;
 
-    state
-        .database
-        .set_yuxi_thread_id(&request.thread_id, &created.thread_id)
-        .await?;
+    if created.thread_id != yuxi_thread_id {
+        return Err(AppError::Protocol(
+            "服务端 run 返回的线程与已绑定会话不一致".into(),
+        ));
+    }
+    if created.request_id != request.request_id {
+        return Err(AppError::Protocol(
+            "服务端 run 返回的 request_id 与桌面请求不一致".into(),
+        ));
+    }
+    validate_authoritative_run_context(
+        &created.run_context,
+        &run_agent_slug,
+        &yuxi_thread_id,
+        &request.request_id,
+    )?;
     state
         .database
         .insert_run(
@@ -781,6 +838,12 @@ async fn send_message_inner(
         &accumulated,
     )
     .await?;
+    validate_authoritative_run_context(
+        &final_result.context,
+        &run_agent_slug,
+        &yuxi_thread_id,
+        &request.request_id,
+    )?;
     persist_run_context(state, &created.run_id, &final_result.context).await?;
     let context = final_result.context.clone();
     let final_text = final_result.output;
@@ -925,7 +988,7 @@ async fn wait_for_result(
             _ = cancellation.cancelled() => {
                 return cancel_local_run(state, run_id, accumulated_text).await
             }
-            result = state.yuxi.result(gateway_url, agent_slug(), api_key, run_id) => result?,
+            result = state.yuxi.result(gateway_url, api_key, run_id) => result?,
         };
         if result.status == "completed" && result.output.is_empty() {
             completed_without_output += 1;

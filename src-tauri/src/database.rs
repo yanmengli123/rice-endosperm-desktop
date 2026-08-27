@@ -119,6 +119,24 @@ impl Database {
             .unwrap_or_else(|| default_gateway_url().to_owned()))
     }
 
+    /// 最近一次由服务端确认的默认智能体。编译期值仅用于首次连接前展示，
+    /// 真正创建远端会话时仍会向服务端重新解析并固化线程绑定。
+    pub async fn server_agent_slug(&self) -> AppResult<String> {
+        Ok(self
+            .setting("server_agent_slug")
+            .await?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| agent_slug().to_owned()))
+    }
+
+    pub async fn save_server_agent_slug(&self, value: &str) -> AppResult<()> {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            return Err(AppError::Internal("服务端默认智能体不能为空".into()));
+        }
+        self.save_setting("server_agent_slug", normalized).await
+    }
+
     pub async fn api_key_hint(&self) -> AppResult<Option<String>> {
         self.setting("api_key_hint").await
     }
@@ -222,13 +240,14 @@ impl Database {
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
         let account_scope = self.current_account_scope().await?;
+        let server_agent_slug = self.server_agent_slug().await?;
         sqlx::query(
             "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at) \
              VALUES(?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(NEW_THREAD_TITLE)
-        .bind(agent_slug())
+        .bind(server_agent_slug)
         .bind(account_scope)
         .bind(&timestamp)
         .bind(&timestamp)
@@ -367,17 +386,36 @@ impl Database {
             .ok_or(AppError::ThreadNotFound)
     }
 
-    pub async fn set_yuxi_thread_id(&self, thread_id: &str, yuxi_thread_id: &str) -> AppResult<()> {
+    pub async fn thread_agent_slug(&self, thread_id: &str) -> AppResult<String> {
         let account_scope = self.current_account_scope().await?;
-        let result = sqlx::query(
-            "UPDATE threads SET yuxi_thread_id = ?, updated_at = ? WHERE id = ? AND account_scope = ?",
-        )
-            .bind(yuxi_thread_id)
-            .bind(now())
+        sqlx::query_scalar("SELECT agent_slug FROM threads WHERE id = ? AND account_scope = ?")
             .bind(thread_id)
             .bind(account_scope)
-            .execute(&self.pool)
-            .await?;
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::ThreadNotFound)
+    }
+
+    /// 原子固化服务端会话 ID 与该会话实际绑定的智能体，避免客户端重启后
+    /// 用新的默认智能体错误续写旧线程。
+    pub async fn bind_server_thread(
+        &self,
+        thread_id: &str,
+        yuxi_thread_id: &str,
+        server_agent_slug: &str,
+    ) -> AppResult<()> {
+        let account_scope = self.current_account_scope().await?;
+        let result = sqlx::query(
+            "UPDATE threads SET yuxi_thread_id = ?, agent_slug = ?, updated_at = ? \
+             WHERE id = ? AND account_scope = ?",
+        )
+        .bind(yuxi_thread_id)
+        .bind(server_agent_slug)
+        .bind(now())
+        .bind(thread_id)
+        .bind(account_scope)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::ThreadNotFound);
         }

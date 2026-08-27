@@ -12,8 +12,10 @@ use crate::{
     error::{AppError, AppResult},
 };
 
-const CREATE_RUN_PATH: &str = "/api/agent-invocation/agent-call/runs";
-const RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
+const DEFAULT_AGENT_PATH: &str = "/api/agent/default";
+const CREATE_THREAD_PATH: &str = "/api/chat/thread";
+const CREATE_RUN_PATH: &str = "/api/agent/runs";
+const LEGACY_RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
 const CREDENTIAL_STATUS_PATH: &str = "/api/agent-invocation/credential-status";
 
 #[derive(Clone)]
@@ -31,10 +33,20 @@ pub struct CreatedRun {
     pub run_context: ServerRunContext,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerThread {
+    pub id: String,
+    pub agent_id: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ServerRunContext {
     pub protocol_version: Option<String>,
+    pub agent_slug: Option<String>,
+    pub thread_id: Option<String>,
+    pub request_id: Option<String>,
+    pub result_authority: Option<String>,
     pub model_spec: Option<String>,
     #[serde(default)]
     pub knowledge_scope: KnowledgeScopeSummary,
@@ -107,21 +119,27 @@ pub struct RunResult {
 }
 
 #[derive(Debug, Serialize)]
+struct CreateThreadRequest<'a> {
+    agent_id: &'a str,
+    thread_id: &'a str,
+    title: &'a str,
+    metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
 struct CreateRunRequest<'a> {
+    query: &'a str,
     agent_slug: &'a str,
-    messages: [InputMessage<'a>; 1],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<&'a str>,
-    request_id: &'a str,
-    async_mode: bool,
+    thread_id: &'a str,
+    meta: RunRequestMeta<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_spec: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
-struct InputMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+struct RunRequestMeta<'a> {
+    request_id: &'a str,
+    client: &'static str,
 }
 
 impl YuxiClient {
@@ -188,7 +206,7 @@ impl YuxiClient {
         // 兼容尚未部署 credential-status 的 Yuxi：查询一个必然不存在的 run。
         // 该请求不会启动模型，也不会产生计费；401/403 仍能准确验证凭证。
         let probe = self
-            .authorized_post(&format!("{base}{RUN_RESULT_PATH}"), api_key)
+            .authorized_post(&format!("{base}{LEGACY_RUN_RESULT_PATH}"), api_key)
             .json(&json!({
                 "run_id": "desktop-connection-test",
                 "agent_slug": agent_slug,
@@ -209,7 +227,7 @@ impl YuxiClient {
         agent_slug: &str,
         api_key: &SecretString,
         question: &str,
-        yuxi_thread_id: Option<&str>,
+        yuxi_thread_id: &str,
         request_id: &str,
         model_spec: Option<&str>,
     ) -> AppResult<CreatedRun> {
@@ -220,14 +238,13 @@ impl YuxiClient {
                 .authorized_post(&format!("{base}{CREATE_RUN_PATH}"), api_key)
                 .header("X-Client-Request-ID", request_id)
                 .json(&CreateRunRequest {
+                    query: question,
                     agent_slug,
-                    messages: [InputMessage {
-                        role: "user",
-                        content: question,
-                    }],
                     thread_id: yuxi_thread_id,
-                    request_id,
-                    async_mode: true,
+                    meta: RunRequestMeta {
+                        request_id,
+                        client: "rice-endosperm-desktop",
+                    },
                     model_spec,
                 })
                 .timeout(Duration::from_secs(45))
@@ -259,6 +276,72 @@ impl YuxiClient {
         Err(last_error.unwrap_or(AppError::ServiceUnavailable))
     }
 
+    /// 从服务端读取当前用户可访问的权威默认智能体。
+    ///
+    /// 桌面端不得把编译期 slug 当作运行时真源；服务端返回值会被固化到本地线程，
+    /// 后续所有 run 都使用该线程实际绑定的智能体。
+    pub async fn default_agent_slug(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+    ) -> AppResult<String> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{DEFAULT_AGENT_PATH}"), api_key)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_default_agent_slug(&value)
+    }
+
+    /// 创建与 Web 端相同的原生 Yuxi Conversation。
+    /// 客户端线程 ID 同时作为幂等键，连接超时后可安全重试而不产生孤儿会话。
+    pub async fn create_thread(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        agent_slug: &str,
+        requested_thread_id: &str,
+        title: &str,
+    ) -> AppResult<ServerThread> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_post(&format!("{base}{CREATE_THREAD_PATH}"), api_key)
+            .json(&CreateThreadRequest {
+                agent_id: agent_slug,
+                thread_id: requested_thread_id,
+                title,
+                metadata: json!({"client": "rice-endosperm-desktop"}),
+            })
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let thread = response
+            .json::<ServerThread>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        if thread.id.is_empty() || thread.agent_id.is_empty() {
+            return Err(AppError::Protocol("创建会话响应缺少 id 或 agent_id".into()));
+        }
+        if thread.id != requested_thread_id {
+            return Err(AppError::Protocol(
+                "服务端返回的会话 ID 与客户端幂等 ID 不一致".into(),
+            ));
+        }
+        if thread.agent_id != agent_slug {
+            return Err(AppError::Protocol(
+                "服务端创建的会话绑定了非预期智能体".into(),
+            ));
+        }
+        Ok(thread)
+    }
+
     pub async fn event_response(
         &self,
         gateway_url: &str,
@@ -284,14 +367,12 @@ impl YuxiClient {
     pub async fn result(
         &self,
         gateway_url: &str,
-        agent_slug: &str,
         api_key: &SecretString,
         run_id: &str,
     ) -> AppResult<RunResult> {
         let base = validate_gateway_url(gateway_url)?;
         let response = self
-            .authorized_post(&format!("{base}{RUN_RESULT_PATH}"), api_key)
-            .json(&json!({ "run_id": run_id, "agent_slug": agent_slug }))
+            .authorized_get(&format!("{base}/api/agent/runs/{run_id}/result"), api_key)
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
@@ -1154,6 +1235,42 @@ fn final_output(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn parse_default_agent_slug(value: &Value) -> AppResult<String> {
+    value
+        .pointer("/agent/slug")
+        .or_else(|| value.pointer("/agent/agent_id"))
+        .and_then(Value::as_str)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Protocol("默认智能体响应缺少 slug".into()))
+}
+
+pub fn validate_authoritative_run_context(
+    context: &ServerRunContext,
+    expected_agent_slug: &str,
+    expected_thread_id: &str,
+    expected_request_id: &str,
+) -> AppResult<()> {
+    let compatible_protocol = context
+        .protocol_version
+        .as_deref()
+        .and_then(|version| version.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse::<u64>().ok()?, minor.parse::<u64>().ok()?)))
+        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 2));
+    if !compatible_protocol
+        || context.result_authority.as_deref() != Some("yuxi_server")
+        || context.agent_slug.as_deref() != Some(expected_agent_slug)
+        || context.thread_id.as_deref() != Some(expected_thread_id)
+        || context.request_id.as_deref() != Some(expected_request_id)
+    {
+        return Err(AppError::Protocol(
+            "服务端 AgentRun 权威上下文与桌面请求不一致；请更新并重启 rice-endosperm-agent 与 APISIX"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_run_result(value: &Value) -> RunResult {
     RunResult {
         status: value
@@ -1211,10 +1328,69 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CliSessionStart, CliTokenPoll, ProgressText, connection_error_for_gateway, final_output,
-        parse_cli_token_response, parse_desktop_login_response, parse_run_result,
-        sanitize_visible_model_text, terminal_status,
+        CliSessionStart, CliTokenPoll, CreateRunRequest, ProgressText, RunRequestMeta,
+        connection_error_for_gateway, final_output, parse_cli_token_response,
+        parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
+
+    #[test]
+    fn serializes_the_same_native_agent_run_contract_as_web() {
+        let value = serde_json::to_value(CreateRunRequest {
+            query: "水稻胚乳发育的关键调控基因有哪些？",
+            agent_slug: "default-chatbot",
+            thread_id: "thread-1",
+            meta: RunRequestMeta {
+                request_id: "desktop-request-123456",
+                client: "rice-endosperm-desktop",
+            },
+            model_spec: None,
+        })
+        .expect("serialize native AgentRun request");
+
+        assert_eq!(value["agent_slug"], "default-chatbot");
+        assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["meta"]["request_id"], "desktop-request-123456");
+        assert_eq!(value["meta"]["client"], "rice-endosperm-desktop");
+        assert!(value.get("messages").is_none());
+        assert!(value.get("async_mode").is_none());
+        assert!(value.get("model_spec").is_none());
+    }
+
+    #[test]
+    fn parses_authoritative_default_agent_from_server() {
+        assert_eq!(
+            parse_default_agent_slug(&json!({"agent": {"slug": "default-chatbot"}}))
+                .expect("parse default agent"),
+            "default-chatbot"
+        );
+        assert!(parse_default_agent_slug(&json!({"agent": {}})).is_err());
+    }
+
+    #[test]
+    fn validates_server_owned_agent_run_context() {
+        let context = serde_json::from_value(json!({
+            "protocol_version": "1.2",
+            "agent_slug": "default-chatbot",
+            "thread_id": "thread-1",
+            "request_id": "request-1",
+            "result_authority": "yuxi_server"
+        }))
+        .expect("decode authoritative context");
+        assert!(
+            validate_authoritative_run_context(
+                &context,
+                "default-chatbot",
+                "thread-1",
+                "request-1"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_authoritative_run_context(&context, "another-agent", "thread-1", "request-1")
+                .is_err()
+        );
+    }
 
     #[test]
     fn decodes_server_device_login_contract() {
