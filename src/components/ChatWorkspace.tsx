@@ -14,6 +14,7 @@ import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, LoaderCircle, Square } f
 import remarkGfm from "remark-gfm";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
 import type { ChatCompletion, LocalMessage } from "../types";
+import { normalizeMarkdownTables } from "../utils/markdown-tables";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 
 type Props = {
@@ -75,7 +76,12 @@ function AssistantMessage() {
 }
 
 function MarkdownText() {
-  return <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} />;
+  return (
+    <MarkdownTextPrimitive
+      remarkPlugins={[remarkGfm]}
+      preprocess={normalizeMarkdownTables}
+    />
+  );
 }
 
 function ChatMessage() {
