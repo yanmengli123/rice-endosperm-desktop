@@ -42,7 +42,7 @@ pub enum AppError {
     ThreadNotFound,
     #[error("网络请求失败：{0}")]
     Network(String),
-    #[error("Yuxi 返回了无法识别的数据：{0}")]
+    #[error("服务端返回错误：{0}")]
     Protocol(String),
     #[error("本地安全存储失败：{0}")]
     CredentialStore(String),
