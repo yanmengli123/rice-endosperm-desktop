@@ -197,7 +197,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .settings-dialog header > div { display: flex; align-items: center; gap: 12px; }
 .settings-dialog h2 { margin: 0; color: var(--green-950); font-size: 17px; }
 .settings-dialog header p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+.settings-dialog header .connection-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: var(--green-100); color: var(--green-800); font-size: 11px; font-weight: 600; }
+.settings-dialog header .connection-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green-600); }
+.settings-dialog header .connection-badge.error { background: #fbeceb; color: #9b3731; }
+.settings-dialog header .connection-badge.error::before { background: #c05046; }
 .settings-body { padding: 13px 23px 23px; }
+.settings-section-title { margin: 15px 2px 6px; color: var(--green-950); font-size: 12px; font-weight: 700; letter-spacing: 0.03em; }
+.settings-section-title:first-child { margin-top: 4px; }
 .setting-row { display: grid; grid-template-columns: 95px 1fr; gap: 12px; border-bottom: 1px solid #edf1ed; padding: 14px 2px; font-size: 12px; }
 .setting-row > span { color: var(--muted); }
 .setting-row > strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
@@ -471,6 +477,47 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   font-size: 11px;
   line-height: 1.5;
 }
+
+.json-preview-ok {
+  margin: 6px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--green-600);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--green-800) 6%, transparent);
+}
+
+.json-preview-ok .json-preview-title {
+  color: var(--green-800);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.json-preview-ok ul {
+  margin: 0;
+  padding-left: 16px;
+  color: var(--gray-700);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.json-preview-ok code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.json-preview-err {
+  margin: 6px 0;
+  padding: 10px 12px;
+  border: 1px solid #ecd2cf;
+  border-radius: 9px;
+  background: color-mix(in srgb, #ecd2cf 30%, transparent);
+  color: #9b3731;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 
 .custom-model-form > button,
 .json-model-form > button {
