@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ExternalLink, KeyRound, LoaderCircle, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
@@ -21,6 +21,11 @@ import {
 } from "../services/tauri-client";
 import type { ByokCredential, ModelOption, PublicSettings } from "../types";
 import type { AccountSummary } from "../services/tauri-client";
+import {
+  normalizeConfigurationForServer,
+  parseModelConfigurationJson,
+  type ModelConfigurationPreview,
+} from "../utils/model-config-import";
 
 type Props = {
   settings: PublicSettings;
@@ -48,6 +53,12 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   const [configurationJson, setConfigurationJson] = useState("");
 
   const byokProviders = Array.from(new Set(models.map((model) => model.spec.split(":")[0])));
+
+  // JSON 导入的本地解析预览：粘贴即校验，成功显示目标，失败给出可操作原因。
+  const jsonPreview: ModelConfigurationPreview | undefined = useMemo(
+    () => (configurationJson.trim() ? parseModelConfigurationJson(configurationJson) : undefined),
+    [configurationJson],
+  );
   const modelOptions = Array.from(new Map([
     ...models,
     ...byokList
@@ -122,13 +133,24 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   }
 
   async function importConfigurationJson() {
-    if (!configurationJson.trim()) {
-      setStatus("请粘贴 JSON 配置");
+    if (!jsonPreview?.ok) {
+      setStatus(jsonPreview?.error || "请先粘贴可解析的 JSON 配置");
+      return;
+    }
+    // 企业安全：导入前确认目标端点与模型，二次防止误把密钥发往非预期网关。
+    if (
+      !window.confirm(
+        `确认把模型密钥设为默认模型？\n\n协议：Anthropic 兼容\nBase URL：${jsonPreview.baseUrl}\n模型：${jsonPreview.model}\n密钥：${jsonPreview.maskedApiKey}`,
+      )
+    ) {
       return;
     }
     setBusy(true);
+    setStatus("正在安全导入并设为默认模型…");
     try {
-      const result = await importModelConfiguration(configurationJson.trim());
+      // 归一化：仅当 env 只有 ANTHROPIC_AUTH_TOKEN 时补一份 ANTHROPIC_API_KEY 副本，
+      // 兼容只认 ANTHROPIC_API_KEY 的旧版 Yuxi 服务端；新版服务端两者皆可。
+      const result = await importModelConfiguration(normalizeConfigurationForServer(configurationJson));
       setConfigurationJson("");
       setModelSpec(result.modelSpec);
       await reloadByok();
@@ -278,12 +300,17 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
       <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
           <div><span className="settings-icon"><ShieldCheck size={20} /></span><div><h2 id="settings-title">设置与连接</h2><p>本机安全配置和应用更新</p></div></div>
+          <span className={`connection-badge ${settings.hasApiKey ? "" : "error"}`}>
+            {settings.hasApiKey ? "已连接" : "未连接"}
+          </span>
           <button className="icon-button" onClick={onClose} aria-label="关闭"><X size={20} /></button>
         </header>
         <div className="settings-body">
+          <div className="settings-section-title">连接信息</div>
           <div className="setting-row"><span>服务地址</span><strong>{settings.gatewayUrl}</strong></div>
           <div className="setting-row"><span>智能体</span><strong>{settings.agentSlug}</strong></div>
           <div className="setting-row"><span>API Key</span><strong className="key-hint"><KeyRound size={15} /> {settings.apiKeyHint || "已安全配置"}</strong></div>
+          <div className="settings-section-title">模型与问答</div>
           <div className="setting-row setting-row-stack">
             <span>账号默认模型<span className="model-hint">（同步保存到 Yuxi 服务端）</span></span>
             <select
@@ -307,6 +334,7 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
           </div>
           {accounts.length > 0 && (
             <div className="settings-field">
+              <div className="settings-section-title">账号与安全</div>
               <span>本机已登录账号</span>
               <ul className="account-list">
                 {accounts.map((account) => (
@@ -378,15 +406,33 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
                 <textarea
                   value={configurationJson}
                   onChange={(event) => setConfigurationJson(event.target.value)}
-                  placeholder={'粘贴包含 env.ANTHROPIC_BASE_URL、ANTHROPIC_API_KEY、ANTHROPIC_MODEL 的 JSON'}
-                  rows={9}
+                  placeholder={'粘贴 Claude Code settings.json，例如 env.ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL'}
+                  rows={8}
                   autoComplete="off"
                   spellCheck={false}
                   disabled={busy}
                 />
-                <p>只读取 Base URL、API Key 和模型名；其他 Claude Code 环境变量不会执行或写入服务端环境。</p>
-                <button onClick={() => void importConfigurationJson()} disabled={busy || !configurationJson.trim()}>
-                  安全导入并设为默认模型
+                {configurationJson.trim() && (
+                  jsonPreview?.ok ? (
+                    <div className="json-preview-ok">
+                      <div className="json-preview-title">已解析，可安全导入：</div>
+                      <ul>
+                        <li>协议：<strong>Anthropic 兼容</strong></li>
+                        <li>Base URL：<code>{jsonPreview.baseUrl}</code></li>
+                        <li>模型：<code>{jsonPreview.model}</code></li>
+                        <li>密钥：<code>{jsonPreview.maskedApiKey}</code>（来源 {jsonPreview.resolvedSources.apiKey}）</li>
+                        {jsonPreview.ignoredFields.length > 0 && (
+                          <li>忽略 {jsonPreview.ignoredFields.length} 个非模型字段（<code>{jsonPreview.ignoredFields.slice(0, 4).join("、")}{jsonPreview.ignoredFields.length > 4 ? "…" : ""}</code>）</li>
+                        )}
+                      </ul>
+                    </div>
+                  ) : (
+                    <div className="json-preview-err">{jsonPreview?.error}</div>
+                  )
+                )}
+                <p>只读取 Base URL、API Key 和模型名；其他 Claude Code 环境变量不会执行或写入服务端环境。密钥仅经加密连接发送、服务端按账号加密保存，不落本机。</p>
+                <button onClick={() => void importConfigurationJson()} disabled={busy || !jsonPreview?.ok}>
+                  {jsonPreview?.ok ? `导入并设为默认：${jsonPreview.model}` : "安全导入并设为默认模型"}
                 </button>
               </div>
             )}
