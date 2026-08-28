@@ -83,6 +83,8 @@ export function createYuxiAdapter(
       const channel = new Channel<RunEvent>();
       let activeRunId: string | undefined;
       let accumulatedText = "";
+      let sawDone = false;
+      let doneStatus: string | undefined;
 
       channel.onmessage = (event) => queue.push(event);
       const invocation = sendMessage(request, channel);
@@ -111,6 +113,8 @@ export function createYuxiAdapter(
             accumulatedText = sanitizeVisibleModelText(event.text);
             yield { content: [{ type: "text", text: accumulatedText }] };
           } else if (event.type === "done") {
+            sawDone = true;
+            doneStatus = event.status;
             accumulatedText = sanitizeVisibleModelText(event.text);
             yield { content: [{ type: "text", text: accumulatedText }] };
           }
@@ -129,6 +133,21 @@ export function createYuxiAdapter(
       } catch (error) {
         if (abortSignal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           callbacks.onRunState?.({ runId: activeRunId, status: "cancelled" });
+          return;
+        }
+        // Rust 层只有在非空回答已成功落库后才会发送 done。即使服务端终态为
+        // failed/interrupted，也保留已经送达的内容，同时如实展示服务端终态。
+        if (sawDone && accumulatedText.trim().length > 0) {
+          const detail = normalizeCommandError(error).message;
+          const status = doneStatus === "completed" ? "completed" : (doneStatus ?? "failed");
+          callbacks.onRunState?.({
+            runId: activeRunId,
+            status,
+            message:
+              status === "completed"
+                ? `回答已完成并保存；服务端附加信息：${detail}`
+                : `回答内容已保存；服务端终态为 ${status}：${detail}`,
+          });
           return;
         }
         callbacks.onRunState?.({

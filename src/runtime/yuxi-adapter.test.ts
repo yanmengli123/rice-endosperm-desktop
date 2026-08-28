@@ -111,4 +111,96 @@ describe("createYuxiAdapter", () => {
       expect.objectContaining({ text: "你好！我是稻芯智析。" }),
     );
   });
+
+  it("done 之后迟到的命令失败降级为 completed，不丢弃已完成回答", async () => {
+    const onRunState = vi.fn();
+    const onCompleted = vi.fn();
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "started", runId: "run-3" });
+      channel.onmessage({ type: "text", text: "水稻胚乳发育分为" });
+      channel.onmessage({ type: "done", runId: "run-3", status: "completed", text: "水稻胚乳发育分为多个关键阶段。" });
+      // 服务端收尾阶段抛出的异常（如清理 ContextVar 失败）污染命令返回值
+      throw new Error(
+        "Yuxi 返回了无法识别的数据：<Token var=<ContextVar name='yuxi_mcp_execution_context' ...>> was created in a different Context",
+      );
+    });
+    const adapter = createYuxiAdapter("local-thread-3", { onRunState, onCompleted });
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ] as unknown as ThreadMessage[];
+    const stream = adapter.run({
+      messages,
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+
+    const rendered: string[] = [];
+    await expect(
+      (async () => {
+        for await (const update of stream) {
+          const part = update.content?.[0];
+          if (part?.type === "text") rendered.push(part.text);
+        }
+      })(),
+    ).resolves.toBeUndefined(); // 不应向调用方抛错
+
+    expect(rendered[rendered.length - 1]).toBe("水稻胚乳发育分为多个关键阶段。");
+    const finalState = onRunState.mock.calls[onRunState.mock.calls.length - 1]?.[0];
+    expect(finalState.status).toBe("completed");
+    expect(finalState.message).toContain("服务端附加信息");
+  });
+
+  it("没有任何内容产出时的失败仍然抛出，保持错误可见", async () => {
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      throw new Error("Yuxi 返回了无法识别的数据：garbage-frame");
+    });
+    const onRunState = vi.fn();
+    const adapter = createYuxiAdapter("local-thread-4", { onRunState });
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ] as unknown as ThreadMessage[];
+    const stream = adapter.run({
+      messages,
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+
+    await expect(async () => {
+      for await (const _update of stream) {
+        // 消费即抛
+      }
+    }).rejects.toThrow("无法识别的数据");
+    const finalState = onRunState.mock.calls[onRunState.mock.calls.length - 1]?.[0];
+    expect(finalState.status).toBe("failed");
+  });
+
+  it("failed 终态带已落库回答时保留内容并如实显示失败", async () => {
+    const onRunState = vi.fn();
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "started", runId: "run-5" });
+      channel.onmessage({ type: "text", text: "已生成并保存的回答" });
+      channel.onmessage({
+        type: "done",
+        runId: "run-5",
+        status: "failed",
+        text: "已生成并保存的回答",
+        context: {},
+      });
+      throw new Error("服务端收尾失败");
+    });
+    const adapter = createYuxiAdapter("local-thread-5", { onRunState });
+    const stream = adapter.run({
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+
+    const rendered: string[] = [];
+    for await (const update of stream) {
+      const part = update.content?.[0];
+      if (part?.type === "text") rendered.push(part.text);
+    }
+
+    expect(rendered[rendered.length - 1]).toBe("已生成并保存的回答");
+    const finalState = onRunState.mock.calls[onRunState.mock.calls.length - 1]?.[0];
+    expect(finalState.status).toBe("failed");
+    expect(finalState.message).toContain("回答内容已保存");
+  });
 });

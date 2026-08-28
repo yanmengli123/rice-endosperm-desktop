@@ -36,6 +36,18 @@ jobs:
       - name: Prepare pinned libsodium
         shell: pwsh
         run: ./.github/scripts/prepare-libsodium.ps1
+      - name: Verify updater signing credentials
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is required for signed updater artifacts."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required for signed updater artifacts."
+          }
       - name: Build and publish installers
         uses: tauri-apps/tauri-action@v0.6.2
         env:
@@ -58,7 +70,7 @@ jobs:
           includeUpdaterJson: false
           assetNamePattern: Daoxin-Zhixi_[version]_[arch][setup].[ext]
           retryAttempts: 2
-          args: --bundles nsis,msi
+          args: --bundles nsis,msi --config src-tauri/tauri.release.conf.json
       - name: Publish updater manifest and checksums
         shell: pwsh
         env:

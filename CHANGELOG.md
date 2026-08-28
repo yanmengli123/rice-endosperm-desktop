@@ -1,9 +1,20 @@
 # 更新日志
 
+## 0.3.6（2026-08-28）
+
+- 修复：跨异步 Context 的 MCP 执行上下文 Token 异常不再泄漏进桌面端回答（服务端 MCP 上下文 / BYOK 凭据上下文都改为跨 Context 安全的 no-op reset）。这是上一版本偶发的"\"Yuxi 返回了无法识别的数据\"\"的根根因。
+- 修复：切换会话或新建会话后上一次回答的答案不再消失——消息表改为 append-only（同 id 重复写入不会覆盖已有答案），并按 account_scope 隔离跨账号数据；服务端生成或抢救回来的有效回答会先于返回落库，桌面端不会丢弃。
+- 修复：MCP 审计摘要不再使用 ``default=str`` 兜底序列化，对 Token / ContextVar / callable 一律拒绝进入 digest 与日志。
+- 修复：服务端 invalid_agent 早退路径的上下文残留——彻底交给生成器 finally 统一清理，杜绝同 token 二次 reset。
+
 ## 未发布
 
 - 设置页新增用户专属大模型配置：可手动填写 OpenAI/Anthropic 兼容协议、HTTPS API Base URL、API Key 和 model，也可粘贴 Claude Code 风格 JSON 一键导入；保存后同步设为服务端用户默认模型。
 - JSON 仅提取模型调用必需的三项配置，其他环境变量不会执行或落盘；API Key 不写本机 SQLite/日志，仍由 Yuxi 服务端按账号加密保存并仅回显掩码。
+
+## 0.3.5（2026-08-28）
+
+- 设置页新增用户专属大模型配置（OpenAI/Anthropic 兼容 + Claude Code JSON 一键导入），保存即同步为服务端用户默认模型。API Key 不落本机 SQLite/日志，仍由 Yuxi 服务端按账号加密保存。
 
 ## 0.3.4（2026-08-27）
 

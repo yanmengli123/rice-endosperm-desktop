@@ -263,6 +263,10 @@ impl Database {
 
     pub async fn ensure_thread(&self, thread_id: &str) -> AppResult<()> {
         let account_scope = self.current_account_scope().await?;
+        self.ensure_thread_in_scope(thread_id, &account_scope).await
+    }
+
+    async fn ensure_thread_in_scope(&self, thread_id: &str, account_scope: &str) -> AppResult<()> {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ? AND account_scope = ?)",
         )
@@ -281,7 +285,9 @@ impl Database {
         let account_scope = self.current_account_scope().await?;
         sqlx::query_as::<_, ThreadSummary>(
             "SELECT t.id, t.title, t.updated_at, \
-             COALESCE((SELECT content FROM messages m WHERE m.thread_id = t.id ORDER BY position DESC LIMIT 1), '') AS preview \
+             COALESCE((SELECT m.content FROM messages m \
+                        WHERE m.thread_id = t.id AND m.account_scope = t.account_scope \
+                        ORDER BY m.position DESC LIMIT 1), '') AS preview \
              FROM threads t WHERE t.account_scope = ? ORDER BY t.updated_at DESC",
         )
         .bind(account_scope)
@@ -322,11 +328,13 @@ impl Database {
     }
 
     pub async fn load_messages(&self, thread_id: &str) -> AppResult<Vec<LocalMessage>> {
-        self.ensure_thread(thread_id).await?;
+        let account_scope = self.current_account_scope().await?;
         sqlx::query_as::<_, LocalMessage>(
-            "SELECT id, role, content, created_at FROM messages WHERE thread_id = ? ORDER BY position",
+            "SELECT id, role, content, created_at FROM messages \
+             WHERE thread_id = ? AND account_scope = ? ORDER BY position",
         )
         .bind(thread_id)
+        .bind(account_scope)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
@@ -339,39 +347,58 @@ impl Database {
         role: &str,
         content: &str,
     ) -> AppResult<()> {
-        self.ensure_thread(thread_id).await?;
+        let account_scope = self.current_account_scope().await?;
+        self.ensure_thread_in_scope(thread_id, &account_scope)
+            .await?;
         let mut transaction = self.pool.begin().await?;
-        // position 在 INSERT 内用标量子查询计算：单条语句在 SQLite 写锁下
-        // 原生原子，避免"先查 MAX 再插入"在并发下撞 UNIQUE(thread_id, position)。
+        // 消息表语义为 append-only：同 id 二次 INSERT 直接 IGNORE，避免重试/
+        // 重发把"上一轮助手答案"覆盖成"下一轮的内容"（历史上常见的"切完会话
+        // 旧答案消失"根因）。
+        //
+        // 单一例外：当同 id 已存在但内容是空字符串时，允许用新内容覆盖——
+        // 服务端标记 failed/interrupted 但其实已经流式输出完的运行，需要把
+        // 已生成内容抢救落库；send_message 路径会再写一次，append-only 在这
+        // 种边缘场景不应让抢救失败。
         sqlx::query(
-            "INSERT INTO messages(id, thread_id, role, content, position, created_at) \
-             VALUES(?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ?), 0) + 1, ?) \
-             ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+            "INSERT INTO messages(id, thread_id, role, content, position, account_scope, created_at) \
+             VALUES(?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ? AND account_scope = ?), 0) + 1, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET content = excluded.content \
+             WHERE messages.thread_id = excluded.thread_id \
+             AND messages.account_scope = excluded.account_scope \
+             AND messages.role = excluded.role \
+             AND messages.content = ''",
         )
         .bind(id)
         .bind(thread_id)
         .bind(role)
         .bind(content)
         .bind(thread_id)
+        .bind(&account_scope)
+        .bind(&account_scope)
         .bind(now())
         .execute(&mut *transaction)
         .await?;
 
-        let current_title: String = sqlx::query_scalar("SELECT title FROM threads WHERE id = ?")
-            .bind(thread_id)
-            .fetch_one(&mut *transaction)
-            .await?;
+        let current_title: String =
+            sqlx::query_scalar("SELECT title FROM threads WHERE id = ? AND account_scope = ?")
+                .bind(thread_id)
+                .bind(&account_scope)
+                .fetch_one(&mut *transaction)
+                .await?;
         let title = if role == "user" && current_title == NEW_THREAD_TITLE {
             content.trim().chars().take(28).collect::<String>()
         } else {
             current_title
         };
-        sqlx::query("UPDATE threads SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(title)
-            .bind(now())
-            .bind(thread_id)
-            .execute(&mut *transaction)
-            .await?;
+        sqlx::query(
+            "UPDATE threads SET title = ?, updated_at = ? WHERE id = ? AND account_scope = ?",
+        )
+        .bind(title)
+        .bind(now())
+        .bind(thread_id)
+        .bind(account_scope)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -430,7 +457,9 @@ impl Database {
         status: &str,
         server_context: &str,
     ) -> AppResult<()> {
-        self.ensure_thread(thread_id).await?;
+        let account_scope = self.current_account_scope().await?;
+        self.ensure_thread_in_scope(thread_id, &account_scope)
+            .await?;
         let timestamp = now();
         sqlx::query(
             "INSERT INTO runs(run_id, request_id, thread_id, status, server_context, created_at, updated_at) \
@@ -475,12 +504,17 @@ impl Database {
     }
 
     pub async fn latest_run_context(&self, thread_id: &str) -> AppResult<Option<String>> {
-        self.ensure_thread(thread_id).await?;
+        let account_scope = self.current_account_scope().await?;
+        self.ensure_thread_in_scope(thread_id, &account_scope)
+            .await?;
         sqlx::query_scalar(
-            "SELECT server_context FROM runs WHERE thread_id = ? AND server_context IS NOT NULL \
-             AND server_context != '' ORDER BY created_at DESC LIMIT 1",
+            "SELECT r.server_context FROM runs r \
+             JOIN threads t ON t.id = r.thread_id \
+             WHERE r.thread_id = ? AND t.account_scope = ? AND r.server_context IS NOT NULL \
+             AND r.server_context != '' ORDER BY r.created_at DESC LIMIT 1",
         )
         .bind(thread_id)
+        .bind(account_scope)
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -648,6 +682,7 @@ async fn is_v1_schema_compatible(pool: &SqlitePool) -> AppResult<bool> {
                 "content",
                 "position",
                 "created_at",
+                "account_scope",
             ],
         ),
         (
@@ -682,12 +717,26 @@ async fn is_v1_schema_compatible(pool: &SqlitePool) -> AppResult<bool> {
                 .bind(table)
                 .fetch_all(pool)
                 .await?;
-        if actual_columns.len() != expected_columns.len()
-            || !actual_columns
-                .iter()
-                .zip(*expected_columns)
-                .all(|(actual, expected)| actual == expected)
-        {
+        // messages 表在 v6 之前不含 ``account_scope``，之后含。修复路径要兼容两套。
+        let current: Vec<String> = expected_columns
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let legacy: Vec<String> = current
+            .iter()
+            .filter(|name| name.as_str() != "account_scope")
+            .cloned()
+            .collect();
+        let compatible = if *table == "messages" {
+            actual_columns == current || actual_columns == legacy
+        } else {
+            actual_columns.len() == current.len()
+                && actual_columns
+                    .iter()
+                    .zip(&current)
+                    .all(|(actual, expected)| actual == expected)
+        };
+        if !compatible {
             return Ok(false);
         }
     }
@@ -727,6 +776,95 @@ mod migration_tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn append_message_treats_same_id_as_append_only_and_does_not_overwrite_history() {
+        // Bug 回归：同 id 重试不得覆盖非空历史内容；仅允许抢救空占位消息。
+        let root = std::env::temp_dir().join(format!("daoxin-append-only-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        database
+            .activate_account("https://api.example.cn", "user-a", "yxkey_a", Some("A"))
+            .await
+            .expect("activate");
+        let thread = database.create_thread().await.expect("create thread");
+
+        database
+            .append_message("user-req-1", &thread.id, "user", "首轮问题")
+            .await
+            .expect("first user message");
+        database
+            .append_message(
+                "assistant-run-1",
+                &thread.id,
+                "assistant",
+                "首轮答案：水稻胚乳",
+            )
+            .await
+            .expect("first assistant message");
+
+        // 同 id 重写（任何网络抖动重试、客户端 run_id 重发都会触发）。
+        database
+            .append_message("user-req-1", &thread.id, "user", "被覆盖的脏数据")
+            .await
+            .expect("idempotent user insert");
+        database
+            .append_message("assistant-run-1", &thread.id, "assistant", "被覆盖的脏数据")
+            .await
+            .expect("idempotent assistant insert");
+
+        let messages = database
+            .load_messages(&thread.id)
+            .await
+            .expect("load_messages");
+        let user_msg = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user msg present");
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant msg present");
+        assert_eq!(user_msg.content, "首轮问题");
+        assert_eq!(assistant_msg.content, "首轮答案：水稻胚乳");
+
+        database
+            .append_message("assistant-empty", &thread.id, "assistant", "")
+            .await
+            .expect("empty placeholder");
+        database
+            .append_message(
+                "assistant-empty",
+                &thread.id,
+                "assistant",
+                "失败终态抢救回来的回答",
+            )
+            .await
+            .expect("recover empty placeholder");
+        let recovered = database
+            .load_messages(&thread.id)
+            .await
+            .expect("reload recovered message");
+        assert_eq!(
+            recovered
+                .iter()
+                .find(|message| message.id == "assistant-empty")
+                .expect("recovered assistant")
+                .content,
+            "失败终态抢救回来的回答"
+        );
+
+        // 同 thread + 新 id 必须能正常 append（append-only 不该阻断新数据进入）。
+        database
+            .append_message("user-req-2", &thread.id, "user", "第二轮问题")
+            .await
+            .expect("new id user insert");
+        let after = database.load_messages(&thread.id).await.expect("reload");
+        assert_eq!(after.len(), 4);
+
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
     async fn repairs_the_published_v1_crlf_checksum_without_losing_data() {
         let root = std::env::temp_dir().join(format!("daoxin-migration-test-{}", Uuid::new_v4()));
         let database = Database::open(&root).await.expect("create test database");
@@ -751,6 +889,14 @@ mod migration_tests {
             .execute(&database.pool)
             .await
             .expect("remove v4 column");
+        sqlx::query("DROP INDEX IF EXISTS idx_messages_account_thread")
+            .execute(&database.pool)
+            .await
+            .expect("remove v6 index");
+        sqlx::query("ALTER TABLE messages DROP COLUMN account_scope")
+            .execute(&database.pool)
+            .await
+            .expect("remove v6 column");
         sqlx::query("ALTER TABLE runs DROP COLUMN server_context")
             .execute(&database.pool)
             .await
@@ -778,7 +924,7 @@ mod migration_tests {
                 .fetch_one(&repaired.pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest_version, 5);
+        assert_eq!(latest_version, 6);
         assert_eq!(
             repaired
                 .setting("migration_test")
@@ -875,6 +1021,16 @@ mod migration_tests {
             .create_thread()
             .await
             .expect("create account A thread");
+        database
+            .insert_run(
+                "run-account-a",
+                "request-account-a",
+                &thread_a.id,
+                "running",
+                r#"{"model":"account-a"}"#,
+            )
+            .await
+            .expect("insert account A run");
 
         database
             .activate_account("https://api.example.cn", "user-b", "yxkey_b", Some("B"))
@@ -887,7 +1043,40 @@ mod migration_tests {
                 .expect("list B threads")
                 .is_empty()
         );
+        // 读列表/消息可以返回空集合，但任何带 thread_id 的写操作或运行上下文
+        // 读取都必须 fail-closed，不能向另一账号线程写入隐藏行。
         assert!(database.ensure_thread(&thread_a.id).await.is_err());
+        assert!(
+            database
+                .load_messages(&thread_a.id)
+                .await
+                .expect("load_messages B")
+                .is_empty()
+        );
+        assert!(
+            database
+                .append_message(
+                    "user-replay",
+                    &thread_a.id,
+                    "user",
+                    "account B 同一 thread_id 的写入"
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .insert_run(
+                    "run-account-b",
+                    "request-account-b",
+                    &thread_a.id,
+                    "running",
+                    r#"{"model":"account-b"}"#,
+                )
+                .await
+                .is_err()
+        );
+        assert!(database.latest_run_context(&thread_a.id).await.is_err());
 
         database
             .activate_account("https://api.example.cn", "user-a", "yxkey_a", Some("A"))
@@ -896,6 +1085,21 @@ mod migration_tests {
         assert_eq!(
             database.list_threads().await.expect("list A threads").len(),
             1
+        );
+        assert!(
+            database
+                .load_messages(&thread_a.id)
+                .await
+                .expect("reload account A messages")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .latest_run_context(&thread_a.id)
+                .await
+                .expect("load account A run context")
+                .as_deref(),
+            Some(r#"{"model":"account-a"}"#)
         );
 
         database.pool.close().await;
