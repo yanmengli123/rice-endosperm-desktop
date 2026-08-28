@@ -555,6 +555,17 @@ async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> 
                 }
             }
             "failed" | "cancelled" | "interrupted" => {
+                if !result.output.trim().is_empty() {
+                    state
+                        .database
+                        .append_message(
+                            &format!("assistant-{}", pending_run.run_id),
+                            &pending_run.thread_id,
+                            "assistant",
+                            &result.output,
+                        )
+                        .await?;
+                }
                 state
                     .database
                     .update_run_progress(
@@ -918,9 +929,27 @@ async fn send_message_inner(
             };
             let persisted_text = if matches!(&error, AppError::ServerUpgradeRequired) {
                 ""
+            } else if final_text.trim().is_empty() {
+                &accumulated
             } else {
                 &final_text
             };
+            // 服务端把 run 标记为 failed/interrupted 时，答案可能已经流式输出完毕
+            //（例如服务端收尾清理抛异常污染了终态）。只要实际产生过非空回答，
+            // 先按幂等 id 落库为助手消息再返回错误——保证"任何已完成回答都先
+            // 持久化再切换"。append_message 对同 id 是 upsert，后续
+            // sync_pending_runs 对账不会产生重复消息。
+            if !persisted_text.trim().is_empty() {
+                state
+                    .database
+                    .append_message(
+                        &format!("assistant-{}", created.run_id),
+                        &request.thread_id,
+                        "assistant",
+                        persisted_text,
+                    )
+                    .await?;
+            }
             state
                 .database
                 .update_run_progress(
@@ -932,6 +961,17 @@ async fn send_message_inner(
                     true,
                 )
                 .await?;
+            if !persisted_text.trim().is_empty() {
+                send_channel(
+                    on_event,
+                    RunEvent::Done {
+                        run_id: created.run_id.clone(),
+                        status: final_result.status.clone(),
+                        text: persisted_text.to_owned(),
+                        context: Box::new(context),
+                    },
+                )?;
+            }
             Err(error)
         }
     }
