@@ -395,6 +395,120 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 
 /* P5 BYOK：自有模型密钥表单 */
+.model-config-section {
+  border: 1px solid var(--gray-200);
+  border-radius: 14px;
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--gray-50);
+}
+
+.model-config-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  width: 100%;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--gray-100);
+}
+
+.model-config-tabs button {
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: transparent;
+  color: var(--gray-600);
+  cursor: pointer;
+}
+
+.model-config-tabs button.active {
+  background: var(--gray-0);
+  color: var(--green-800);
+  box-shadow: 0 1px 4px rgba(16, 38, 25, 0.12);
+}
+
+.custom-model-form,
+.json-model-form {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 100%;
+}
+
+.custom-model-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--gray-600);
+  font-size: 12px;
+}
+
+.custom-model-form input,
+.custom-model-form select,
+.json-model-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--gray-200);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: var(--gray-0);
+  color: var(--gray-800);
+  font: inherit;
+}
+
+.json-model-form textarea {
+  resize: vertical;
+  min-height: 145px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.json-model-form p {
+  margin: 0;
+  color: var(--gray-500);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.custom-model-form > button,
+.json-model-form > button {
+  border: 0;
+  border-radius: 9px;
+  padding: 9px 12px;
+  background: var(--green-800);
+  color: white;
+  cursor: pointer;
+}
+
+.custom-model-form > button:disabled,
+.json-model-form > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.model-config-section .account-name {
+  flex-direction: column;
+  align-items: flex-start;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.model-config-section .account-name small {
+  color: var(--gray-500);
+}
+
+.legacy-byok-panel {
+  margin-top: 10px;
+}
+
+.legacy-byok-panel summary {
+  cursor: pointer;
+  color: var(--gray-600);
+  font-size: 12px;
+}
+
 .byok-form {
   display: flex;
   flex-direction: column;
@@ -405,6 +519,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .byok-form input,
 .byok-form select {
   width: 100%;
+}
+
+@media (max-height: 820px) {
+  .settings-dialog {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 32px);
+  }
+
+  .settings-body {
+    overflow-y: auto;
+  }
 }
 
 .thinking-status {
