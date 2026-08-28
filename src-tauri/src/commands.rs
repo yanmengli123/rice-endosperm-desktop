@@ -1489,6 +1489,10 @@ pub struct ByokCredentialView {
     pub label: String,
     pub masked_hint: String,
     pub status: String,
+    pub protocol: Option<String>,
+    pub base_url: Option<String>,
+    pub model_id: Option<String>,
+    pub model_spec: Option<String>,
 }
 
 #[tauri::command]
@@ -1516,6 +1520,10 @@ pub async fn list_byok_credentials(
             label: item.label,
             masked_hint: item.masked_hint,
             status: item.status,
+            protocol: item.protocol,
+            base_url: item.base_url,
+            model_id: item.model_id,
+            model_spec: item.model_spec,
         })
         .collect())
 }
@@ -1542,6 +1550,56 @@ pub async fn save_byok_credential(
             provider_id.trim(),
             &SecretString::from(api_key),
         )
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn save_custom_model_credential(
+    protocol: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+    state: State<'_, AppState>,
+) -> Result<crate::yuxi::ModelConfigurationResult, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .save_custom_model_credential(
+            &gateway_url,
+            &bearer,
+            protocol.trim(),
+            base_url.trim(),
+            &SecretString::from(api_key),
+            model.trim(),
+        )
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn import_model_configuration(
+    configuration: String,
+    state: State<'_, AppState>,
+) -> Result<crate::yuxi::ModelConfigurationResult, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .import_model_configuration(&gateway_url, &bearer, &SecretString::from(configuration))
         .await
         .map_err(CommandError::from)
 }

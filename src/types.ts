@@ -122,6 +122,16 @@ export type ByokCredential = {
   label: string;
   maskedHint: string;
   status: string;
+  protocol?: string;
+  baseUrl?: string;
+  modelId?: string;
+  modelSpec?: string;
+};
+
+export type ModelConfigurationResult = {
+  credentialId: number;
+  modelSpec: string;
+  ignoredFields: string[];
 };
 
 export type ModelOption = {

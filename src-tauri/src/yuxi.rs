@@ -674,6 +674,10 @@ impl YuxiClient {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                protocol: optional_string(item, "protocol"),
+                base_url: optional_string(item, "base_url"),
+                model_id: optional_string(item, "model_id"),
+                model_spec: optional_string(item, "model_spec"),
             })
             .collect())
     }
@@ -700,6 +704,56 @@ impl YuxiClient {
             .await?;
         ensure_success(response).await?;
         Ok(())
+    }
+
+    /// 保存用户级 OpenAI/Anthropic 兼容端点；服务端会完成 SSRF 校验、加密和默认模型切换。
+    pub async fn save_custom_model_credential(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        protocol: &str,
+        base_url: &str,
+        api_key: &SecretString,
+        model: &str,
+    ) -> AppResult<ModelConfigurationResult> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_put(&format!("{base}/api/user/model-credentials"), bearer)
+            .json(&json!({
+                "protocol": protocol,
+                "base_url": base_url,
+                "api_key": api_key.expose_secret(),
+                "model": model,
+                "activate_as_default": true,
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        parse_model_configuration_response(ensure_success(response).await?).await
+    }
+
+    /// 导入 Claude Code 风格 JSON。原文只在本次 HTTPS 请求内存在，不写入本地存储。
+    pub async fn import_model_configuration(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        configuration: &SecretString,
+    ) -> AppResult<ModelConfigurationResult> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_post(&format!("{base}/api/user/model-credentials/import"), bearer)
+            .json(&json!({
+                "configuration": configuration.expose_secret(),
+                "activate_as_default": true,
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        parse_model_configuration_response(ensure_success(response).await?).await
     }
 
     /// P5 BYOK：逻辑撤销自有凭据；进行中任务由服务端 fail-closed 处理。
@@ -882,12 +936,68 @@ pub struct ByokCredential {
     pub label: String,
     pub masked_hint: String,
     pub status: String,
+    pub protocol: Option<String>,
+    pub base_url: Option<String>,
+    pub model_id: Option<String>,
+    pub model_spec: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigurationResult {
+    pub credential_id: i64,
+    pub model_spec: String,
+    pub ignored_fields: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
     pub spec: String,
     pub label: String,
+}
+
+fn optional_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+async fn parse_model_configuration_response(
+    response: reqwest::Response,
+) -> AppResult<ModelConfigurationResult> {
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| AppError::Protocol(error.to_string()))?;
+    let credential_id = value
+        .get("credential_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Protocol("模型配置响应缺少 credential_id".into()))?;
+    let model_spec = value
+        .get("model_spec")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("模型配置响应缺少 model_spec".into()))?
+        .to_owned();
+    let ignored_fields = value
+        .get("ignored_fields")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ModelConfigurationResult {
+        credential_id,
+        model_spec,
+        ignored_fields,
+    })
 }
 
 fn parse_desktop_login_response(value: &Value) -> AppResult<DesktopLoginIdentity> {

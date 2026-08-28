@@ -24,6 +24,7 @@
 - Yuxi 异步 Agent run、SSE 增量输出、`Last-Event-ID` 断线续传和原任务结果恢复。
 - 本地与服务端双重取消，不因网络重试创建重复 run。
 - Stronghold 加密 vault + 操作系统凭据保险库保存 API Key；Key 不进入 SQLite、浏览器存储或日志。
+- 用户可在设置页手动配置 OpenAI/Anthropic 兼容模型，或导入 Claude Code 风格 JSON；模型 API Key 只发送到 Yuxi 做用户级加密存储，不落本机数据库。
 - SQLite 保存本地会话、消息和运行恢复状态。
 - Tauri 2 原生 Windows 安装包和 GitHub Releases 自动更新。
 - 远程地址强制 HTTPS，本机开发地址例外；严格 CSP 和最小 Tauri capability。

@@ -7,6 +7,7 @@ import type {
   DeviceLoginStart,
   LocalMessage,
   ModelOption,
+  ModelConfigurationResult,
   PublicSettings,
   PendingRunSync,
   RunEvent,
@@ -84,6 +85,21 @@ export const listByokCredentials = () => invoke<ByokCredential[]>("list_byok_cre
 
 export const saveByokCredential = (providerId: string, apiKey: string) =>
   invoke<void>("save_byok_credential", { providerId, apiKey });
+
+export const saveCustomModelCredential = (
+  protocol: "openai" | "anthropic",
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+) => invoke<ModelConfigurationResult>("save_custom_model_credential", {
+  protocol,
+  baseUrl,
+  apiKey,
+  model,
+});
+
+export const importModelConfiguration = (configuration: string) =>
+  invoke<ModelConfigurationResult>("import_model_configuration", { configuration });
 
 export const removeByokCredential = (credentialId: number) =>
   invoke<void>("remove_byok_credential", { credentialId });
