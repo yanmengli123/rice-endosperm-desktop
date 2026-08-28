@@ -11,11 +11,15 @@ import {
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, LoaderCircle, Square } from "lucide-react";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
 import type { ChatCompletion, LocalMessage } from "../types";
 import { normalizeMarkdownTables } from "../utils/markdown-tables";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
+import { extractCodeBlock, HtmlPreviewFrame, isHtmlPreviewLanguage } from "../utils/html-preview";
+import type { ReactNode } from "react";
 
 type Props = {
   threadId: string;
@@ -75,11 +79,30 @@ function AssistantMessage() {
   );
 }
 
+// 与 Web 端 DOMPurify 策略对齐：允许展示型 HTML 与行内样式，剥离脚本与事件属性。
+const markdownSanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    "*": [...(defaultSchema.attributes?.["*"] ?? []), "style"],
+  },
+};
+
+function PreWithPreview({ children }: { children?: ReactNode }) {
+  const block = extractCodeBlock(children);
+  if (block && isHtmlPreviewLanguage(block.language)) {
+    return <HtmlPreviewFrame html={block.code} />;
+  }
+  return <pre>{children}</pre>;
+}
+
 function MarkdownText() {
   return (
     <MarkdownTextPrimitive
       remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
       preprocess={normalizeMarkdownTables}
+      components={{ pre: PreWithPreview }}
     />
   );
 }

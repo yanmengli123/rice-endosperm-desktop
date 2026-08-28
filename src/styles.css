@@ -545,3 +545,22 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .thinking-status svg {
   animation: spin 1s linear infinite;
 }
+
+
+/* html:preview 沙箱预览（与 Web 端预览容器对齐） */
+.html-preview-render {
+  margin: 10px 0;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.html-preview-frame {
+  display: block;
+  width: 100%;
+  height: 360px;
+  max-height: 700px;
+  border: 0;
+  background: #ffffff;
+}
