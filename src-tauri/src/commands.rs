@@ -769,7 +769,19 @@ async fn send_message_inner(
         loop {
             let next = tokio::select! {
                 _ = cancellation.cancelled() => return cancel_local_run(state, &created.run_id, &accumulated).await,
-                next = stream.next() => next,
+                next = tokio::time::timeout(Duration::from_secs(45), stream.next()) => match next {
+                    Ok(next) => next,
+                    Err(_) => {
+                        send_channel(
+                            on_event,
+                            RunEvent::Status {
+                                status: "polling".into(),
+                                message: "事件流暂时没有新数据，正在核对服务端任务状态…".into(),
+                            },
+                        )?;
+                        break;
+                    }
+                },
             };
             match next {
                 Some(Ok(event)) => {
@@ -793,6 +805,16 @@ async fn send_message_inner(
                         .get("thread_id")
                         .and_then(Value::as_str)
                         .is_none_or(|thread_id| thread_id == created.thread_id);
+                    if belongs_to_parent_thread && let Some(message) = run_progress_message(&value)
+                    {
+                        send_channel(
+                            on_event,
+                            RunEvent::Status {
+                                status: "running".into(),
+                                message: message.into(),
+                            },
+                        )?;
+                    }
                     if belongs_to_parent_thread && let Some(text) = progress_text.apply(&value) {
                         accumulated = text;
                         state
@@ -1089,6 +1111,14 @@ fn send_channel(channel: &Channel<RunEvent>, event: RunEvent) -> AppResult<()> {
 
 fn is_terminal(status: &str) -> bool {
     TERMINAL_STATUSES.contains(&status)
+}
+
+fn run_progress_message(value: &Value) -> Option<&str> {
+    let chunk = value.pointer("/payload/chunk")?;
+    (chunk.get("status").and_then(Value::as_str) == Some("progress"))
+        .then(|| chunk.get("message").and_then(Value::as_str))
+        .flatten()
+        .filter(|message| !message.trim().is_empty())
 }
 
 fn error_is_reconnectable(error: &AppError) -> bool {
@@ -1711,7 +1741,8 @@ pub async fn set_chat_model_preference(
 mod tests {
     use super::{
         RunEvent, SendMessageRequest, is_reasoning_protocol_failure, local_account_scope,
-        remote_principal_for_scope, validate_device_login_urls, validate_send_request,
+        remote_principal_for_scope, run_progress_message, validate_device_login_urls,
+        validate_send_request,
     };
     use crate::yuxi::CliSessionStart;
 
@@ -1747,6 +1778,26 @@ mod tests {
         .expect("serialize done");
         assert_eq!(done["type"], "done");
         assert_eq!(done["runId"], "run-1");
+    }
+
+    #[test]
+    fn reads_authoritative_server_progress_events() {
+        let value = serde_json::json!({
+            "payload": {
+                "chunk": {
+                    "status": "progress",
+                    "message": "服务端正在检索知识并生成回复…"
+                }
+            }
+        });
+        assert_eq!(
+            run_progress_message(&value),
+            Some("服务端正在检索知识并生成回复…")
+        );
+        assert_eq!(
+            run_progress_message(&serde_json::json!({"payload": {"status": "running"}})),
+            None
+        );
     }
 
     #[test]
