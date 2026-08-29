@@ -21,7 +21,7 @@ import { createYuxiAdapter } from "../runtime/yuxi-adapter";
 import type { ChatCompletion, LocalMessage } from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { normalizeRichAnswer } from "../utils/rich-answer";
-import { CodeHeader, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
+import { CodeHeader, HtmlFencedCodeBlock, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
 import { YuxiAttachmentAdapter } from "../runtime/yuxi-attachment-adapter";
 
 type Props = {
@@ -117,6 +117,8 @@ function MarkdownText() {
       }}
       componentsByLanguage={{
         htmlpreview: { SyntaxHighlighter: HtmlPreviewCodeBlock, CodeHeader: () => null },
+        // 模型输出的 ```html 围栏（常为内联样式卡片）默认渲染预览，可切换源码
+        html: { SyntaxHighlighter: HtmlFencedCodeBlock, CodeHeader: () => null },
         mermaid: { SyntaxHighlighter: MermaidDiagram, CodeHeader: () => null },
       }}
       defer

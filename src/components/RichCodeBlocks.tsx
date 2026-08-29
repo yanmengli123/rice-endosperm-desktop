@@ -28,7 +28,7 @@ export function CodeHeader({ language, code }: { language?: string; code: string
   );
 }
 
-export function PrismCodeBlock({ language, code }: SyntaxHighlighterProps) {
+function PrismSource({ language, code }: { language: string; code: string }) {
   return (
     <Highlight theme={themes.nightOwlLight} code={code.replace(/\n$/, "")} language={language as Language}>
       {({ className, style, tokens, getLineProps, getTokenProps }) => (
@@ -51,8 +51,53 @@ export function PrismCodeBlock({ language, code }: SyntaxHighlighterProps) {
   );
 }
 
+export function PrismCodeBlock(props: SyntaxHighlighterProps) {
+  return <PrismSource language={props.language} code={props.code} />;
+}
+
 export function HtmlPreviewCodeBlock({ code }: SyntaxHighlighterProps) {
   return <HtmlPreviewFrame html={code} />;
+}
+
+/**
+ * ```html 围栏块：科研模型常用带内联样式的 HTML 卡片组织结构化答案
+ * （如"调控基因分类卡片"），按源码展示会得到一大块可读性极差的标签文本。
+ * 默认走沙箱渲染预览（与 html:preview 同一净化/iframe 策略），
+ * 提供"查看源码"切换保留原始代码语义；脚本/事件属性已被 DOMPurify 剥离。
+ */
+export function HtmlFencedCodeBlock({ code }: { code: string }) {
+  const [showSource, setShowSource] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const source = code.replace(/\n$/, "");
+  return (
+    <div className="html-fenced-block">
+      <div className="code-block-header html-fenced-header">
+        <span>html</span>
+        <div className="html-fenced-actions">
+          <button
+            type="button"
+            onClick={() => setShowSource((value) => !value)}
+            aria-label={showSource ? "切换到渲染视图" : "切换到源码视图"}
+          >
+            {showSource ? "渲染视图" : "查看源码"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void navigator.clipboard.writeText(source).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1400);
+              });
+            }}
+            aria-label="复制代码"
+          >
+            {copied ? "已复制" : "复制"}
+          </button>
+        </div>
+      </div>
+      {showSource ? <PrismSource language="html" code={source} /> : <HtmlPreviewFrame html={source} />}
+    </div>
+  );
 }
 
 export function MermaidDiagram({ code }: SyntaxHighlighterProps) {
