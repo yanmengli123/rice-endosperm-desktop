@@ -756,3 +756,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .settings-nav > button { justify-content: center; padding: 11px; }
   .settings-body.settings-content { padding: 16px; }
 }
+
+/* ```html 围栏块：默认渲染预览 + 源码切换 */
+.html-fenced-block { margin: 10px 0; }
+.html-fenced-block .code-block-header { margin-top: 0; }
+.html-fenced-actions { display: inline-flex; align-items: center; gap: 10px; }
+.html-fenced-actions button { border: 1px solid #cfdcd2; border-radius: 7px; padding: 4px 9px; }
+.html-fenced-block .html-preview-render { margin: 0; border-radius: 0 0 12px 12px; }
+.html-fenced-block pre.syntax-code-block { margin: 0; border-radius: 0 0 11px 11px; }
