@@ -7,11 +7,7 @@ import { ConnectionSetup } from "./ConnectionSetup";
 import { saveConnectionWithLogin } from "../services/tauri-client";
 
 vi.mock("../services/tauri-client", () => ({
-  activateWithCode: vi.fn(),
   saveConnectionWithLogin: vi.fn(),
-  saveConnection: vi.fn(),
-  pollDeviceLogin: vi.fn(),
-  startDeviceLogin: vi.fn(),
   normalizeCommandError: (error: { message: string }) => new Error(error.message),
 }));
 

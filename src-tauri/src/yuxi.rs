@@ -624,73 +624,6 @@ impl YuxiClient {
         self.client.delete(url).bearer_auth(key.expose_secret())
     }
 
-    /// 创建设备码登录会话（桌面端开户入口；批准后换取自动创建的 API Key）。
-    pub async fn create_cli_session(
-        &self,
-        gateway_url: &str,
-        key_name: Option<&str>,
-    ) -> AppResult<CliSessionStart> {
-        let base = validate_gateway_url(gateway_url)?;
-        let mut body = json!({"key_name": ""});
-        if let Some(name) = key_name.filter(|value| !value.trim().is_empty()) {
-            body["key_name"] = json!(name);
-        }
-        let response = self
-            .client
-            .post(format!("{base}/api/auth/cli/sessions"))
-            .json(&body)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await?;
-        let response = ensure_success(response).await?;
-        let parsed = response
-            .json::<CliSessionStart>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        Ok(parsed)
-    }
-
-    /// 轮询设备码授权结果；返回 Pending 表示用户尚未在网页端批准。
-    pub async fn poll_cli_token(
-        &self,
-        gateway_url: &str,
-        device_code: &str,
-    ) -> AppResult<CliTokenPoll> {
-        let base = validate_gateway_url(gateway_url)?;
-        let response = self
-            .client
-            .post(format!("{base}/api/auth/cli/sessions/token"))
-            .json(&json!({"device_code": device_code}))
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await?;
-        let status = response.status();
-        if status.as_u16() == 400 {
-            // authorization_pending / expired 等都以 400 + detail.error 表达
-            let value = response.json::<Value>().await.unwrap_or(Value::Null);
-            let code = value
-                .pointer("/detail/error")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if code == "authorization_pending" {
-                return Ok(CliTokenPoll::Pending);
-            }
-            let message = value
-                .pointer("/detail/message")
-                .and_then(Value::as_str)
-                .unwrap_or("设备码授权失败")
-                .to_string();
-            return Err(AppError::Protocol(message));
-        }
-        let response = ensure_success(response).await?;
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        parse_cli_token_response(&value)
-    }
-
     /// P2b：旋转设备会话刷新令牌。重放/撤销/过期都以 401 表达，
     /// 由调用方决定是回退过渡 Key 还是提示重新登录。
     pub async fn refresh_cli_session(
@@ -760,75 +693,6 @@ impl YuxiClient {
             .await
             .map_err(|error| AppError::Protocol(error.to_string()))?;
         parse_desktop_login_response(&value)
-    }
-
-    /// P5：一次性激活凭证兑换设备会话对（公开端点，无静态 Key 签发）。
-    pub async fn exchange_onboarding_activation(
-        &self,
-        gateway_url: &str,
-        activation_code: &str,
-        device_name: &str,
-    ) -> AppResult<OnboardingExchange> {
-        let base = validate_gateway_url(gateway_url)?;
-        let response = self
-            .client
-            .post(format!("{base}/api/auth/onboarding/exchange"))
-            .json(&json!({
-                "activation_code": activation_code,
-                "device_name": device_name,
-            }))
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await?;
-        let response = ensure_success(response).await?;
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| AppError::Protocol(error.to_string()))?;
-        let session = value
-            .get("session")
-            .ok_or_else(|| AppError::Protocol("激活响应缺少会话对".into()))?;
-        let session_field = |name: &str| -> AppResult<String> {
-            session
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| AppError::Protocol(format!("激活响应缺少会话字段 {name}")))
-        };
-        Ok(OnboardingExchange {
-            account_scope_id: value
-                .get("account_scope_id")
-                .and_then(Value::as_str)
-                .filter(|item| item.starts_with("yxacct_"))
-                .ok_or_else(|| AppError::Protocol("激活响应缺少账号作用域标识".into()))?
-                .to_string(),
-            user_name: value
-                .pointer("/user/username")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            access_token: session_field("access_token")?,
-            refresh_token: session_field("refresh_token")?,
-            family_id: session_field("session_id")?,
-        })
-    }
-
-    /// 设备登录本机持久化失败时，用新 Key 自撤销，避免服务器残留孤儿凭证。
-    pub async fn delete_api_key(
-        &self,
-        gateway_url: &str,
-        api_key: &SecretString,
-        api_key_id: i64,
-    ) -> AppResult<()> {
-        let base = validate_gateway_url(gateway_url)?;
-        let response = self
-            .authorized_delete(&format!("{base}/api/user/apikey/{api_key_id}"), api_key)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await?;
-        ensure_success(response).await?;
-        Ok(())
     }
 
     /// P5 BYOK：列出当前用户的自有模型凭据（仅掩码，无明文）。
@@ -1073,56 +937,11 @@ impl YuxiClient {
     }
 }
 
-/// 服务端设备码响应。Wire 格式严格匹配 FastAPI 的 snake_case JSON。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct CliSessionStart {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub verification_uri_complete: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-#[derive(Debug, Clone)]
-pub enum CliTokenPoll {
-    Pending,
-    Approved {
-        secret: String,
-        api_key_id: i64,
-        account_scope_id: String,
-        key_name: String,
-        user_name: String,
-        user_uid: String,
-        /// P2b：服务端签发的可旋转会话对；旧服务端无此字段时为 None（回退 Key 流）。
-        session: Option<ExchangeSession>,
-    },
-}
-
-/// 设备码 exchange 返回的会话对。
-#[derive(Debug, Clone)]
-pub struct ExchangeSession {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub family_id: String,
-}
-
 /// 刷新端点返回的轮换结果。
 #[derive(Debug, Clone)]
 pub struct RotatedSession {
     pub access_token: String,
     pub refresh_token: String,
-}
-
-/// P5 激活码兑换结果：纯会话账号（无静态 Key）。
-#[derive(Debug, Clone)]
-pub struct OnboardingExchange {
-    pub account_scope_id: String,
-    pub user_name: String,
-    pub access_token: String,
-    pub refresh_token: String,
-    pub family_id: String,
 }
 
 /// 账号、密码和 API Key 联合认证后的服务端权威身份。
@@ -1229,62 +1048,6 @@ fn parse_desktop_login_response(value: &Value) -> AppResult<DesktopLoginIdentity
         account_scope_id,
         user_name,
         user_uid,
-    })
-}
-
-fn parse_cli_token_response(value: &Value) -> AppResult<CliTokenPoll> {
-    let secret = value
-        .get("secret")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::Protocol("授权响应缺少 API Key".into()))?
-        .to_string();
-    let api_key_id = value
-        .pointer("/api_key/id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| AppError::Protocol("授权响应缺少 API Key ID".into()))?;
-    let account_scope_id = value
-        .get("account_scope_id")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with("yxacct_") && value.len() >= 24)
-        .ok_or_else(|| AppError::Protocol("授权响应缺少账号作用域标识".into()))?
-        .to_string();
-    let key_name = value
-        .pointer("/api_key/name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let user_name = value
-        .pointer("/user/username")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let user_uid = value
-        .pointer("/user/uid")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::Protocol("授权响应缺少用户 UID".into()))?
-        .to_string();
-    // P2b：会话对为可选字段——旧服务端缺失时桌面端回退过渡 Key 流
-    let session = value.get("session").and_then(|session| {
-        let access_token = session.get("access_token")?.as_str()?.to_string();
-        let refresh_token = session.get("refresh_token")?.as_str()?.to_string();
-        let family_id = session.get("session_id")?.as_str()?.to_string();
-        Some(ExchangeSession {
-            access_token,
-            refresh_token,
-            family_id,
-        })
-    });
-
-    Ok(CliTokenPoll::Approved {
-        secret,
-        api_key_id,
-        account_scope_id,
-        key_name,
-        user_name,
-        user_uid,
-        session,
     })
 }
 
@@ -1644,9 +1407,8 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CliSessionStart, CliTokenPoll, CreateRunRequest, ProgressText, RunRequestMeta,
-        connection_error_for_gateway, final_output, parse_cli_token_response,
-        parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
+        CreateRunRequest, ProgressText, RunRequestMeta, connection_error_for_gateway,
+        final_output, parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
 
@@ -1728,48 +1490,6 @@ mod tests {
             validate_authoritative_run_context(&context, "another-agent", "thread-1", "request-1")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn decodes_server_device_login_contract() {
-        let response: CliSessionStart = serde_json::from_value(json!({
-            "device_code": "device-secret",
-            "user_code": "ABCD-EFGH",
-            "verification_uri": "https://rice.example.com/auth/cli/authorize",
-            "verification_uri_complete": "https://rice.example.com/auth/cli/authorize?user_code=ABCD-EFGH",
-            "expires_in": 600,
-            "interval": 2
-        }))
-        .expect("decode FastAPI snake_case response");
-
-        assert_eq!(response.device_code, "device-secret");
-        assert_eq!(response.user_code, "ABCD-EFGH");
-        assert_eq!(response.expires_in, 600);
-        assert_eq!(response.interval, 2);
-    }
-
-    #[test]
-    fn decodes_device_token_contract_with_opaque_account_scope() {
-        let response = parse_cli_token_response(&json!({
-            "api_key": {"id": 12, "name": "desktop"},
-            "secret": "yxkey_1234567890abcdefghijkl",
-            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef",
-            "user": {"username": "Alice", "uid": "alice"}
-        }))
-        .expect("decode token response");
-
-        let CliTokenPoll::Approved {
-            api_key_id,
-            account_scope_id,
-            user_uid,
-            ..
-        } = response
-        else {
-            panic!("expected approved token response");
-        };
-        assert_eq!(api_key_id, 12);
-        assert_eq!(account_scope_id, "yxacct_0123456789abcdef0123456789abcdef");
-        assert_eq!(user_uid, "alice");
     }
 
     #[test]
