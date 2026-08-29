@@ -24,12 +24,35 @@ export type LocalMessage = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments: LocalMessageAttachment[];
+};
+
+export type LocalMessageAttachment = {
+  id: string;
+  name: string;
+  contentType?: string;
+  fileSize: number;
 };
 
 export type SendMessageRequest = {
   threadId: string;
   question: string;
   requestId: string;
+  attachments: PendingChatAttachment[];
+};
+
+export type PendingChatAttachment = {
+  tmpFileId: string;
+  fileName: string;
+  fileType?: string;
+  fileSize: number;
+  bucketName: string;
+  objectName: string;
+  parseSupported: boolean;
+  parseMethods: string[];
+  parsedObjectName?: string;
+  parseMethod?: string;
+  truncated: boolean;
 };
 
 export type ChatCompletion = {

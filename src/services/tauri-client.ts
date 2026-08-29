@@ -10,6 +10,7 @@ import type {
   ModelConfigurationResult,
   PublicSettings,
   PendingRunSync,
+  PendingChatAttachment,
   RunEvent,
   ServerRunContext,
   SendMessageRequest,
@@ -62,6 +63,17 @@ export const sendMessage = (
   request: SendMessageRequest,
   onEvent: Channel<RunEvent>,
 ) => invoke<ChatCompletion>("send_message", { request, onEvent });
+
+export const uploadChatAttachment = (
+  fileName: string,
+  contentType: string,
+  dataBase64: string,
+) => invoke<PendingChatAttachment>("upload_chat_attachment", { fileName, contentType, dataBase64 });
+
+export const parseChatAttachment = (
+  attachment: PendingChatAttachment,
+  parseMethod: string,
+) => invoke<PendingChatAttachment>("parse_chat_attachment", { attachment, parseMethod });
 
 export const cancelRun = (requestId: string, runId?: string) =>
   invoke<void>("cancel_run", { requestId, runId });

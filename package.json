@@ -2,7 +2,7 @@
   "name": "daoxin-zhixi-desktop",
   "description": "稻芯智析——水稻胚乳科研智能问答桌面客户端",
   "private": true,
-  "version": "0.3.9",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -20,13 +20,18 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "dompurify": "^3.4.14",
+    "katex": "^0.18.4",
     "lucide-react": "^1.28.0",
+    "mermaid": "^11.17.2",
+    "prism-react-renderer": "^2.4.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
     "rehype-raw": "^7.0.0",
     "rehype-sanitize": "^6.0.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

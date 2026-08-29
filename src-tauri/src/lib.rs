@@ -14,10 +14,11 @@ use commands::{
     activate_with_code, cancel_run, create_thread, delete_api_key, delete_thread,
     get_chat_model_preference, get_public_settings, get_thread_run_context,
     import_model_configuration, list_accounts, list_byok_credentials, list_chat_models,
-    list_threads, load_messages, poll_device_login, remove_account, remove_byok_credential,
-    rename_thread, save_byok_credential, save_connection, save_connection_with_login,
-    save_custom_model_credential, send_message, set_chat_model_preference, start_device_login,
-    switch_account, sync_pending_runs, test_connection,
+    list_threads, load_messages, parse_chat_attachment, poll_device_login, remove_account,
+    remove_byok_credential, rename_thread, save_byok_credential, save_connection,
+    save_connection_with_login, save_custom_model_credential, send_message,
+    set_chat_model_preference, start_device_login, switch_account, sync_pending_runs,
+    test_connection, upload_chat_attachment,
 };
 use state::AppState;
 
@@ -61,6 +62,8 @@ pub fn run() {
             rename_thread,
             delete_thread,
             send_message,
+            upload_chat_attachment,
+            parse_chat_attachment,
             cancel_run,
             start_device_login,
             poll_device_login,

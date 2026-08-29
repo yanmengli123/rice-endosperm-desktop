@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import {
   ActionBarPrimitive,
   AssistantRuntimeProvider,
+  AttachmentPrimitive,
   AuiIf,
   ComposerPrimitive,
   MessagePrimitive,
@@ -10,16 +11,18 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, LoaderCircle, Square } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, Copy, FlaskConical, LoaderCircle, Paperclip, Square, X } from "lucide-react";
 import rehypeRaw from "rehype-raw";
+import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
 import type { ChatCompletion, LocalMessage } from "../types";
-import { normalizeMarkdownTables } from "../utils/markdown-tables";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
-import { extractCodeBlock, HtmlPreviewFrame, isHtmlPreviewLanguage } from "../utils/html-preview";
-import type { ReactNode } from "react";
+import { normalizeRichAnswer } from "../utils/rich-answer";
+import { CodeHeader, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
+import { YuxiAttachmentAdapter } from "../runtime/yuxi-attachment-adapter";
 
 type Props = {
   threadId: string;
@@ -39,6 +42,16 @@ function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
       },
     ],
     createdAt: new Date(message.createdAt),
+    attachments: message.role === "user"
+      ? (message.attachments ?? []).map((attachment) => ({
+          id: attachment.id,
+          type: attachment.contentType?.startsWith("image/") ? "image" : "document",
+          name: attachment.name,
+          contentType: attachment.contentType,
+          status: { type: "complete" as const },
+          content: [],
+        }))
+      : undefined,
   }));
 }
 
@@ -46,6 +59,7 @@ function UserMessage() {
   return (
     <MessagePrimitive.Root className="message-row user-message-row">
       <div className="message user-message">
+        <MessagePrimitive.Attachments components={{ Attachment: SentAttachment }} />
         <MessagePrimitive.Parts />
       </div>
     </MessagePrimitive.Root>
@@ -84,26 +98,48 @@ const markdownSanitizeSchema = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
-    "*": [...(defaultSchema.attributes?.["*"] ?? []), "style"],
+    "*": [...(defaultSchema.attributes?.["*"] ?? [])],
+    img: [...(defaultSchema.attributes?.img ?? []), "loading", "width", "height"],
   },
 };
-
-function PreWithPreview({ children }: { children?: ReactNode }) {
-  const block = extractCodeBlock(children);
-  if (block && isHtmlPreviewLanguage(block.language)) {
-    return <HtmlPreviewFrame html={block.code} />;
-  }
-  return <pre>{children}</pre>;
-}
 
 function MarkdownText() {
   return (
     <MarkdownTextPrimitive
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
-      preprocess={normalizeMarkdownTables}
-      components={{ pre: PreWithPreview }}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema], rehypeKatex]}
+      preprocess={normalizeRichAnswer}
+      components={{
+        SyntaxHighlighter: PrismCodeBlock,
+        CodeHeader,
+        a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer noopener">{children}</a>,
+        img: ({ alt, ...props }) => <img {...props} alt={alt || "回答中的图片"} loading="lazy" />,
+      }}
+      componentsByLanguage={{
+        htmlpreview: { SyntaxHighlighter: HtmlPreviewCodeBlock, CodeHeader: () => null },
+        mermaid: { SyntaxHighlighter: MermaidDiagram, CodeHeader: () => null },
+      }}
+      defer
     />
+  );
+}
+
+function SentAttachment() {
+  return (
+    <AttachmentPrimitive.Root className="message-attachment">
+      <Paperclip size={14} />
+      <AttachmentPrimitive.Name />
+    </AttachmentPrimitive.Root>
+  );
+}
+
+function ComposerAttachment() {
+  return (
+    <AttachmentPrimitive.Root className="composer-attachment">
+      <Paperclip size={14} />
+      <AttachmentPrimitive.Name />
+      <AttachmentPrimitive.Remove className="attachment-remove" aria-label="移除附件"><X size={14} /></AttachmentPrimitive.Remove>
+    </AttachmentPrimitive.Root>
   );
 }
 
@@ -153,9 +189,13 @@ function Composer() {
   return (
     <div className="composer-shell">
       <ComposerPrimitive.Root className="composer">
+        <ComposerPrimitive.Attachments components={{ Attachment: ComposerAttachment }} />
+        <ComposerPrimitive.AddAttachment className="attachment-button" aria-label="添加图片或附件" multiple>
+          <Paperclip size={19} />
+        </ComposerPrimitive.AddAttachment>
         <ComposerPrimitive.Input
           className="composer-input"
-          placeholder="询问水稻胚乳发育、基因调控或组学分析问题……"
+          placeholder="询问问题，或添加图片、PDF、表格与科研附件……"
           rows={1}
           aria-label="输入问题"
         />
@@ -176,6 +216,7 @@ function Composer() {
 }
 
 function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
+  const attachmentAdapter = useMemo(() => new YuxiAttachmentAdapter(), []);
   const adapter = useMemo(
     () =>
       createYuxiAdapter(threadId, {
@@ -188,6 +229,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
   );
   const runtime = useLocalRuntime(adapter, {
     initialMessages: toInitialMessages(messages),
+    adapters: { attachments: attachmentAdapter },
   });
 
   return (

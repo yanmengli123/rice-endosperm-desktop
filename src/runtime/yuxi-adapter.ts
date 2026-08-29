@@ -3,6 +3,8 @@ import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
 import { cancelRun, normalizeCommandError, sendMessage } from "../services/tauri-client";
 import type { ChatCompletion, RunEvent } from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
+import { YUXI_ATTACHMENT_PART_NAME } from "./yuxi-attachment-adapter";
+import type { PendingChatAttachment } from "../types";
 
 type AdapterCallbacks = {
   onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
@@ -61,6 +63,28 @@ function latestUserText(messages: readonly ThreadMessage[]): string {
     .trim();
 }
 
+function latestUserAttachments(messages: readonly ThreadMessage[]): PendingChatAttachment[] {
+  const message = [...messages].reverse().find((item) => item.role === "user");
+  if (!message || message.role !== "user") return [];
+  const attachments: PendingChatAttachment[] = [];
+  for (const attachment of message.attachments ?? []) {
+    for (const part of attachment.content) {
+      if (part.type !== "data" || part.name !== YUXI_ATTACHMENT_PART_NAME) continue;
+      const value = part.data as unknown;
+      if (
+        typeof value === "object"
+        && value !== null
+        && "tmpFileId" in value
+        && "objectName" in value
+        && "bucketName" in value
+      ) {
+        attachments.push(value as PendingChatAttachment);
+      }
+    }
+  }
+  return attachments;
+}
+
 function requestId() {
   return `desktop-${crypto.randomUUID()}`;
 }
@@ -72,12 +96,15 @@ export function createYuxiAdapter(
   return {
     async *run({ messages, abortSignal }) {
       const question = latestUserText(messages);
-      if (!question) throw new Error("请输入问题后再发送");
+      const attachments = latestUserAttachments(messages);
+      if (!question && attachments.length === 0) throw new Error("请输入问题或添加附件后再发送");
+      const resolvedQuestion = question || "请分析随附文件。";
 
       const request = {
         threadId: localThreadId,
-        question,
+        question: resolvedQuestion,
         requestId: requestId(),
+        attachments,
       };
       const queue = new AsyncQueue<RunEvent>();
       const channel = new Channel<RunEvent>();
