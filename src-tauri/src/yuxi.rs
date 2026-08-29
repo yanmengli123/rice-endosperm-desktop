@@ -1407,8 +1407,8 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CreateRunRequest, ProgressText, RunRequestMeta, connection_error_for_gateway,
-        final_output, parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
+        CreateRunRequest, ProgressText, RunRequestMeta, connection_error_for_gateway, final_output,
+        parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
 
