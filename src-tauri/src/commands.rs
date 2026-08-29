@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
@@ -14,14 +15,15 @@ use url::Url;
 use crate::{
     config::{agent_slug, validate_gateway_url},
     credentials::{api_key_hint, api_key_scope_id, validate_api_key},
-    database::{LocalMessage, PublicSettings, ThreadSummary},
+    database::{LocalMessage, LocalMessageAttachment, PublicSettings, ThreadSummary},
     diagnostics,
     error::{AppError, AppResult, CommandError},
     session::StoredSession,
     state::AppState,
     yuxi::{
-        CliSessionStart, CliTokenPoll, ModelOption, ProgressText, RunResult, ServerRunContext,
-        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
+        CliSessionStart, CliTokenPoll, ModelOption, PendingChatAttachment, ProgressText, RunResult,
+        ServerRunContext, sanitize_visible_model_text, terminal_status,
+        validate_authoritative_run_context,
     },
 };
 
@@ -34,6 +36,66 @@ pub struct SendMessageRequest {
     pub thread_id: String,
     pub question: String,
     pub request_id: String,
+    #[serde(default)]
+    pub attachments: Vec<PendingChatAttachment>,
+}
+
+#[tauri::command]
+pub async fn upload_chat_attachment(
+    file_name: String,
+    content_type: String,
+    data_base64: String,
+    state: State<'_, AppState>,
+) -> Result<PendingChatAttachment, CommandError> {
+    const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+    let safe_name = Path::new(&file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CommandError::from(AppError::Protocol("附件文件名无效".into())))?;
+    let bytes = BASE64_STANDARD
+        .decode(data_base64)
+        .map_err(|_| CommandError::from(AppError::Protocol("附件内容编码无效".into())))?;
+    if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(CommandError::from(AppError::Protocol(
+            "附件必须为非空文件且不能超过 5 MB".into(),
+        )));
+    }
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .upload_tmp_attachment(&gateway_url, &bearer, safe_name, &content_type, bytes)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn parse_chat_attachment(
+    mut attachment: PendingChatAttachment,
+    parse_method: String,
+    state: State<'_, AppState>,
+) -> Result<PendingChatAttachment, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .parse_tmp_attachment(&gateway_url, &bearer, &mut attachment, parse_method.trim())
+        .await
+        .map_err(CommandError::from)?;
+    Ok(attachment)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -642,13 +704,26 @@ async fn send_message_inner(
 ) -> AppResult<ChatCompletion> {
     state.database.ensure_thread(&request.thread_id).await?;
     let question = request.question.trim();
+    let local_attachments = request
+        .attachments
+        .iter()
+        .map(|attachment| LocalMessageAttachment {
+            id: attachment.tmp_file_id.clone(),
+            name: attachment.file_name.clone(),
+            content_type: attachment.file_type.clone(),
+            file_size: attachment.file_size,
+        })
+        .collect::<Vec<_>>();
+    let local_attachments_json = serde_json::to_string(&local_attachments)
+        .map_err(|error| AppError::Internal(format!("附件元数据无法序列化: {error}")))?;
     state
         .database
-        .append_message(
+        .append_message_with_attachments(
             &format!("user-{}", request.request_id),
             &request.thread_id,
             "user",
             question,
+            &local_attachments_json,
         )
         .await?;
 
@@ -681,6 +756,15 @@ async fn send_message_inner(
             .await?;
         (server_thread.id, server_thread.agent_id)
     };
+    let attachment_file_ids = state
+        .yuxi
+        .confirm_tmp_attachments(
+            &gateway_url,
+            &api_key,
+            &yuxi_thread_id,
+            &request.attachments,
+        )
+        .await?;
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
         result = state.yuxi.create_run(
@@ -691,6 +775,7 @@ async fn send_message_inner(
             &yuxi_thread_id,
             &request.request_id,
             None,
+            &attachment_file_ids,
         ) => result?,
     };
     state.set_request_run_id(&request.request_id, &created.run_id)?;
@@ -1090,6 +1175,17 @@ fn validate_send_request(request: &SendMessageRequest) -> AppResult<()> {
         return Err(AppError::Protocol(
             "问题长度必须为 1 至 20000 个字符".into(),
         ));
+    }
+    if request.attachments.len() > 6 {
+        return Err(AppError::Protocol("每次最多添加 6 个附件".into()));
+    }
+    if request.attachments.iter().any(|attachment| {
+        attachment.tmp_file_id.is_empty()
+            || attachment.file_name.is_empty()
+            || attachment.bucket_name.is_empty()
+            || attachment.object_name.is_empty()
+    }) {
+        return Err(AppError::Protocol("附件元数据不完整，请重新上传".into()));
     }
     if request.request_id.len() < 16
         || request.request_id.len() > 64
@@ -1806,6 +1902,7 @@ mod tests {
             thread_id: "thread-1".into(),
             question: "水稻胚乳何时完成细胞化？".into(),
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
+            attachments: vec![],
         };
         assert!(validate_send_request(&request).is_ok());
     }

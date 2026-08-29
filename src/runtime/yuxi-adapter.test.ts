@@ -203,4 +203,50 @@ describe("createYuxiAdapter", () => {
     expect(finalState.status).toBe("failed");
     expect(finalState.message).toContain("回答内容已保存");
   });
+
+  it("把当前用户消息的 Yuxi 附件元数据传入原生 AgentRun 请求", async () => {
+    mocks.sendMessage.mockResolvedValueOnce({
+      runId: "run-attachment",
+      threadId: "server-thread",
+      requestId: "desktop-attachment",
+      status: "completed",
+      text: "附件分析完成",
+      context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+    });
+    const attachment = {
+      tmpFileId: "tmp-1",
+      fileName: "endosperm.pdf",
+      fileType: "application/pdf",
+      fileSize: 1024,
+      bucketName: "knowledgebases",
+      objectName: "tmp/chat_attachments/u1/tmp-1/original/endosperm.pdf",
+      parseSupported: true,
+      parseMethods: ["disable"],
+      parsedObjectName: "tmp/chat_attachments/u1/tmp-1/parsed/endosperm.md",
+      parseMethod: "disable",
+      truncated: false,
+    };
+    const messages = [{
+      role: "user",
+      content: [{ type: "text", text: "总结这篇文献" }],
+      attachments: [{
+        id: "attachment-1",
+        type: "document",
+        name: "endosperm.pdf",
+        status: { type: "complete" },
+        content: [{ type: "data", name: "yuxi-chat-attachment", data: attachment }],
+      }],
+    }] as unknown as ThreadMessage[];
+    const stream = createYuxiAdapter("local-thread").run({
+      messages,
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ attachments: [attachment], question: "总结这篇文献" }),
+      expect.anything(),
+    );
+  });
 });

@@ -22,7 +22,7 @@ export function extractCodeBlock(children: ReactNode): {
 export const HTML_PREVIEW_LANGUAGE = "html:preview";
 
 export function isHtmlPreviewLanguage(language: string): boolean {
-  return language === HTML_PREVIEW_LANGUAGE;
+  return language === HTML_PREVIEW_LANGUAGE || language === "htmlpreview";
 }
 
 /**
@@ -31,14 +31,17 @@ export function isHtmlPreviewLanguage(language: string): boolean {
  */
 export function HtmlPreviewFrame({ html }: { html: string }) {
   const safeHtml = sanitizeModelHtml(html);
+  const estimatedHeight = Math.min(520, Math.max(120, 76 + html.split("\n").length * 18));
+  const srcDoc = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;padding:0;background:transparent;color:#17231d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.6;overflow:auto}body{padding:8px;box-sizing:border-box}*{box-sizing:border-box}table{width:100%;border-collapse:collapse}th,td{padding:7px 9px;border:1px solid #d8e3dc;text-align:left}img{max-width:100%;height:auto}</style></head><body>${safeHtml}</body></html>`;
   return (
     <div className="html-preview-render">
       <iframe
         className="html-preview-frame"
         sandbox=""
-        srcDoc={safeHtml}
+        srcDoc={srcDoc}
         title="HTML 预览"
         loading="lazy"
+        style={{ height: `${estimatedHeight}px` }}
       />
     </div>
   );

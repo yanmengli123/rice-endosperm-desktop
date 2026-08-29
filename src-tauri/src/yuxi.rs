@@ -17,6 +17,7 @@ const CREATE_THREAD_PATH: &str = "/api/chat/thread";
 const CREATE_RUN_PATH: &str = "/api/agent/runs";
 const LEGACY_RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
 const CREDENTIAL_STATUS_PATH: &str = "/api/agent-invocation/credential-status";
+const TMP_ATTACHMENT_PATH: &str = "/api/chat/attachments/tmp";
 
 #[derive(Clone)]
 pub struct YuxiClient {
@@ -140,6 +141,81 @@ struct CreateRunRequest<'a> {
 struct RunRequestMeta<'a> {
     request_id: &'a str,
     client: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachment_file_ids: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingChatAttachment {
+    pub tmp_file_id: String,
+    pub file_name: String,
+    pub file_type: Option<String>,
+    pub file_size: usize,
+    pub bucket_name: String,
+    pub object_name: String,
+    pub parse_supported: bool,
+    #[serde(default)]
+    pub parse_methods: Vec<String>,
+    pub parsed_object_name: Option<String>,
+    pub parse_method: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmpAttachmentResponse {
+    tmp_file_id: String,
+    file_name: String,
+    file_type: Option<String>,
+    file_size: usize,
+    bucket_name: String,
+    object_name: String,
+    #[serde(default)]
+    parse_supported: bool,
+    #[serde(default)]
+    parse_methods: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmpAttachmentParseResponse {
+    parsed_object_name: String,
+    parse_method: String,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TmpAttachmentParseRequest<'a> {
+    object_name: &'a str,
+    file_name: &'a str,
+    parse_method: &'a str,
+    bucket_name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct TmpAttachmentConfirmRequest<'a> {
+    attachments: Vec<TmpAttachmentConfirmItem<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct TmpAttachmentConfirmItem<'a> {
+    file_name: &'a str,
+    file_type: Option<&'a str>,
+    bucket_name: &'a str,
+    object_name: &'a str,
+    parsed_object_name: Option<&'a str>,
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmpAttachmentConfirmResponse {
+    attachments: Vec<ConfirmedAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmedAttachment {
+    file_id: String,
 }
 
 impl YuxiClient {
@@ -230,6 +306,7 @@ impl YuxiClient {
         yuxi_thread_id: &str,
         request_id: &str,
         model_spec: Option<&str>,
+        attachment_file_ids: &[String],
     ) -> AppResult<CreatedRun> {
         let base = validate_gateway_url(gateway_url)?;
         let mut last_error = None;
@@ -244,6 +321,10 @@ impl YuxiClient {
                     meta: RunRequestMeta {
                         request_id,
                         client: "rice-endosperm-desktop",
+                        attachment_file_ids: attachment_file_ids
+                            .iter()
+                            .map(String::as_str)
+                            .collect(),
                     },
                     model_spec,
                 })
@@ -274,6 +355,131 @@ impl YuxiClient {
             }
         }
         Err(last_error.unwrap_or(AppError::ServiceUnavailable))
+    }
+
+    pub async fn upload_tmp_attachment(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        file_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> AppResult<PendingChatAttachment> {
+        let base = validate_gateway_url(gateway_url)?;
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.to_owned())
+            .mime_str(content_type)
+            .map_err(|error| AppError::Protocol(format!("附件 MIME 类型无效: {error}")))?;
+        let response = self
+            .authorized_post(&format!("{base}{TMP_ATTACHMENT_PATH}"), api_key)
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let uploaded = response
+            .json::<TmpAttachmentResponse>()
+            .await
+            .map_err(|error| AppError::Protocol(format!("附件上传响应无法解析: {error}")))?;
+        Ok(PendingChatAttachment {
+            tmp_file_id: uploaded.tmp_file_id,
+            file_name: uploaded.file_name,
+            file_type: uploaded.file_type,
+            file_size: uploaded.file_size,
+            bucket_name: uploaded.bucket_name,
+            object_name: uploaded.object_name,
+            parse_supported: uploaded.parse_supported,
+            parse_methods: uploaded.parse_methods,
+            parsed_object_name: None,
+            parse_method: None,
+            truncated: false,
+        })
+    }
+
+    pub async fn parse_tmp_attachment(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        attachment: &mut PendingChatAttachment,
+        parse_method: &str,
+    ) -> AppResult<()> {
+        if !attachment
+            .parse_methods
+            .iter()
+            .any(|method| method == parse_method)
+        {
+            return Err(AppError::Protocol(
+                "服务端未声明支持所选附件解析引擎".into(),
+            ));
+        }
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_post(&format!("{base}{TMP_ATTACHMENT_PATH}/parse"), api_key)
+            .json(&TmpAttachmentParseRequest {
+                object_name: &attachment.object_name,
+                file_name: &attachment.file_name,
+                parse_method,
+                bucket_name: &attachment.bucket_name,
+            })
+            .timeout(Duration::from_secs(15 * 60))
+            .send()
+            .await?;
+        let parsed = ensure_success(response)
+            .await?
+            .json::<TmpAttachmentParseResponse>()
+            .await
+            .map_err(|error| AppError::Protocol(format!("附件解析响应无法解析: {error}")))?;
+        attachment.parsed_object_name = Some(parsed.parsed_object_name);
+        attachment.parse_method = Some(parsed.parse_method);
+        attachment.truncated = parsed.truncated;
+        Ok(())
+    }
+
+    pub async fn confirm_tmp_attachments(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        thread_id: &str,
+        attachments: &[PendingChatAttachment],
+    ) -> AppResult<Vec<String>> {
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_post(
+                &format!("{base}/api/chat/thread/{thread_id}/attachments/confirm"),
+                api_key,
+            )
+            .json(&TmpAttachmentConfirmRequest {
+                attachments: attachments
+                    .iter()
+                    .map(|attachment| TmpAttachmentConfirmItem {
+                        file_name: &attachment.file_name,
+                        file_type: attachment.file_type.as_deref(),
+                        bucket_name: &attachment.bucket_name,
+                        object_name: &attachment.object_name,
+                        parsed_object_name: attachment.parsed_object_name.as_deref(),
+                        truncated: attachment.truncated,
+                    })
+                    .collect(),
+            })
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
+        let confirmed = ensure_success(response)
+            .await?
+            .json::<TmpAttachmentConfirmResponse>()
+            .await
+            .map_err(|error| AppError::Protocol(format!("附件绑定响应无法解析: {error}")))?;
+        if confirmed.attachments.len() != attachments.len() {
+            return Err(AppError::Protocol("服务端未完整绑定本次附件".into()));
+        }
+        Ok(confirmed
+            .attachments
+            .into_iter()
+            .map(|item| item.file_id)
+            .collect())
     }
 
     /// 从服务端读取当前用户可访问的权威默认智能体。
@@ -1453,6 +1659,7 @@ mod tests {
             meta: RunRequestMeta {
                 request_id: "desktop-request-123456",
                 client: "rice-endosperm-desktop",
+                attachment_file_ids: vec![],
             },
             model_spec: None,
         })
@@ -1465,6 +1672,27 @@ mod tests {
         assert!(value.get("messages").is_none());
         assert!(value.get("async_mode").is_none());
         assert!(value.get("model_spec").is_none());
+    }
+
+    #[test]
+    fn serializes_confirmed_attachment_ids_inside_run_meta() {
+        let value = serde_json::to_value(CreateRunRequest {
+            query: "总结附件",
+            agent_slug: "default-chatbot",
+            thread_id: "thread-1",
+            meta: RunRequestMeta {
+                request_id: "desktop-request-with-file",
+                client: "rice-endosperm-desktop",
+                attachment_file_ids: vec!["file-1", "file-2"],
+            },
+            model_spec: None,
+        })
+        .expect("serialize attachment run request");
+
+        assert_eq!(
+            value["meta"]["attachment_file_ids"],
+            json!(["file-1", "file-2"])
+        );
     }
 
     #[test]

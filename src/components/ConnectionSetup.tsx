@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, MonitorSmartphone, Server, Ticket } from "lucide-react";
+import { CheckCircle2, Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, MonitorSmartphone, Server, ShieldCheck, Ticket } from "lucide-react";
 import {
   activateWithCode,
   normalizeCommandError,
@@ -27,7 +27,7 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
   const [deviceError, setDeviceError] = useState("");
   const [activationCode, setActivationCode] = useState("");
   const [activating, setActivating] = useState(false);
-  const [activationOpen, setActivationOpen] = useState(false);
+  const [loginMode, setLoginMode] = useState<"credentials" | "device" | "activation">("credentials");
   const pollTimer = useRef<number | undefined>(undefined);
   const pollActive = useRef(false);
 
@@ -131,79 +131,67 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
     <main className="connection-page">
       <div className="connection-decoration decoration-one" />
       <div className="connection-decoration decoration-two" />
-      <section className="connection-card">
-        <div className="connection-brand">
-          <img src="/brand-logo.png" alt="稻芯智析徽标" />
-          <div>
-            <span>稻芯智析</span>
-            <small>水稻胚乳科研智能体</small>
+      <section className="connection-shell">
+        <aside className="connection-rail">
+          <div className="connection-brand">
+            <img src="/brand-logo.png" alt="稻芯智析徽标" />
+            <div><span>稻芯智析</span><small>水稻胚乳科研智能体</small></div>
           </div>
-        </div>
-        <div className="connection-heading">
-          <span className="connection-icon"><Leaf size={22} /></span>
-          <h1>连接科研智能服务</h1>
-          <p>使用管理员发放的登录 ID、初始密码和 API Key 联合登录，或在网页端完成设备码授权。凭证由系统安全存储保护，不会写入网页存储、SQLite 或日志。</p>
-        </div>
-
-        {deviceLogin ? (
-          <div className="device-login-panel" role="dialog" aria-label="设备码授权">
-            <MonitorSmartphone size={26} />
-            <p className="device-login-lead">
-              在打开的网页中确认以下授权码完成登录（账号需已由管理员开通或已自助注册）：
-            </p>
-            <div className="device-login-code">{deviceLogin.userCode}</div>
-            <p className="device-login-url">
-              若浏览器未自动打开，请访问：
-              <br />
-              <span>{deviceLogin.verificationUrl}</span>
-            </p>
-            {deviceError ? (
-              <div className="form-error" role="alert">{deviceError}</div>
-            ) : (
-              <p className="device-login-status">
-                <LoaderCircle className="spin" size={15} /> {deviceStatus}
-              </p>
-            )}
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => {
-                pollActive.current = false;
-                setDeviceLogin(null);
-              }}
-            >
-              取消授权登录
-            </button>
+          <div className="connection-rail-copy">
+            <span className="connection-icon"><Leaf size={22} /></span>
+            <p className="eyebrow">ENTERPRISE RESEARCH AI</p>
+            <h1>连接你的科研工作空间</h1>
+            <p>账号、模型和知识范围均由 Yuxi 服务端统一管理；桌面端仅保存受系统安全存储保护的会话凭证。</p>
           </div>
-        ) : (
-          <>
-            <button type="button" className="device-login-entry" onClick={() => void startLogin()}>
-              <MonitorSmartphone size={17} /> 使用账号登录（设备码授权）
-            </button>
+          <ul className="connection-assurances">
+            <li><ShieldCheck size={17} /><span><strong>凭证隔离</strong>不写入浏览器存储、SQLite 或日志</span></li>
+            <li><CheckCircle2 size={17} /><span><strong>服务端权威</strong>问答、知识范围和模型策略完全一致</span></li>
+            <li><MonitorSmartphone size={17} /><span><strong>多种登录</strong>支持设备授权、激活码和三要素登录</span></li>
+          </ul>
+        </aside>
 
-            <details className="activation-panel" open={activationOpen} onToggle={(event) => setActivationOpen((event.target as HTMLDetailsElement).open)}>
-              <summary><Ticket size={16} /> 使用激活码登录</summary>
-              <form onSubmit={submitActivation} className="activation-form">
-                <label>
-                  <span>激活码</span>
-                  <input
-                    value={activationCode}
-                    onChange={(event) => setActivationCode(event.target.value)}
-                    placeholder="yxact_..."
-                    autoComplete="off"
-                    spellCheck={false}
-                    required
-                  />
-                  <small>管理员开户时发放的一次性激活码；激活后本机绑定该账号并使用安全会话。</small>
-                </label>
-                <button className="primary-button" disabled={activating || !activationCode.trim()}>
-                  {activating ? <LoaderCircle className="spin" size={18} /> : <Ticket size={18} />}
-                  {activating ? "正在激活…" : "激活并登录"}
-                </button>
-              </form>
-            </details>
+        <div className="connection-workspace">
+          <header className="connection-workspace-header">
+            <div><span>安全接入</span><h2>登录稻芯智析</h2></div>
+            <span className="security-pill"><ShieldCheck size={14} />企业安全通道</span>
+          </header>
+          <nav className="connection-mode-nav" aria-label="登录方式">
+            <button type="button" className={loginMode === "credentials" ? "active" : ""} onClick={() => setLoginMode("credentials")}><KeyRound size={16} />账号与 API Key</button>
+            <button type="button" className={loginMode === "device" ? "active" : ""} onClick={() => setLoginMode("device")}><MonitorSmartphone size={16} />设备授权</button>
+            <button type="button" className={loginMode === "activation" ? "active" : ""} onClick={() => setLoginMode("activation")}><Ticket size={16} />激活码</button>
+          </nav>
 
-            <form onSubmit={submit} className="connection-form">
+          <div className="connection-mode-content">
+          {loginMode === "device" && (deviceLogin ? (
+            <div className="device-login-panel" role="dialog" aria-label="设备码授权">
+              <MonitorSmartphone size={28} />
+              <div><h3>请在网页端确认授权</h3><p className="device-login-lead">浏览器已打开授权页面，请核对并输入以下设备码：</p></div>
+              <div className="device-login-code">{deviceLogin.userCode}</div>
+              <p className="device-login-url">备用地址：<span>{deviceLogin.verificationUrl}</span></p>
+              {deviceError ? <div className="form-error" role="alert">{deviceError}</div> : <p className="device-login-status"><LoaderCircle className="spin" size={15} /> {deviceStatus}</p>}
+              <button type="button" className="secondary-button" onClick={() => { pollActive.current = false; setDeviceLogin(null); }}>取消授权登录</button>
+            </div>
+          ) : (
+            <div className="connection-method-intro">
+              <span className="method-icon"><MonitorSmartphone size={26} /></span>
+              <h3>网页设备授权</h3>
+              <p>推荐用于企业账号。桌面端不会接触你的网页登录密码，管理员也可随时在服务端撤销该设备。</p>
+              <button type="button" className="primary-button" onClick={() => void startLogin()}><MonitorSmartphone size={18} />开始设备授权</button>
+            </div>
+          ))}
+
+          {loginMode === "activation" && (
+            <form onSubmit={submitActivation} className="activation-form enterprise-form">
+              <div className="connection-method-intro compact"><span className="method-icon"><Ticket size={24} /></span><div><h3>一次性激活码</h3><p>适合管理员为新用户发放的首次登录，兑换后激活码立即失效。</p></div></div>
+              <label><span>激活码</span><input value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="yxact_..." autoComplete="off" spellCheck={false} required /><small>激活后本机绑定该账号并使用可撤销的安全设备会话。</small></label>
+              {error && <div className="form-error" role="alert">{error}</div>}
+              <button className="primary-button" disabled={activating || !activationCode.trim()}>{activating ? <LoaderCircle className="spin" size={18} /> : <Ticket size={18} />}{activating ? "正在激活…" : "激活并登录"}</button>
+            </form>
+          )}
+
+          {loginMode === "credentials" && (
+            <form onSubmit={submit} className="connection-form enterprise-form">
+              <div className="form-section-heading"><div><h3>管理员发放的登录凭据</h3><p>三项凭据会在服务端进行原子校验，任一不匹配都不会绑定本机。</p></div></div>
               <label>
                 <span>登录名</span>
                 <input
@@ -261,9 +249,10 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
                 {saving ? "正在安全验证…" : "测试并安全保存"}
               </button>
             </form>
-            <p className="privacy-note">测试连接不会启动模型任务，也不会产生大模型调用费用。没有账号？请联系管理员开通，或在网页端开放自助注册后自行注册。</p>
-          </>
-        )}
+          )}
+          </div>
+          <p className="privacy-note">连接测试不会启动模型任务，也不会产生大模型调用费用。没有账号时请联系企业管理员开通。</p>
+        </div>
       </section>
     </main>
   );

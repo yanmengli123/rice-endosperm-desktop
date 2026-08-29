@@ -47,13 +47,32 @@ pub struct ThreadSummary {
     pub preview: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalMessage {
     pub id: String,
     pub role: String,
     pub content: String,
     pub created_at: String,
+    pub attachments: Vec<LocalMessageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalMessageAttachment {
+    pub id: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub file_size: usize,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct LocalMessageRow {
+    id: String,
+    role: String,
+    content: String,
+    created_at: String,
+    attachments_json: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,15 +348,27 @@ impl Database {
 
     pub async fn load_messages(&self, thread_id: &str) -> AppResult<Vec<LocalMessage>> {
         let account_scope = self.current_account_scope().await?;
-        sqlx::query_as::<_, LocalMessage>(
-            "SELECT id, role, content, created_at FROM messages \
+        let rows = sqlx::query_as::<_, LocalMessageRow>(
+            "SELECT id, role, content, created_at, attachments_json FROM messages \
              WHERE thread_id = ? AND account_scope = ? ORDER BY position",
         )
         .bind(thread_id)
         .bind(account_scope)
         .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let attachments = serde_json::from_str(&row.attachments_json)
+                    .map_err(|error| AppError::Database(format!("本地附件元数据损坏: {error}")))?;
+                Ok(LocalMessage {
+                    id: row.id,
+                    role: row.role,
+                    content: row.content,
+                    created_at: row.created_at,
+                    attachments,
+                })
+            })
+            .collect()
     }
 
     pub async fn append_message(
@@ -346,6 +377,18 @@ impl Database {
         thread_id: &str,
         role: &str,
         content: &str,
+    ) -> AppResult<()> {
+        self.append_message_with_attachments(id, thread_id, role, content, "[]")
+            .await
+    }
+
+    pub async fn append_message_with_attachments(
+        &self,
+        id: &str,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        attachments_json: &str,
     ) -> AppResult<()> {
         let account_scope = self.current_account_scope().await?;
         self.ensure_thread_in_scope(thread_id, &account_scope)
@@ -360,9 +403,9 @@ impl Database {
         // 已生成内容抢救落库；send_message 路径会再写一次，append-only 在这
         // 种边缘场景不应让抢救失败。
         sqlx::query(
-            "INSERT INTO messages(id, thread_id, role, content, position, account_scope, created_at) \
-             VALUES(?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ? AND account_scope = ?), 0) + 1, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET content = excluded.content \
+            "INSERT INTO messages(id, thread_id, role, content, attachments_json, position, account_scope, created_at) \
+             VALUES(?, ?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ? AND account_scope = ?), 0) + 1, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET content = excluded.content, attachments_json = excluded.attachments_json \
              WHERE messages.thread_id = excluded.thread_id \
              AND messages.account_scope = excluded.account_scope \
              AND messages.role = excluded.role \
@@ -372,6 +415,7 @@ impl Database {
         .bind(thread_id)
         .bind(role)
         .bind(content)
+        .bind(attachments_json)
         .bind(thread_id)
         .bind(&account_scope)
         .bind(&account_scope)
@@ -865,6 +909,49 @@ mod migration_tests {
     }
 
     #[tokio::test]
+    async fn persists_message_attachments_across_thread_reloads() {
+        let root = std::env::temp_dir().join(format!("daoxin-attachments-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        database
+            .activate_account("https://api.example.cn", "user-a", "yxkey_a", Some("A"))
+            .await
+            .expect("activate");
+        let thread = database.create_thread().await.expect("create thread");
+        let attachments = r#"[{"id":"tmp-1","name":"evidence.pdf","contentType":"application/pdf","fileSize":2048}]"#;
+
+        database
+            .append_message_with_attachments(
+                "user-with-file",
+                &thread.id,
+                "user",
+                "Please analyze the attached evidence.",
+                attachments,
+            )
+            .await
+            .expect("append message with attachment");
+
+        let messages = database
+            .load_messages(&thread.id)
+            .await
+            .expect("reload messages");
+        let message = messages
+            .iter()
+            .find(|message| message.id == "user-with-file")
+            .expect("message present");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].name, "evidence.pdf");
+        assert_eq!(
+            message.attachments[0].content_type.as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(message.attachments[0].file_size, 2048);
+
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
     async fn repairs_the_published_v1_crlf_checksum_without_losing_data() {
         let root = std::env::temp_dir().join(format!("daoxin-migration-test-{}", Uuid::new_v4()));
         let database = Database::open(&root).await.expect("create test database");
@@ -897,6 +984,10 @@ mod migration_tests {
             .execute(&database.pool)
             .await
             .expect("remove v6 column");
+        sqlx::query("ALTER TABLE messages DROP COLUMN attachments_json")
+            .execute(&database.pool)
+            .await
+            .expect("remove v7 column");
         sqlx::query("ALTER TABLE runs DROP COLUMN server_context")
             .execute(&database.pool)
             .await
@@ -924,7 +1015,7 @@ mod migration_tests {
                 .fetch_one(&repaired.pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest_version, 6);
+        assert_eq!(latest_version, 7);
         assert_eq!(
             repaired
                 .setting("migration_test")

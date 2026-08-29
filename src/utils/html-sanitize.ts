@@ -41,7 +41,8 @@ let cachedPurify: PurifyInstance | null = null;
 
 function getPurify(): PurifyInstance | null {
   if (cachedPurify) return cachedPurify;
-  // DOMPurify 需要 DOM；在非 DOM 测试环境下返回 null，由调用方降级处理。
+  if (typeof window === "undefined") return null;
+  // DOMPurify 需要 DOM；在非 DOM 环境中由调用方安全降级为空内容。
   const purify = DOMPurify(window);
   if (!purify || typeof purify.sanitize !== "function" || !purify.isSupported) {
     return null;
@@ -51,11 +52,11 @@ function getPurify(): PurifyInstance | null {
 }
 
 /**
- * 净化模型输出的 HTML。DOM 不可用时（纯 Node 测试环境）原样返回，
- * 由调用方决定降级策略；生产环境（Tauri WebView）始终有 DOM。
+ * 净化模型输出的 HTML。DOM 不可用时 fail-closed，绝不返回未经净化的内容；
+ * 生产环境（Tauri WebView）始终有 DOM。
  */
 export function sanitizeModelHtml(html: string): string {
   const purify = getPurify();
-  if (!purify) return html;
+  if (!purify) return "";
   return purify.sanitize(html, PURIFY_CONFIG) as unknown as string;
 }
