@@ -10,20 +10,16 @@ use tauri::{State, ipc::Channel};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
-use url::Url;
-
 use crate::{
     config::{agent_slug, validate_gateway_url},
     credentials::{api_key_hint, api_key_scope_id, validate_api_key},
     database::{LocalMessage, LocalMessageAttachment, PublicSettings, ThreadSummary},
     diagnostics,
     error::{AppError, AppResult, CommandError},
-    session::StoredSession,
     state::AppState,
     yuxi::{
-        CliSessionStart, CliTokenPoll, ModelOption, PendingChatAttachment, ProgressText, RunResult,
-        ServerRunContext, sanitize_visible_model_text, terminal_status,
-        validate_authoritative_run_context,
+        ModelOption, PendingChatAttachment, ProgressText, RunResult, ServerRunContext,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -1231,292 +1227,6 @@ fn is_reasoning_protocol_failure(message: &str) -> bool {
         && normalized.contains("must be passed back")
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceLoginStart {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_url: String,
-    pub web_origin: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceLoginResult {
-    pub approved: bool,
-    pub user_name: Option<String>,
-    pub user_uid: Option<String>,
-}
-
-fn validate_device_login_urls(start: &CliSessionStart) -> AppResult<String> {
-    let user_code = start.user_code.as_bytes();
-    let valid_user_code = user_code.len() == 9
-        && user_code[4] == b'-'
-        && user_code.iter().enumerate().all(|(index, byte)| {
-            index == 4
-                || ((byte.is_ascii_uppercase() || matches!(byte, b'2'..=b'9'))
-                    && !matches!(byte, b'I' | b'O'))
-        });
-    if !valid_user_code {
-        return Err(AppError::Protocol("服务端返回的 user_code 格式无效".into()));
-    }
-
-    let verification = Url::parse(&start.verification_uri)
-        .map_err(|_| AppError::Protocol("服务端返回的网页授权地址无效".into()))?;
-    let complete = Url::parse(&start.verification_uri_complete)
-        .map_err(|_| AppError::Protocol("服务端返回的完整网页授权地址无效".into()))?;
-
-    for url in [&verification, &complete] {
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-        if url.host_str().is_none()
-            || url.username() != ""
-            || url.password().is_some()
-            || url.fragment().is_some()
-            || (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
-        {
-            return Err(AppError::Protocol(
-                "网页授权地址必须是 HTTPS（本机调试可用 loopback HTTP），且不能包含凭据或片段"
-                    .into(),
-            ));
-        }
-    }
-    if verification.query().is_some()
-        || verification.origin() != complete.origin()
-        || verification.path() != complete.path()
-    {
-        return Err(AppError::Protocol(
-            "服务端返回的网页授权地址不属于同一可信页面".into(),
-        ));
-    }
-    let code_matches = complete
-        .query_pairs()
-        .any(|(key, value)| key == "user_code" && value == start.user_code);
-    if !code_matches {
-        return Err(AppError::Protocol(
-            "完整网页授权地址缺少匹配的 user_code".into(),
-        ));
-    }
-    Ok(verification.origin().ascii_serialization())
-}
-
-#[tauri::command]
-pub async fn start_device_login(
-    gateway_url: String,
-    key_name: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<DeviceLoginStart, CommandError> {
-    // 先确认网关可达且地址合法，再发起设备码会话
-    let _ = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
-    let start: CliSessionStart = state
-        .yuxi
-        .create_cli_session(&gateway_url, key_name.as_deref())
-        .await
-        .map_err(CommandError::from)?;
-    let web_origin = validate_device_login_urls(&start).map_err(CommandError::from)?;
-    Ok(DeviceLoginStart {
-        device_code: start.device_code,
-        user_code: start.user_code,
-        verification_url: start.verification_uri_complete,
-        web_origin,
-        expires_in: start.expires_in,
-        interval: start.interval,
-    })
-}
-
-/// P5 激活结果：纯会话账号（无静态 Key），前端据此提示完成。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActivationOutcome {
-    pub account_scope: String,
-    pub user_name: String,
-}
-
-#[tauri::command]
-pub async fn activate_with_code(
-    gateway_url: String,
-    activation_code: String,
-    device_name: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<ActivationOutcome, CommandError> {
-    let gateway = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
-    let device = {
-        let trimmed = device_name.as_deref().unwrap_or("桌面端").trim();
-        if trimmed.is_empty() {
-            "桌面端"
-        } else {
-            trimmed
-        }
-    };
-
-    let exchange = state
-        .yuxi
-        .exchange_onboarding_activation(&gateway, activation_code.trim(), device)
-        .await?;
-
-    // 仅保存会话对（无静态 Key 可写）；ensure_active_bearer 会话优先，
-    // 纯会话账号在刷新失败时 fail-closed 引导重新激活。
-    let scope = exchange.account_scope_id.clone();
-    let local_scope = local_account_scope(&gateway, &scope);
-    let now = chrono::Utc::now().timestamp();
-    let stored = StoredSession {
-        access_token: exchange.access_token.clone(),
-        refresh_token: exchange.refresh_token.clone(),
-        family_id: exchange.family_id.clone(),
-        access_expires_at: now + 30 * 60,
-    };
-    let blob =
-        serde_json::to_string(&stored).map_err(|error| AppError::Protocol(error.to_string()))?;
-    state
-        .credentials
-        .save_session_blob(&local_scope, &blob)
-        .map_err(CommandError::from)?;
-
-    state
-        .database
-        .activate_account(&gateway, &scope, "设备会话", Some(device))
-        .await
-        .map_err(CommandError::from)?;
-    if let Err(error) = state
-        .database
-        .upsert_account(&local_scope, &exchange.user_name, &gateway)
-        .await
-    {
-        diagnostics::log(
-            "WARN",
-            "activation_account_upsert_failed",
-            &error.to_string(),
-        );
-    }
-
-    Ok(ActivationOutcome {
-        account_scope: local_scope,
-        user_name: exchange.user_name,
-    })
-}
-
-#[tauri::command]
-pub async fn poll_device_login(
-    gateway_url: String,
-    device_code: String,
-    state: State<'_, AppState>,
-) -> Result<DeviceLoginResult, CommandError> {
-    match state
-        .yuxi
-        .poll_cli_token(&gateway_url, &device_code)
-        .await
-        .map_err(CommandError::from)?
-    {
-        CliTokenPoll::Pending => Ok(DeviceLoginResult {
-            approved: false,
-            user_name: None,
-            user_uid: None,
-        }),
-        CliTokenPoll::Approved {
-            mut secret,
-            api_key_id,
-            account_scope_id,
-            key_name,
-            user_name,
-            user_uid,
-            session: session_pair,
-        } => {
-            let gateway_url = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
-            let local_scope = local_account_scope(&gateway_url, &account_scope_id);
-            let hint = api_key_hint(&secret);
-            let secure_secret = SecretString::from(secret.clone());
-            secret.zeroize();
-            let key_display = if key_name.is_empty() {
-                "桌面端".to_string()
-            } else {
-                key_name
-            };
-            if let Err(error) = persist_local_connection(
-                &state,
-                &gateway_url,
-                &account_scope_id,
-                &hint,
-                Some(&key_display),
-                &secure_secret,
-            )
-            .await
-            {
-                // 本机持久化失败时，撤销刚由设备流创建的专用 Key，避免服务端遗留孤儿凭证。
-                if let Err(revoke_error) = state
-                    .yuxi
-                    .delete_api_key(&gateway_url, &secure_secret, api_key_id)
-                    .await
-                {
-                    diagnostics::log(
-                        "ERROR",
-                        "device_key_compensation_failed",
-                        &revoke_error.to_string(),
-                    );
-                }
-                return Err(CommandError::from(error));
-            }
-
-            // P2b：同时落一份作用域凭据，供"切换账号"回到此账号时使用
-            if let Err(error) = state
-                .credentials
-                .save_api_key_for_scope(&local_scope, secure_secret.expose_secret())
-            {
-                diagnostics::log("WARN", "scoped_key_save_failed", &error.to_string());
-            }
-
-            // P2b：登记账号目录 + 持久化可旋转会话对（服务端未签发时跳过）
-            if let Err(error) = state
-                .database
-                .upsert_account(
-                    &local_scope,
-                    if user_name.is_empty() {
-                        &user_uid
-                    } else {
-                        &user_name
-                    },
-                    &gateway_url,
-                )
-                .await
-            {
-                diagnostics::log("WARN", "account_upsert_failed", &error.to_string());
-            }
-            if let Some(pair) = session_pair {
-                let expires_at = crate::session::parse_jwt_exp(&pair.access_token)
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp() + 30 * 60);
-                let stored = crate::session::StoredSession {
-                    access_token: pair.access_token,
-                    refresh_token: pair.refresh_token,
-                    family_id: pair.family_id,
-                    access_expires_at: expires_at,
-                };
-                match serde_json::to_string(&stored) {
-                    Ok(json) => {
-                        if let Err(error) = state.credentials.save_session_blob(&local_scope, &json)
-                        {
-                            diagnostics::log("WARN", "session_store_failed", &error.to_string());
-                        }
-                    }
-                    Err(error) => {
-                        diagnostics::log("WARN", "session_serialize_failed", &error.to_string());
-                    }
-                }
-            }
-
-            Ok(DeviceLoginResult {
-                approved: true,
-                user_name: Some(user_name),
-                user_uid: Some(user_uid),
-            })
-        }
-    }
-}
-
 #[tauri::command]
 pub async fn list_accounts(
     state: State<'_, AppState>,
@@ -1837,10 +1547,8 @@ pub async fn set_chat_model_preference(
 mod tests {
     use super::{
         RunEvent, SendMessageRequest, is_reasoning_protocol_failure, local_account_scope,
-        remote_principal_for_scope, run_progress_message, validate_device_login_urls,
-        validate_send_request,
+        remote_principal_for_scope, run_progress_message, validate_send_request,
     };
-    use crate::yuxi::CliSessionStart;
 
     #[test]
     fn run_events_serialize_fields_as_camel_case() {
@@ -1930,49 +1638,5 @@ mod tests {
         assert!(!is_reasoning_protocol_failure(
             "reasoning_content is an API field described in this answer"
         ));
-    }
-
-    #[test]
-    fn rejects_cross_origin_or_insecure_device_authorization_urls() {
-        let valid = CliSessionStart {
-            device_code: "secret".into(),
-            user_code: "ABCD-EFGH".into(),
-            verification_uri: "https://rice.example.cn/auth/cli/authorize".into(),
-            verification_uri_complete:
-                "https://rice.example.cn/auth/cli/authorize?user_code=ABCD-EFGH".into(),
-            expires_in: 600,
-            interval: 2,
-        };
-        assert_eq!(
-            validate_device_login_urls(&valid).unwrap(),
-            "https://rice.example.cn"
-        );
-
-        let mut cross_origin = valid.clone();
-        cross_origin.verification_uri_complete =
-            "https://phishing.example/auth/cli/authorize?user_code=ABCD-EFGH".into();
-        assert!(validate_device_login_urls(&cross_origin).is_err());
-
-        let mut insecure = valid;
-        insecure.verification_uri = "http://rice.example.cn/auth/cli/authorize".into();
-        insecure.verification_uri_complete =
-            "http://rice.example.cn/auth/cli/authorize?user_code=ABCD-EFGH".into();
-        assert!(validate_device_login_urls(&insecure).is_err());
-
-        let mut malformed_code = CliSessionStart {
-            device_code: "secret".into(),
-            user_code: "../../BAD".into(),
-            verification_uri: "https://rice.example.cn/auth/cli/authorize".into(),
-            verification_uri_complete:
-                "https://rice.example.cn/auth/cli/authorize?user_code=../../BAD".into(),
-            expires_in: 600,
-            interval: 2,
-        };
-        assert!(validate_device_login_urls(&malformed_code).is_err());
-
-        malformed_code.user_code = "ABCI-EFGH".into();
-        malformed_code.verification_uri_complete =
-            "https://rice.example.cn/auth/cli/authorize?user_code=ABCI-EFGH".into();
-        assert!(validate_device_login_urls(&malformed_code).is_err());
     }
 }
