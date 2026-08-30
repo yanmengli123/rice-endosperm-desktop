@@ -15,6 +15,7 @@ use crate::{
 const KEYRING_SERVICE: &str = "cn.rice-endosperm.daoxin";
 const KEYRING_ACCOUNT: &str = "stronghold-unlock-key";
 const API_KEY_RECORD: &[u8] = b"yuxi-api-key";
+const WORKFLOW_MODEL_KEY_RECORD: &[u8] = b"workflow-model-api-key:v1";
 
 pub struct CredentialStore {
     vault: Mutex<Stronghold>,
@@ -138,6 +139,85 @@ impl CredentialStore {
         }
         if let Some(secret) = previous.as_mut() {
             secret.zeroize();
+        }
+        Ok(())
+    }
+
+    pub fn save_workflow_model_api_key(&self, api_key: &str) -> AppResult<()> {
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() || trimmed.len() > 4096 || trimmed.chars().any(char::is_control) {
+            return Err(AppError::CredentialStore(
+                "工作流模型 API Key 格式无效".into(),
+            ));
+        }
+        let vault = self.lock()?;
+        let mut previous = vault
+            .store()
+            .get(WORKFLOW_MODEL_KEY_RECORD)
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+        vault
+            .store()
+            .insert(
+                WORKFLOW_MODEL_KEY_RECORD.to_vec(),
+                trimmed.as_bytes().to_vec(),
+                None,
+            )
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+        if let Err(save_error) = vault.save() {
+            let rollback = match previous.take() {
+                Some(secret) => {
+                    vault
+                        .store()
+                        .insert(WORKFLOW_MODEL_KEY_RECORD.to_vec(), secret, None)
+                }
+                None => vault.store().delete(WORKFLOW_MODEL_KEY_RECORD),
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(AppError::CredentialStore(format!(
+                    "工作流凭证落盘失败且回滚失败: {save_error}; {rollback_error}"
+                )));
+            }
+            return Err(AppError::CredentialStore(save_error.to_string()));
+        }
+        if let Some(secret) = previous.as_mut() {
+            secret.zeroize();
+        }
+        Ok(())
+    }
+
+    pub fn workflow_model_api_key(&self) -> AppResult<Option<SecretString>> {
+        let vault = self.lock()?;
+        match vault
+            .store()
+            .get(WORKFLOW_MODEL_KEY_RECORD)
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?
+        {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(secret) => Ok(Some(SecretString::from(secret))),
+                Err(error) => {
+                    let mut raw = error.into_bytes();
+                    raw.zeroize();
+                    Err(AppError::CredentialStore("工作流模型凭证内容损坏".into()))
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_workflow_model_api_key(&self) -> AppResult<()> {
+        let vault = self.lock()?;
+        if vault
+            .store()
+            .contains_key(WORKFLOW_MODEL_KEY_RECORD)
+            .map_err(|error| AppError::CredentialStore(error.to_string()))?
+        {
+            vault
+                .store()
+                .delete(WORKFLOW_MODEL_KEY_RECORD)
+                .map_err(|error| AppError::CredentialStore(error.to_string()))?;
+            vault
+                .save()
+                .map_err(|error| AppError::CredentialStore(error.to_string()))?;
         }
         Ok(())
     }

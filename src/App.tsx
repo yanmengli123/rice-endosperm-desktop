@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CircleAlert, LoaderCircle, PanelLeft, Wifi, WifiOff } from "lucide-react";
+import { CircleAlert, Cpu, LoaderCircle, PanelLeft, Wifi, WifiOff } from "lucide-react";
 import { ChatWorkspace } from "./components/ChatWorkspace";
 import { ConnectionSetup } from "./components/ConnectionSetup";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -17,6 +17,7 @@ import {
   syncPendingRuns,
 } from "./services/tauri-client";
 import type { ChatCompletion, LocalMessage, PublicSettings, ServerRunContext, ThreadSummary } from "./types";
+import { WorkflowWorkspace } from "./workflow/WorkflowWorkspace";
 import "./styles.css";
 
 const FALLBACK_GATEWAY = "http://127.0.0.1:9088";
@@ -33,6 +34,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [runState, setRunState] = useState<{ status: string; message?: string }>({ status: "idle" });
+  const [productMode, setProductMode] = useState<"qa" | "workflow">("qa");
   const initialized = useRef(false);
   const threadLoadSequence = useRef(0);
   const activeThreadRef = useRef<string | undefined>(undefined);
@@ -202,10 +204,20 @@ export default function App() {
     return <main className="boot-screen"><img src="/brand-logo.png" alt="" /><LoaderCircle className="spin" /><p>正在启动稻芯智析…</p></main>;
   }
 
+  if (productMode === "workflow") {
+    return (
+      <WorkflowWorkspace
+        qaAvailable={Boolean(settings?.hasApiKey)}
+        onOpenQa={() => setProductMode("qa")}
+      />
+    );
+  }
+
   if (!settings?.hasApiKey) {
     return (
       <ConnectionSetup
         defaultGatewayUrl={settings?.gatewayUrl || FALLBACK_GATEWAY}
+        onOpenWorkflow={() => setProductMode("workflow")}
         onConnected={(connected) => {
           setSettings(connected);
           setLoading(true);
@@ -236,6 +248,9 @@ export default function App() {
             <button className="icon-button" onClick={() => setSidebarOpen((value) => !value)} aria-label="展开或收起侧栏"><PanelLeft size={20} /></button>
             <div><strong>{threads.find((thread) => thread.id === activeThreadId)?.title || "新对话"}</strong><span>稻芯智析 · 水稻胚乳科研智能体</span></div>
           </div>
+          <button className="topbar-workflow-button" onClick={() => setProductMode("workflow")}>
+            <Cpu size={16} />科研工作流
+          </button>
           <div className={`connection-badge ${runState.status === "failed" ? "error" : ""}`}>
             {runState.status === "failed" ? <WifiOff size={15} /> : <Wifi size={15} />}
             {runState.message || (runState.status === "running" ? "思考中…" : "服务已连接")}

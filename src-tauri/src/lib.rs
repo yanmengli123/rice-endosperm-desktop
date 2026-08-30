@@ -6,6 +6,7 @@ mod diagnostics;
 mod error;
 mod session;
 mod state;
+mod workflow;
 mod yuxi;
 
 use tauri::Manager;
@@ -20,6 +21,13 @@ use commands::{
     upload_chat_attachment,
 };
 use state::AppState;
+use workflow::{
+    cancel_workflow_agent, cancel_workflow_run, create_workflow_project,
+    delete_workflow_model_settings, delete_workflow_project, get_workflow_engine_status,
+    get_workflow_model_settings, list_workflow_artifacts, list_workflow_projects,
+    list_workflow_runs, open_workflow_artifact, pick_workflow_directory, respond_workflow_approval,
+    run_counts_pca_workflow, run_workflow_agent, save_workflow_model_settings,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,6 +41,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -75,6 +84,22 @@ pub fn run() {
             list_accounts,
             switch_account,
             remove_account,
+            pick_workflow_directory,
+            create_workflow_project,
+            list_workflow_projects,
+            delete_workflow_project,
+            list_workflow_runs,
+            list_workflow_artifacts,
+            get_workflow_engine_status,
+            run_counts_pca_workflow,
+            cancel_workflow_run,
+            open_workflow_artifact,
+            get_workflow_model_settings,
+            save_workflow_model_settings,
+            delete_workflow_model_settings,
+            run_workflow_agent,
+            respond_workflow_approval,
+            cancel_workflow_agent,
         ])
         .run(tauri::generate_context!());
 

@@ -12,6 +12,14 @@ import type {
   ServerRunContext,
   SendMessageRequest,
   ThreadSummary,
+  WorkflowArtifact,
+  WorkflowEngineStatus,
+  WorkflowAgentCompletion,
+  WorkflowAgentEvent,
+  WorkflowModelSettings,
+  WorkflowEvent,
+  WorkflowProject,
+  WorkflowRun,
 } from "../types";
 
 export const getPublicSettings = () =>
@@ -121,6 +129,81 @@ export const switchAccount = (accountScope: string) =>
 
 export const removeAccount = (accountScope: string) =>
   invoke<void>("remove_account", { accountScope });
+
+export const pickWorkflowDirectory = () =>
+  invoke<string | null>("pick_workflow_directory");
+
+export const createWorkflowProject = (root: string, name?: string) =>
+  invoke<WorkflowProject>("create_workflow_project", { root, name });
+
+export const listWorkflowProjects = () =>
+  invoke<WorkflowProject[]>("list_workflow_projects");
+
+export const deleteWorkflowProject = (projectId: string) =>
+  invoke<void>("delete_workflow_project", { projectId });
+
+export const listWorkflowRuns = (projectId: string) =>
+  invoke<WorkflowRun[]>("list_workflow_runs", { projectId });
+
+export const listWorkflowArtifacts = (projectId: string) =>
+  invoke<WorkflowArtifact[]>("list_workflow_artifacts", { projectId });
+
+export const getWorkflowEngineStatus = () =>
+  invoke<WorkflowEngineStatus>("get_workflow_engine_status");
+
+export const runCountsPcaWorkflow = (
+  projectId: string,
+  inputRelativePath: string,
+  onEvent: Channel<WorkflowEvent>,
+) => invoke<WorkflowRun>("run_counts_pca_workflow", {
+  request: { projectId, inputRelativePath },
+  onEvent,
+});
+
+export const cancelWorkflowRun = (runId: string) =>
+  invoke<boolean>("cancel_workflow_run", { runId });
+
+export const openWorkflowArtifact = (artifactId: string) =>
+  invoke<void>("open_workflow_artifact", { artifactId });
+
+export const getWorkflowModelSettings = () =>
+  invoke<WorkflowModelSettings | null>("get_workflow_model_settings");
+
+export const saveWorkflowModelSettings = (
+  provider: WorkflowModelSettings["provider"],
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+) => invoke<WorkflowModelSettings>("save_workflow_model_settings", {
+  settings: { provider, baseUrl, model, apiKey },
+});
+
+export const deleteWorkflowModelSettings = () =>
+  invoke<void>("delete_workflow_model_settings");
+
+export const runWorkflowAgent = (
+  projectId: string,
+  prompt: string,
+  onEvent: Channel<WorkflowAgentEvent>,
+) => invoke<WorkflowAgentCompletion>("run_workflow_agent", {
+  request: { projectId, prompt },
+  onEvent,
+});
+
+export const respondWorkflowApproval = (
+  projectId: string,
+  approvalId: string,
+  approved: boolean,
+  feedback?: string,
+) => invoke<void>("respond_workflow_approval", {
+  projectId,
+  approvalId,
+  approved,
+  feedback,
+});
+
+export const cancelWorkflowAgent = (projectId: string) =>
+  invoke<boolean>("cancel_workflow_agent", { projectId });
 
 export function normalizeCommandError(
   error: unknown,
