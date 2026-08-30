@@ -6,6 +6,7 @@ use crate::{
     credentials::CredentialStore,
     database::Database,
     error::{AppError, AppResult},
+    workflow::WorkflowState,
     yuxi::YuxiClient,
 };
 
@@ -13,6 +14,7 @@ pub struct AppState {
     pub database: Database,
     pub credentials: CredentialStore,
     pub yuxi: YuxiClient,
+    pub workflow: WorkflowState,
     active_requests: Mutex<HashMap<String, ActiveRequest>>,
 }
 
@@ -27,6 +29,7 @@ impl AppState {
             database: Database::open(app_data_dir).await?,
             credentials: CredentialStore::open(app_data_dir)?,
             yuxi: YuxiClient::new(app_version)?,
+            workflow: WorkflowState::open(app_data_dir).await?,
             active_requests: Mutex::new(HashMap::new()),
         })
     }

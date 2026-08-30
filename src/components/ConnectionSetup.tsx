@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckCircle2, Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, Server, ShieldCheck } from "lucide-react";
+import { CheckCircle2, Cpu, Eye, EyeOff, KeyRound, Leaf, LoaderCircle, LockKeyhole, Server, ShieldCheck } from "lucide-react";
 import {
   normalizeCommandError,
   saveConnectionWithLogin,
@@ -9,9 +9,10 @@ import type { PublicSettings } from "../types";
 type Props = {
   defaultGatewayUrl: string;
   onConnected: (settings: PublicSettings) => void;
+  onOpenWorkflow?: () => void;
 };
 
-export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
+export function ConnectionSetup({ defaultGatewayUrl, onConnected, onOpenWorkflow }: Props) {
   const [apiKey, setApiKey] = useState("");
   const [loginName, setLoginName] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -67,6 +68,11 @@ export function ConnectionSetup({ defaultGatewayUrl, onConnected }: Props) {
             <li><CheckCircle2 size={17} /><span><strong>服务端权威</strong>问答、知识范围和模型策略完全一致</span></li>
             <li><KeyRound size={17} /><span><strong>统一登录</strong>账号与 API Key 经服务端原子校验</span></li>
           </ul>
+          {onOpenWorkflow && (
+            <button className="connection-local-workflow" onClick={onOpenWorkflow}>
+              <Cpu size={17} /><span><strong>无需登录</strong>进入本地科研工作流</span>
+            </button>
+          )}
         </aside>
 
         <div className="connection-workspace">
