@@ -208,7 +208,7 @@ pub fn execute_counts_pca(
     let mut feature_count = 0_usize;
     let mut variable_feature_count = 0_usize;
     for record in reader.records() {
-        if feature_count % 512 == 0 && cancellation.is_cancelled() {
+        if feature_count.is_multiple_of(512) && cancellation.is_cancelled() {
             return Err(AppError::Cancelled);
         }
         let record =
