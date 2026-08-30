@@ -2,7 +2,7 @@
   "name": "daoxin-zhixi-desktop",
   "description": "稻芯智析——水稻胚乳科研智能问答桌面客户端",
   "private": true,
-  "version": "0.4.2",
+  "version": "0.4.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
