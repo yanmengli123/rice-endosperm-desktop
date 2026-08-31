@@ -1,6 +1,6 @@
 # 更新日志
 
-## 未发布
+## 0.4.4（2026-08-31）
 
 - 新增双引擎科研工作台：Yuxi 继续负责远程知识问答，WISP headless Sidecar 通过版本化 JSONL stdio RPC 负责本地科研计算；进程、SQLite、凭据、取消与事件通道完全隔离。
 - 新增确定性 `counts.csv → PCA.csv + PCA.svg + report.md` 工作流，输入仅允许来自项目 `input/`，输出登记限制在 `results/`/`reports/`，每个文件和运行清单均记录 SHA-256。
