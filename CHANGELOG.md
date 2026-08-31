@@ -6,7 +6,7 @@
 - 新增确定性 `counts.csv → PCA.csv + PCA.svg + report.md` 工作流，输入仅允许来自项目 `input/`，输出登记限制在 `results/`/`reports/`，每个文件和运行清单均记录 SHA-256。
 - WISP 回合现在作为正式工作流 Run 持久化，保存提示、最终回答、模型、token、终态和失败原因；切换项目或重启后可恢复历史，异常退出的运行明确标记为 `interrupted`。
 - Artifact Bridge 由说明占位升级为显式传输：发送前重新校验登记文件的大小与 SHA-256，经当前 Yuxi 账号上传，且只随用户下一条问题进入问答；跨域动作写入独立审计表。
-- GitHub Release 固定构建 `rice-endosperm-workflow` 提交 `5a3689aac24b4c7ed30670d8baad8f00b7cd468d`，安装包携带 Worker SHA-256 构建清单、AGPL-3.0 许可证与源码定位；运行前完整性校验失败即拒绝启动。
+- GitHub Release 固定构建 `rice-endosperm-workflow` 提交 `0b06c20bac6eae60b65078a85d4be1eb480537cd`，安装包携带当次 Worker SHA-256 构建清单、AGPL-3.0 许可证与源码定位；运行前完整性校验失败即拒绝启动。
 
 ## 0.4.3（2026-08-30）
 

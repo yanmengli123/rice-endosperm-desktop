@@ -13,6 +13,8 @@ $engineResourceRoot = Join-Path $resourceRoot "workflow-engine"
 $tempParent = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
 New-Item -ItemType Directory -Force -Path $noticeRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $engineResourceRoot | Out-Null
+$temporaryCheckout = $null
+try {
 $checkout = if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
   $temporaryCheckout = Join-Path $tempParent ("rice-workflow-worker-" + [guid]::NewGuid().ToString("N"))
   New-Item -ItemType Directory -Path $temporaryCheckout | Out-Null
@@ -102,3 +104,8 @@ $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $noticeRoot "wo
 Write-Host "Prepared workflow worker $resolvedCommit"
 Write-Host "sha256: $hash"
 Write-Host "resources sha256: $resourceHash"
+} finally {
+  if ($temporaryCheckout -and (Test-Path -LiteralPath $temporaryCheckout)) {
+    Remove-Item -LiteralPath $temporaryCheckout -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
