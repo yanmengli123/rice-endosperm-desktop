@@ -249,4 +249,42 @@ describe("createYuxiAdapter", () => {
       expect.anything(),
     );
   });
+
+  it("仅在问答成功后消费用户显式桥接的工作流产物", async () => {
+    const bridgeAttachment = {
+      tmpFileId: "tmp-workflow-1",
+      fileName: "PCA.csv",
+      fileType: "text/csv",
+      fileSize: 2048,
+      bucketName: "knowledgebases",
+      objectName: "tmp/chat_attachments/u1/tmp-workflow-1/original/PCA.csv",
+      parseSupported: false,
+      parseMethods: [],
+      truncated: false,
+    };
+    mocks.sendMessage.mockResolvedValueOnce({
+      runId: "run-workflow-bridge",
+      threadId: "server-thread",
+      requestId: "desktop-workflow-bridge",
+      status: "completed",
+      text: "PCA 结果分析完成",
+      context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+    });
+    const onBridgeConsumed = vi.fn();
+    const stream = createYuxiAdapter("local-thread", {
+      bridgeAttachment,
+      onBridgeConsumed,
+    }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "解释这个 PCA 结果" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ attachments: [bridgeAttachment] }),
+      expect.anything(),
+    );
+    expect(onBridgeConsumed).toHaveBeenCalledOnce();
+  });
 });

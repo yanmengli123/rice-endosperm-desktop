@@ -9,6 +9,8 @@ import type { PendingChatAttachment } from "../types";
 type AdapterCallbacks = {
   onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
   onCompleted?: (completion: ChatCompletion) => void;
+  bridgeAttachment?: PendingChatAttachment;
+  onBridgeConsumed?: () => void;
 };
 
 class AsyncQueue<T> {
@@ -97,6 +99,12 @@ export function createYuxiAdapter(
     async *run({ messages, abortSignal }) {
       const question = latestUserText(messages);
       const attachments = latestUserAttachments(messages);
+      if (
+        callbacks.bridgeAttachment
+        && !attachments.some((item) => item.tmpFileId === callbacks.bridgeAttachment?.tmpFileId)
+      ) {
+        attachments.push(callbacks.bridgeAttachment);
+      }
       if (!question && attachments.length === 0) throw new Error("请输入问题或添加附件后再发送");
       const resolvedQuestion = question || "请分析随附文件。";
 
@@ -157,6 +165,7 @@ export function createYuxiAdapter(
         }
         callbacks.onRunState?.({ runId: activeRunId, status: "completed" });
         callbacks.onCompleted?.(completion);
+        if (callbacks.bridgeAttachment) callbacks.onBridgeConsumed?.();
       } catch (error) {
         if (abortSignal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           callbacks.onRunState?.({ runId: activeRunId, status: "cancelled" });

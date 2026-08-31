@@ -349,7 +349,7 @@ async fn refresh_server_agent_slug(
 /// P5 fail-closed：会话型账号（存在会话 blob）在旋转失败时**禁止回退静态 API Key**——
 /// 管理员撤销设备后静态 Key 不能成为旁路。返回 SessionRequiresRelogin 让前端引导
 /// 重新登录；仅"无任何会话记录"的传统手动 Key 账号继续走 api_key() 路径。
-async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
+pub(crate) async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
     use crate::session::{StoredSession, parse_jwt_exp};
 
     let gateway = state.database.gateway_url().await?;

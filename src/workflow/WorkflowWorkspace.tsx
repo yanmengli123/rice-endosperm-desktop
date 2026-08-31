@@ -17,6 +17,7 @@ import {
   MessageSquareText,
   Play,
   ShieldCheck,
+  Send,
   Square,
   Trash2,
 } from "lucide-react";
@@ -46,6 +47,7 @@ import { WorkflowAgentPanel } from "./WorkflowAgentPanel";
 type Props = {
   onOpenQa: () => void;
   qaAvailable: boolean;
+  onBridgeArtifact: (artifact: WorkflowArtifact) => Promise<void>;
 };
 
 function formatBytes(value: number) {
@@ -65,7 +67,7 @@ function statusLabel(status: WorkflowRun["status"]) {
   }[status];
 }
 
-export function WorkflowWorkspace({ onOpenQa, qaAvailable }: Props) {
+export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: Props) {
   const [projects, setProjects] = useState<WorkflowProject[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string>();
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
@@ -77,6 +79,7 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable }: Props) {
   const [progress, setProgress] = useState({ percent: 0, message: "" });
   const [error, setError] = useState("");
   const [workspaceTool, setWorkspaceTool] = useState<"agent" | "pca">("agent");
+  const [bridgingArtifactId, setBridgingArtifactId] = useState<string>();
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
     [activeProjectId, projects],
@@ -173,6 +176,18 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable }: Props) {
     if (activeRunId) await cancelWorkflowRun(activeRunId);
   }
 
+  async function bridgeArtifact(artifact: WorkflowArtifact) {
+    setError("");
+    setBridgingArtifactId(artifact.id);
+    try {
+      await onBridgeArtifact(artifact);
+    } catch (reason) {
+      setError(normalizeCommandError(reason).message);
+    } finally {
+      setBridgingArtifactId(undefined);
+    }
+  }
+
   return (
     <div className="workflow-shell">
       <aside className="workflow-sidebar">
@@ -228,6 +243,7 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable }: Props) {
               </div>
               {workspaceTool === "agent" ? (
                 <WorkflowAgentPanel
+                  key={activeProject.id}
                   project={activeProject}
                   engine={engine}
                   onFilesChanged={() => void refreshProjectData(activeProject.id)}
@@ -285,19 +301,30 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable }: Props) {
                 <div className="workflow-record-list">
                   {artifacts.length === 0 && <p className="workflow-placeholder">运行完成后在这里显示结果</p>}
                   {artifacts.map((artifact) => (
-                    <button className="workflow-artifact" key={artifact.id} onClick={() => void openWorkflowArtifact(artifact.id)}>
-                      {artifact.mediaType.startsWith("image/") ? <BarChart3 size={18} /> : <FileText size={18} />}
-                      <span><strong>{artifact.name}</strong><small>{formatBytes(artifact.sizeBytes)} · {artifact.sha256.slice(0, 12)}…</small></span>
-                      <ChevronRight size={15} />
-                    </button>
+                    <div className="workflow-artifact-row" key={artifact.id}>
+                      <button className="workflow-artifact" onClick={() => void openWorkflowArtifact(artifact.id)}>
+                        {artifact.mediaType.startsWith("image/") ? <BarChart3 size={18} /> : <FileText size={18} />}
+                        <span><strong>{artifact.name}</strong><small>{formatBytes(artifact.sizeBytes)} · {artifact.sha256.slice(0, 12)}…</small></span>
+                        <ChevronRight size={15} />
+                      </button>
+                      <button
+                        className="workflow-artifact-send"
+                        disabled={!qaAvailable || Boolean(bridgingArtifactId)}
+                        onClick={() => void bridgeArtifact(artifact)}
+                        title="发送到科研问答"
+                        aria-label={`发送 ${artifact.name} 到科研问答`}
+                      >
+                        {bridgingArtifactId === artifact.id ? <LoaderCircle className="spin" size={14} /> : <Send size={14} />}
+                      </button>
+                    </div>
                   ))}
                 </div>
               </section>
               <section className="workflow-bridge-card">
                 <header><div><Bot size={16} /><strong>Artifact Bridge</strong></div></header>
                 <p>成果只有在你明确选择后才会发送到科研问答，不共享会话、记忆或数据库。</p>
-                <button disabled={!qaAvailable || artifacts.length === 0} onClick={onOpenQa}>
-                  <CheckCircle2 size={15} />进入问答并选择成果
+                <button disabled={!qaAvailable || artifacts.length === 0 || Boolean(bridgingArtifactId)} onClick={() => void bridgeArtifact(artifacts[0])}>
+                  <CheckCircle2 size={15} />发送最新成果到问答
                 </button>
               </section>
             </aside>

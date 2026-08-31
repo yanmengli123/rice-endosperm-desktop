@@ -2,7 +2,7 @@
 
 <img src="public/brand-logo.png" width="180" alt="稻芯智析徽标">
 
-稻芯智析是面向水稻胚乳发育、灌浆调控、基因功能与组学分析的科研智能问答桌面客户端。客户端以 [Yuxi](https://github.com/xerrors/Yuxi) 作为 Agent 业务内核，通过管理员签发的账号与 Yuxi API Key 连接用户指定的 APISIX/Yuxi 网关。
+稻芯智析是面向水稻胚乳发育、灌浆调控、基因功能与组学分析的双引擎科研桌面工作台。知识问答以 [Yuxi](https://github.com/xerrors/Yuxi) 作为远程 Agent 业务内核；本地科研计算由独立的 [rice-endosperm-workflow](https://github.com/yanmengli123/rice-endosperm-workflow) WISP Sidecar 执行。
 
 > 当前公开版是自托管客户端：首次启动时填写管理员发放的登录 ID（或用户名）、初始密码、Yuxi API Key 和网关地址。三项凭据会由服务端原子校验，客户端不会自行拼接身份。本地默认地址为 `http://127.0.0.1:9088`；远程网关必须使用 HTTPS。
 
@@ -28,6 +28,18 @@
 - SQLite 保存本地会话、消息和运行恢复状态。
 - Tauri 2 原生 Windows 安装包和 GitHub Releases 自动更新。
 - 远程地址强制 HTTPS，本机开发地址例外；严格 CSP 和最小 Tauri capability。
+- 独立“科研工作流”域：本地项目沙箱、WISP 流式工具调用/审批/取消、运行历史、产物哈希与崩溃恢复不依赖 Yuxi 在线状态。
+- 确定性表达矩阵 PCA 与显式 Artifact Bridge；本地产物只有经用户选择、完整性复核并在下一条问题发送时才进入 Yuxi。
+
+## 双引擎边界
+
+```text
+智能问答：React → Tauri → APISIX/Yuxi（HTTPS/SSE）
+科研工作流：React → Tauri WorkflowSupervisor → WISP Worker（stdio JSONL）
+唯一跨域入口：用户显式触发的 Artifact Bridge
+```
+
+科研项目会创建 `input/`、`work/`、`results/`、`reports/`、`scripts/` 和 `.rice-workflow/`。确定性执行器只从 `input/` 读取，产物登记只接受 `results/` 与 `reports/` 内的真实普通文件；符号链接逃逸、父目录穿越、磁盘根和用户主目录均会被拒绝。工作流模型 API Key 保存在独立 Stronghold 记录中，不与 Yuxi 凭据或 SQLite 混用。
 
 ## 使用前提
 
@@ -60,6 +72,7 @@ git clone https://github.com/yanmengli123/rice-endosperm-desktop.git
 cd rice-endosperm-desktop
 pnpm install --frozen-lockfile
 . .\.github\scripts\prepare-libsodium.ps1
+.\.github\scripts\prepare-workflow-worker.ps1 -SourceDirectory "D:\path\to\rice-endosperm-workflow"
 pnpm tauri dev
 ```
 
@@ -82,12 +95,14 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.github\scripts\prepare-libsodium.ps1`。脚本会下载官方 libsodium 动态运行库、校验固定 SHA-256，并把 DLL 放入 Tauri 安装包资源；这种方式也避免静态 CRT 与 Rust MSVC 运行库冲突。
+Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.github\scripts\prepare-libsodium.ps1`。脚本会下载官方 libsodium 动态运行库、校验固定 SHA-256，并把 DLL 放入 Tauri 安装包资源；这种方式也避免静态 CRT 与 Rust MSVC 运行库冲突。开发模式可直接发现相邻 WISP fork 的 release/debug worker；正式安装包由 `prepare-workflow-worker.ps1` 从固定提交冷构建并生成来源/哈希清单。
 
 ## 数据与安全
 
 - 应用不内置、收集或代管用户的 Yuxi API Key。
 - 对话请求只发往用户配置的网关；本项目不包含遥测或第三方分析 SDK。
+- 本地工作流文件不经过 Yuxi；但使用云端工作流模型时，Agent 选择的必要项目上下文会发送给该模型供应商。未发表或敏感数据应使用受信任的企业网关/本地模型，并逐项核对工具审批。
+- Artifact Bridge 默认关闭；只有用户点击指定产物后才上传，且上传前会复核登记时的 SHA-256。
 - 删除本机 API Key 不会删除本地历史会话；卸载策略与完整数据位置见 [隐私说明](PRIVACY.md)。
 - 发现漏洞请按 [安全政策](SECURITY.md) 私下报告，不要在公开 Issue 中提交密钥或漏洞细节。
 
@@ -104,4 +119,4 @@ git push origin v0.1.6
 
 ## 许可证与声明
 
-本项目使用 [MIT License](LICENSE)。Yuxi 是独立的开源项目；“稻芯智析”不是医疗、农艺或实验决策的替代品，重要科研结论应核对原始文献并通过实验验证。
+桌面 Shell 使用 [MIT License](LICENSE)。Yuxi 是独立的开源项目。安装包内的 WISP Worker 是通过 JSONL stdio 协议运行的独立程序，采用 AGPL-3.0-only；其精确源码提交、二进制 SHA-256、许可证和源码链接随安装包提供。组合发行或商业部署仍应由发布方完成适用的开源许可证合规审查。“稻芯智析”不是医疗、农艺或实验决策的替代品，重要科研结论应核对原始文献并通过实验验证。

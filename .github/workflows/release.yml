@@ -36,6 +36,9 @@ jobs:
       - name: Prepare pinned libsodium
         shell: pwsh
         run: ./.github/scripts/prepare-libsodium.ps1
+      - name: Build pinned WISP workflow worker
+        shell: pwsh
+        run: ./.github/scripts/prepare-workflow-worker.ps1
       - name: Verify updater signing credentials
         shell: pwsh
         env:
@@ -63,6 +66,7 @@ jobs:
             - 普通用户推荐下载 `x64-setup.exe`。
             - 企业分发可使用 `.msi`。
             - 首次启动需填写你自己的 Yuxi API Key 与网关地址。
+            - 本地科研工作流包含独立 WISP Worker；其固定源码提交、SHA-256 与 AGPL-3.0 许可证随安装包提供。
 
             完整变更与安全说明见仓库 README。安装包由公开源码自动构建；当前若未配置 Authenticode 证书，Windows 可能提示未知发布者。
           releaseDraft: false

@@ -22,11 +22,12 @@ use commands::{
 };
 use state::AppState;
 use workflow::{
-    cancel_workflow_agent, cancel_workflow_run, create_workflow_project,
-    delete_workflow_model_settings, delete_workflow_project, get_workflow_engine_status,
-    get_workflow_model_settings, list_workflow_artifacts, list_workflow_projects,
-    list_workflow_runs, open_workflow_artifact, pick_workflow_directory, respond_workflow_approval,
-    run_counts_pca_workflow, run_workflow_agent, save_workflow_model_settings,
+    bridge_workflow_artifact_to_qa, cancel_workflow_agent, cancel_workflow_run,
+    create_workflow_project, delete_workflow_model_settings, delete_workflow_project,
+    get_workflow_engine_status, get_workflow_model_settings, list_workflow_agent_turns,
+    list_workflow_artifacts, list_workflow_projects, list_workflow_runs, open_workflow_artifact,
+    pick_workflow_directory, respond_workflow_approval, run_counts_pca_workflow,
+    run_workflow_agent, save_workflow_model_settings,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -90,6 +91,7 @@ pub fn run() {
             delete_workflow_project,
             list_workflow_runs,
             list_workflow_artifacts,
+            list_workflow_agent_turns,
             get_workflow_engine_status,
             run_counts_pca_workflow,
             cancel_workflow_run,
@@ -100,6 +102,7 @@ pub fn run() {
             run_workflow_agent,
             respond_workflow_approval,
             cancel_workflow_agent,
+            bridge_workflow_artifact_to_qa,
         ])
         .run(tauri::generate_context!());
 

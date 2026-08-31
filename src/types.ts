@@ -67,6 +67,29 @@ export type WorkflowAgentCompletion = {
   turnId: string;
   text: string;
   sessionId?: string;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  changedPaths: string[];
+};
+
+export type WorkflowAgentTurn = {
+  id: string;
+  runId: string;
+  projectId: string;
+  engineTurnId?: string;
+  engineSessionId?: string;
+  provider: string;
+  model: string;
+  prompt: string;
+  response: string;
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted";
+  error?: string;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  createdAt: string;
+  finishedAt?: string;
 };
 
 export type WorkflowAgentEvent =
