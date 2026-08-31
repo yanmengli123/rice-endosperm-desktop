@@ -82,6 +82,9 @@ $resourceBytes = [System.Text.Encoding]::UTF8.GetBytes(($sortedResourceLines -jo
 $resourceDigestBytes = [System.Security.Cryptography.SHA256]::HashData($resourceBytes)
 $resourceHash = [System.Convert]::ToHexString($resourceDigestBytes).ToLowerInvariant()
 $version = [string](& $destinationBinary --version 2>$null | Select-Object -First 1)
+# The worker CLI rejects `--version` (exit code 1); clear it so the post-script
+# `exit $LASTEXITCODE` appended by GitHub Actions does not fail a completed step.
+$global:LASTEXITCODE = 0
 if ([string]::IsNullOrWhiteSpace($version)) {
   $version = "wisp-science 1.8.0"
 }
