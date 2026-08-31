@@ -16,6 +16,7 @@ import type {
   WorkflowEngineStatus,
   WorkflowAgentCompletion,
   WorkflowAgentEvent,
+  WorkflowAgentTurn,
   WorkflowModelSettings,
   WorkflowEvent,
   WorkflowProject,
@@ -148,6 +149,9 @@ export const listWorkflowRuns = (projectId: string) =>
 export const listWorkflowArtifacts = (projectId: string) =>
   invoke<WorkflowArtifact[]>("list_workflow_artifacts", { projectId });
 
+export const listWorkflowAgentTurns = (projectId: string) =>
+  invoke<WorkflowAgentTurn[]>("list_workflow_agent_turns", { projectId });
+
 export const getWorkflowEngineStatus = () =>
   invoke<WorkflowEngineStatus>("get_workflow_engine_status");
 
@@ -165,6 +169,9 @@ export const cancelWorkflowRun = (runId: string) =>
 
 export const openWorkflowArtifact = (artifactId: string) =>
   invoke<void>("open_workflow_artifact", { artifactId });
+
+export const bridgeWorkflowArtifactToQa = (artifactId: string) =>
+  invoke<PendingChatAttachment>("bridge_workflow_artifact_to_qa", { artifactId });
 
 export const getWorkflowModelSettings = () =>
   invoke<WorkflowModelSettings | null>("get_workflow_model_settings");

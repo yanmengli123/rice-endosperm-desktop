@@ -37,3 +37,8 @@ src-tauri/resources/libsodium.dll
 *.sln
 *.sw?
 .tooling/
+# Release-time WISP sidecar artifacts (built from the pinned public fork).
+src-tauri/resources/rice-workflow-worker.exe
+src-tauri/resources/workflow/worker-build.json
+src-tauri/resources/workflow/LICENSE-AGPL-3.0.txt
+src-tauri/resources/workflow-engine/

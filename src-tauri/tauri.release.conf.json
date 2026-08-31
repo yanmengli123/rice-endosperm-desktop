@@ -1,6 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/libsodium.dll": "libsodium.dll",
+      "resources/rice-workflow-worker.exe": "rice-workflow-worker.exe",
+      "resources/workflow/worker-build.json": "workflow/worker-build.json",
+      "resources/workflow/LICENSE-AGPL-3.0.txt": "workflow/LICENSE-AGPL-3.0.txt",
+      "resources/workflow/SOURCE.md": "workflow/SOURCE.md",
+      "resources/workflow-engine/skills": "workflow-engine/skills",
+      "resources/workflow-engine/python": "workflow-engine/python",
+      "resources/workflow-engine/r": "workflow-engine/r",
+      "resources/workflow-engine/seed": "workflow-engine/seed",
+      "resources/workflow-engine/mcp-servers/bio-tools": "workflow-engine/mcp-servers/bio-tools"
+    }
   }
 }

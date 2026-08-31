@@ -42,6 +42,27 @@ pub struct WorkflowArtifact {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowAgentTurn {
+    pub id: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub engine_turn_id: Option<String>,
+    pub engine_session_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub response: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowEngineStatus {
@@ -135,6 +156,10 @@ pub struct WorkflowAgentCompletion {
     pub turn_id: String,
     pub text: String,
     pub session_id: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

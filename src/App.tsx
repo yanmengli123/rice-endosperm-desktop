@@ -7,6 +7,7 @@ import { Sidebar } from "./components/Sidebar";
 import { RunContextBar } from "./components/RunContextBar";
 import {
   createThread,
+  bridgeWorkflowArtifactToQa,
   deleteThread,
   getPublicSettings,
   getThreadRunContext,
@@ -16,7 +17,7 @@ import {
   renameThread,
   syncPendingRuns,
 } from "./services/tauri-client";
-import type { ChatCompletion, LocalMessage, PublicSettings, ServerRunContext, ThreadSummary } from "./types";
+import type { ChatCompletion, LocalMessage, PendingChatAttachment, PublicSettings, ServerRunContext, ThreadSummary, WorkflowArtifact } from "./types";
 import { WorkflowWorkspace } from "./workflow/WorkflowWorkspace";
 import "./styles.css";
 
@@ -35,6 +36,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [runState, setRunState] = useState<{ status: string; message?: string }>({ status: "idle" });
   const [productMode, setProductMode] = useState<"qa" | "workflow">("qa");
+  const [bridgeAttachment, setBridgeAttachment] = useState<PendingChatAttachment>();
   const initialized = useRef(false);
   const threadLoadSequence = useRef(0);
   const activeThreadRef = useRef<string | undefined>(undefined);
@@ -209,6 +211,20 @@ export default function App() {
       <WorkflowWorkspace
         qaAvailable={Boolean(settings?.hasApiKey)}
         onOpenQa={() => setProductMode("qa")}
+        onBridgeArtifact={async (artifact: WorkflowArtifact) => {
+          if (!settings?.hasApiKey) {
+            setError("请先连接 Yuxi 服务，再把工作流产物发送到科研问答");
+            return;
+          }
+          try {
+            const uploaded = await bridgeWorkflowArtifactToQa(artifact.id);
+            setBridgeAttachment(uploaded);
+            setProductMode("qa");
+          } catch (reason) {
+            setError(normalizeCommandError(reason).message);
+            throw reason;
+          }
+        }}
       />
     );
   }
@@ -265,6 +281,8 @@ export default function App() {
             messages={messages}
             onRunState={handleRunState}
             onCompleted={completed}
+            bridgeAttachment={bridgeAttachment}
+            onBridgeConsumed={() => setBridgeAttachment(undefined)}
           />
         ) : error ? (
           // ensureThread 失败（如数据库损坏）时给出重试入口，避免永久 spinner。
@@ -292,6 +310,7 @@ export default function App() {
           onClose={() => setSettingsOpen(false)}
           onCredentialDeleted={() => {
             setSettingsOpen(false);
+            setBridgeAttachment(undefined);
             setSettings({ ...settings, hasApiKey: false, apiKeyHint: undefined });
           }}
         />

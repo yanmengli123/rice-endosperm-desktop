@@ -14,13 +14,14 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   cancelWorkflowAgent,
   deleteWorkflowModelSettings,
   getWorkflowModelSettings,
+  listWorkflowAgentTurns,
   normalizeCommandError,
   respondWorkflowApproval,
   runWorkflowAgent,
@@ -28,6 +29,7 @@ import {
 } from "../services/tauri-client";
 import type {
   WorkflowAgentEvent,
+  WorkflowAgentTurn,
   WorkflowEngineStatus,
   WorkflowModelSettings,
   WorkflowProject,
@@ -70,6 +72,14 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
   const [tools, setTools] = useState<ToolActivity[]>([]);
   const [approval, setApproval] = useState<Approval>();
   const [error, setError] = useState("");
+  const [history, setHistory] = useState<WorkflowAgentTurn[]>([]);
+  const [selectedTurnId, setSelectedTurnId] = useState<string>();
+
+  const refreshHistory = useCallback(async () => {
+    const turns = await listWorkflowAgentTurns(project.id);
+    setHistory(turns);
+    return turns;
+  }, [project.id]);
 
   useEffect(() => {
     void getWorkflowModelSettings()
@@ -85,6 +95,14 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
       })
       .catch((reason) => setError(normalizeCommandError(reason).message));
   }, []);
+
+  useEffect(() => {
+    setAnswer("");
+    setTools([]);
+    setApproval(undefined);
+    setSelectedTurnId(undefined);
+    void refreshHistory().catch((reason) => setError(normalizeCommandError(reason).message));
+  }, [refreshHistory]);
 
   async function saveSettings(event: React.FormEvent) {
     event.preventDefault();
@@ -151,6 +169,8 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
       setAnswer(completion.text);
       setPrompt("");
       onFilesChanged();
+      const turns = await refreshHistory();
+      setSelectedTurnId(turns[0]?.id);
     } catch (reason) {
       setError(normalizeCommandError(reason).message);
     } finally {
@@ -189,7 +209,7 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
           <label><span>API Base URL</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" /></label>
           <label><span>Model</span><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="provider/model" /></label>
           <label><span>API Key</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings?.apiKeyHint || "仅保存在 Stronghold"} autoComplete="off" /></label>
-          <div><button type="submit" disabled={!apiKey.trim()}><Save size={14} />保存独立配置</button>{settings && <button type="button" className="danger" onClick={() => void removeSettings()}><Trash2 size={14} />删除</button>}</div>
+          <div><button type="submit" disabled={!apiKey.trim() && !settings?.hasApiKey}><Save size={14} />保存独立配置</button>{settings && <button type="button" className="danger" onClick={() => void removeSettings()}><Trash2 size={14} />删除</button>}</div>
         </form>
       )}
 
@@ -202,13 +222,36 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
         {answer && <div className="workflow-agent-answer"><ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown></div>}
       </div>
 
+      {history.length > 0 && (
+        <section className="workflow-agent-history">
+          <header><strong>已持久化回合</strong><span>{history.length}</span></header>
+          <div>
+            {history.map((turn) => (
+              <button
+                key={turn.id}
+                className={selectedTurnId === turn.id ? "active" : ""}
+                onClick={() => {
+                  setSelectedTurnId(turn.id);
+                  setAnswer(turn.response);
+                  setTools([]);
+                  setError(turn.error || "");
+                }}
+              >
+                <span><strong>{turn.prompt}</strong><small>{turn.model} · {new Date(turn.createdAt).toLocaleString("zh-CN")}</small></span>
+                <em className={turn.status}>{turn.status === "completed" ? "完成" : turn.status === "running" ? "运行中" : turn.status === "cancelled" ? "已取消" : turn.status === "interrupted" ? "已中断" : "失败"}</em>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
       {approval && <div className="workflow-approval"><ShieldQuestion size={21} /><div><strong>操作需要确认</strong><p>{approval.message}</p><span>确认前请核对命令、文件路径和影响范围。</span></div><div><button onClick={() => void decideApproval(false)}>拒绝</button><button className="approve" onClick={() => void decideApproval(true)}><CheckCircle2 size={14} />允许一次</button></div></div>}
 
       <div className="workflow-agent-composer">
         <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述要在当前项目中完成的科研计算任务…" disabled={running} />
         {running ? <button className="stop" onClick={() => void cancelWorkflowAgent(project.id)}><Square size={15} />停止</button> : <button onClick={() => void runAgent()} disabled={!engine?.available || !settings?.hasApiKey || !prompt.trim()}><Play size={15} />执行</button>}
       </div>
-      <footer><KeyRound size={13} />工作流模型凭据与 Yuxi 凭据完全隔离，API Key 不进入 SQLite 或日志。</footer>
+      <footer><KeyRound size={13} />工作流凭据与 Yuxi 完全隔离；使用云端模型时，必要项目上下文可能发送给该模型供应商。</footer>
     </article>
   );
 }

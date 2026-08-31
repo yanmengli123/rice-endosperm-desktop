@@ -1,3 +1,4 @@
+mod artifacts;
 mod commands;
 mod pca;
 mod project;
@@ -6,11 +7,12 @@ mod store;
 mod supervisor;
 
 pub use commands::{
-    cancel_workflow_agent, cancel_workflow_run, create_workflow_project,
-    delete_workflow_model_settings, delete_workflow_project, get_workflow_engine_status,
-    get_workflow_model_settings, list_workflow_artifacts, list_workflow_projects,
-    list_workflow_runs, open_workflow_artifact, pick_workflow_directory, respond_workflow_approval,
-    run_counts_pca_workflow, run_workflow_agent, save_workflow_model_settings,
+    bridge_workflow_artifact_to_qa, cancel_workflow_agent, cancel_workflow_run,
+    create_workflow_project, delete_workflow_model_settings, delete_workflow_project,
+    get_workflow_engine_status, get_workflow_model_settings, list_workflow_agent_turns,
+    list_workflow_artifacts, list_workflow_projects, list_workflow_runs, open_workflow_artifact,
+    pick_workflow_directory, respond_workflow_approval, run_counts_pca_workflow,
+    run_workflow_agent, save_workflow_model_settings,
 };
 pub use protocol::*;
 pub use store::WorkflowStore;

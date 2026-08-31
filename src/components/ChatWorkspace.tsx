@@ -18,7 +18,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
-import type { ChatCompletion, LocalMessage } from "../types";
+import type { ChatCompletion, LocalMessage, PendingChatAttachment } from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { normalizeRichAnswer } from "../utils/rich-answer";
 import { CodeHeader, HtmlFencedCodeBlock, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
@@ -29,6 +29,8 @@ type Props = {
   messages: LocalMessage[];
   onRunState: (state: { runId?: string; status: string; message?: string }, threadId: string) => void;
   onCompleted: (completion: ChatCompletion, threadId: string) => void;
+  bridgeAttachment?: PendingChatAttachment;
+  onBridgeConsumed?: () => void;
 };
 
 function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
@@ -187,9 +189,16 @@ function Welcome() {
   );
 }
 
-function Composer() {
+function Composer({ bridgeAttachment, onBridgeConsumed }: Pick<Props, "bridgeAttachment" | "onBridgeConsumed">) {
   return (
     <div className="composer-shell">
+      {bridgeAttachment && (
+        <div className="artifact-bridge-pending" role="status">
+          <Paperclip size={15} />
+          <span><strong>来自科研工作流</strong><small>{bridgeAttachment.fileName} · 将随下一条问题发送</small></span>
+          <button onClick={onBridgeConsumed} aria-label="移除工作流产物"><X size={14} /></button>
+        </div>
+      )}
       <ComposerPrimitive.Root className="composer">
         <ComposerPrimitive.Attachments components={{ Attachment: ComposerAttachment }} />
         <ComposerPrimitive.AddAttachment className="attachment-button" aria-label="添加图片或附件" multiple>
@@ -217,7 +226,7 @@ function Composer() {
   );
 }
 
-function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
+function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed }: Props) {
   const attachmentAdapter = useMemo(() => new YuxiAttachmentAdapter(), []);
   const adapter = useMemo(
     () =>
@@ -226,8 +235,10 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
         //（切换会话后旧 run 的迟到回调不应污染新会话状态）。
         onRunState: (state) => onRunState(state, threadId),
         onCompleted: (completion) => onCompleted(completion, threadId),
+        bridgeAttachment,
+        onBridgeConsumed,
       }),
-    [threadId, onRunState, onCompleted],
+    [threadId, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed],
   );
   const runtime = useLocalRuntime(adapter, {
     initialMessages: toInitialMessages(messages),
@@ -250,7 +261,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted }: Props) {
             <ArrowDown size={18} />
           </ThreadPrimitive.ScrollToBottom>
           <ThreadPrimitive.ViewportFooter className="thread-footer">
-            <Composer />
+            <Composer bridgeAttachment={bridgeAttachment} onBridgeConsumed={onBridgeConsumed} />
           </ThreadPrimitive.ViewportFooter>
         </ThreadPrimitive.Viewport>
       </ThreadPrimitive.Root>
