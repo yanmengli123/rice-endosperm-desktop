@@ -4255,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "rice-endosperm-desktop"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
  "chrono",
