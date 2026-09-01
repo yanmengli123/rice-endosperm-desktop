@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command},
     sync::Mutex as AsyncMutex,
+    time::Instant,
 };
 use uuid::Uuid;
 
@@ -35,6 +36,10 @@ const WISP_RPC_SCHEMA: &str = "wisp.agent-rpc.v1";
 const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_VISIBLE_TOOL_RESULT_BYTES: usize = 16 * 1024;
 const MAX_ACCUMULATED_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_TURN_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+const MIN_WORKFLOW_TIMEOUT_SECS: u64 = 30;
+const MAX_WORKFLOW_TIMEOUT_SECS: u64 = 4 * 60 * 60;
 
 #[derive(Deserialize)]
 struct WorkerBuildManifest {
@@ -291,7 +296,16 @@ impl WorkflowSupervisor {
             .env("WISP_API_KEY", api_key.expose_secret())
             .env("WISP_APPROVAL_MODE", "safe")
             .env("WISP_RESTRICT_READS", "1")
-            .env("WISP_MAX_ITER", "60");
+            .env("WISP_MAX_ITER", "60")
+            // The worker and all of its Python/PowerShell descendants must
+            // exchange UTF-8 bytes.  Without this, Windows' legacy console
+            // code page can corrupt Chinese scientific text or raise
+            // UnicodeEncodeError in otherwise successful tools.
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("NO_COLOR", "1");
         if let Some(resource_root) = resolved_worker.resource_root {
             command.env("WISP_RESOURCE_ROOT", resource_root);
         }
@@ -391,11 +405,44 @@ impl WorkflowSupervisor {
         let mut input_tokens = 0_u64;
         let mut output_tokens = 0_u64;
         let mut reasoning_tokens = 0_u64;
+        let turn_started_at = Instant::now();
+        let total_timeout =
+            workflow_timeout("RICE_WORKFLOW_TURN_TIMEOUT_SECS", DEFAULT_TURN_TIMEOUT_SECS);
+        let idle_timeout =
+            workflow_timeout("RICE_WORKFLOW_IDLE_TIMEOUT_SECS", DEFAULT_IDLE_TIMEOUT_SECS);
+        let total_deadline = turn_started_at + total_timeout;
         let result = loop {
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) => break Err(AppError::Protocol("WISP 在完成指令前退出".into())),
-                Err(error) => {
+            let now = Instant::now();
+            if now >= total_deadline {
+                break Err(AppError::Protocol(format!(
+                    "WISP 工作流超过总时限（{} 秒），已安全终止；中间文件仍保留在项目目录",
+                    total_timeout.as_secs()
+                )));
+            }
+            let idle_deadline = now + idle_timeout;
+            let (read_deadline, timeout_message) = if total_deadline <= idle_deadline {
+                (
+                    total_deadline,
+                    format!(
+                        "WISP 工作流超过总时限（{} 秒），已安全终止；中间文件仍保留在项目目录",
+                        total_timeout.as_secs()
+                    ),
+                )
+            } else {
+                (
+                    idle_deadline,
+                    format!(
+                        "WISP 工作流连续 {} 秒没有产生协议事件，已按卡死保护终止",
+                        idle_timeout.as_secs()
+                    ),
+                )
+            };
+            let next_line = tokio::time::timeout_at(read_deadline, lines.next_line()).await;
+            let line = match next_line {
+                Err(_) => break Err(AppError::Protocol(timeout_message)),
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => break Err(AppError::Protocol("WISP 在完成指令前退出".into())),
+                Ok(Err(error)) => {
                     break Err(AppError::Protocol(format!("WISP 流读取失败：{error}")));
                 }
             };
@@ -711,6 +758,18 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     format!("{}\n…[工具结果已截断]", &value[..end])
 }
 
+fn bounded_timeout_secs(raw: Option<&str>, default_secs: u64) -> Duration {
+    let seconds = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default_secs)
+        .clamp(MIN_WORKFLOW_TIMEOUT_SECS, MAX_WORKFLOW_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
+fn workflow_timeout(name: &str, default_secs: u64) -> Duration {
+    bounded_timeout_secs(std::env::var(name).ok().as_deref(), default_secs)
+}
+
 #[cfg(windows)]
 fn hide_console(command: &mut Command) {
     command.creation_flags(0x0800_0000);
@@ -739,6 +798,14 @@ mod tests {
         let truncated = truncate_utf8(&value, 101);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.contains("已截断"));
+    }
+
+    #[test]
+    fn workflow_timeouts_are_bounded_and_invalid_values_use_defaults() {
+        assert_eq!(bounded_timeout_secs(Some("5"), 90).as_secs(), 30);
+        assert_eq!(bounded_timeout_secs(Some("999999"), 90).as_secs(), 14_400);
+        assert_eq!(bounded_timeout_secs(Some("invalid"), 90).as_secs(), 90);
+        assert_eq!(bounded_timeout_secs(None, 90).as_secs(), 90);
     }
 
     #[test]

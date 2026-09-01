@@ -1,6 +1,6 @@
 param(
   [string]$WorkerRepository = "https://github.com/yanmengli123/rice-endosperm-workflow.git",
-  [string]$WorkerCommit = "0b06c20bac6eae60b65078a85d4be1eb480537cd",
+  [string]$WorkerCommit = "1f051d01c17d610b17b5817072e0c7a68e7ee34d",
   [string]$SourceDirectory = "",
   [switch]$AllowDirtySource
 )
