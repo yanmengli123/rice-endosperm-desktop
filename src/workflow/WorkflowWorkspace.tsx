@@ -79,6 +79,8 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: P
   const [progress, setProgress] = useState({ percent: 0, message: "" });
   const [error, setError] = useState("");
   const [workspaceTool, setWorkspaceTool] = useState<"agent" | "pca">("agent");
+  const [focusedAgentRunId, setFocusedAgentRunId] = useState<string>();
+  const [focusRequest, setFocusRequest] = useState(0);
   const [bridgingArtifactId, setBridgingArtifactId] = useState<string>();
   const activeProject = useMemo(
     () => projects.find((project) => project.id === activeProjectId),
@@ -188,6 +190,13 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: P
     }
   }
 
+  function focusRun(run: WorkflowRun) {
+    if (run.workflowKind !== "wisp-agent") return;
+    setWorkspaceTool("agent");
+    setFocusedAgentRunId(run.id);
+    setFocusRequest((current) => current + 1);
+  }
+
   return (
     <div className="workflow-shell">
       <aside className="workflow-sidebar">
@@ -241,15 +250,18 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: P
                 <button className={workspaceTool === "agent" ? "active" : ""} onClick={() => setWorkspaceTool("agent")}><Bot size={15} />本地科研助手</button>
                 <button className={workspaceTool === "pca" ? "active" : ""} onClick={() => setWorkspaceTool("pca")}><BarChart3 size={15} />确定性 PCA</button>
               </div>
-              {workspaceTool === "agent" ? (
+              <div className="workflow-tool-pane" hidden={workspaceTool !== "agent"}>
                 <WorkflowAgentPanel
-                  key={activeProject.id}
                   project={activeProject}
                   engine={engine}
+                  focusRunId={focusedAgentRunId}
+                  focusRequest={focusRequest}
                   onFilesChanged={() => void refreshProjectData(activeProject.id)}
+                  onTaskActivity={() => void refreshProjectData(activeProject.id)}
                 />
-              ) : (
-              <article className="workflow-hero-card">
+              </div>
+              <div className="workflow-tool-pane" hidden={workspaceTool !== "pca"}>
+                <article className="workflow-hero-card">
                 <div className="workflow-card-heading">
                   <span className="workflow-icon"><BarChart3 size={21} /></span>
                   <div><span>DETERMINISTIC PIPELINE</span><h2>表达矩阵主成分分析</h2><p>读取非负 counts 矩阵，执行 log2(count + 1)、样本 PCA、科研图形与可复现清单。</p></div>
@@ -273,8 +285,8 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: P
                     <button onClick={() => void runPca()}><Play size={15} />运行 PCA 工作流</button>
                   )}
                 </div>
-              </article>
-              )}
+                </article>
+              </div>
 
               <article className="workflow-policy-card">
                 <ShieldCheck size={22} />
@@ -288,11 +300,18 @@ export function WorkflowWorkspace({ onOpenQa, qaAvailable, onBridgeArtifact }: P
                 <div className="workflow-record-list">
                   {runs.length === 0 && <p className="workflow-placeholder">尚无运行记录</p>}
                   {runs.map((run) => (
-                    <article key={run.id} className={`workflow-run ${run.status}`}>
+                    <button
+                      type="button"
+                      key={run.id}
+                      className={`workflow-run ${run.status} ${run.workflowKind === "wisp-agent" ? "clickable" : ""}`}
+                      onClick={() => focusRun(run)}
+                      disabled={run.workflowKind !== "wisp-agent"}
+                      title={run.workflowKind === "wisp-agent" ? "打开对应科研任务" : undefined}
+                    >
                       <div><strong>{run.workflowKind}</strong><span>{statusLabel(run.status)}</span></div>
                       <small>{new Date(run.createdAt).toLocaleString("zh-CN")}</small>
                       {run.error && <p>{run.error}</p>}
-                    </article>
+                    </button>
                   ))}
                 </div>
               </section>

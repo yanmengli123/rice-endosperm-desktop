@@ -89,6 +89,11 @@ fn validate_model_settings(
     ))
 }
 
+fn same_credential_scope(previous: &WorkflowModelSettings, next: &WorkflowModelSettings) -> bool {
+    previous.provider == next.provider
+        && previous.base_url.trim_end_matches('/') == next.base_url.trim_end_matches('/')
+}
+
 async fn load_model_settings(state: &AppState) -> Result<WorkflowModelSettings, CommandError> {
     let raw = state
         .workflow
@@ -136,12 +141,32 @@ pub async fn save_workflow_model_settings(
     state: State<'_, AppState>,
 ) -> Result<WorkflowModelSettings, CommandError> {
     let (mut public, replacement) = validate_model_settings(settings)?;
+    let stored_settings = state
+        .workflow
+        .store
+        .setting(MODEL_SETTINGS_KEY)
+        .await
+        .map_err(command_error)?
+        .map(|raw| {
+            serde_json::from_str::<WorkflowModelSettings>(&raw)
+                .map_err(|_| command_error(AppError::Protocol("工作流模型配置已损坏".into())))
+        })
+        .transpose()?;
     let previous = state
         .credentials
         .workflow_model_api_key()
         .map_err(command_error)?;
     if replacement.is_none() && previous.is_none() {
         return Err(command_error(AppError::MissingCredential));
+    }
+    if replacement.is_none()
+        && !stored_settings
+            .as_ref()
+            .is_some_and(|stored| same_credential_scope(stored, &public))
+    {
+        return Err(command_error(AppError::Protocol(
+            "切换模型供应商或 API Base URL 时必须输入该端点的新 API Key".into(),
+        )));
     }
     if let Some(api_key) = replacement.as_deref() {
         state
@@ -244,7 +269,7 @@ pub async fn run_workflow_agent(
         .workflow_model_api_key()
         .map_err(command_error)?
         .ok_or_else(|| command_error(AppError::MissingCredential))?;
-    let run_id = format!("wfr_{}", Uuid::new_v4().simple());
+    let run_id = requested_agent_run_id(request.run_id.as_deref())?;
     let turn_id = format!("wft_{}", Uuid::new_v4().simple());
     let stamp = Utc::now().to_rfc3339();
     let run = WorkflowRun {
@@ -288,7 +313,7 @@ pub async fn run_workflow_agent(
     let outcome = state
         .workflow
         .supervisor
-        .run_turn(&project, &settings, api_key, prompt, &on_event)
+        .run_turn(&run_id, &project, &settings, api_key, prompt, &on_event)
         .await;
     match outcome {
         Ok(completion) => {
@@ -351,6 +376,21 @@ pub async fn run_workflow_agent(
 
 fn token_count(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn requested_agent_run_id(value: Option<&str>) -> Result<String, CommandError> {
+    let Some(value) = value else {
+        return Ok(format!("wfr_{}", Uuid::new_v4().simple()));
+    };
+    let suffix = value
+        .strip_prefix("wfr_")
+        .ok_or_else(|| command_error(AppError::Protocol("科研任务标识格式无效".into())))?;
+    if suffix.len() != 32 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(command_error(AppError::Protocol(
+            "科研任务标识格式无效".into(),
+        )));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 async fn persist_agent_failure(
@@ -462,7 +502,7 @@ pub async fn bridge_workflow_artifact_to_qa(
 
 #[tauri::command]
 pub async fn respond_workflow_approval(
-    project_id: String,
+    run_id: String,
     approval_id: String,
     approved: bool,
     feedback: Option<String>,
@@ -472,7 +512,7 @@ pub async fn respond_workflow_approval(
         .workflow
         .supervisor
         .respond_approval(
-            project_id.trim(),
+            run_id.trim(),
             approval_id.trim(),
             approved,
             feedback.as_deref(),
@@ -483,13 +523,13 @@ pub async fn respond_workflow_approval(
 
 #[tauri::command]
 pub async fn cancel_workflow_agent(
-    project_id: String,
+    run_id: String,
     state: State<'_, AppState>,
 ) -> Result<bool, CommandError> {
     state
         .workflow
         .supervisor
-        .cancel_turn(project_id.trim())
+        .cancel_turn(run_id.trim())
         .await
         .map_err(command_error)
 }
@@ -836,5 +876,32 @@ mod tests {
     fn model_settings_reject_plain_http_except_loopback() {
         assert!(validate_model_settings(settings("http://api.example.com/v1", "key")).is_err());
         assert!(validate_model_settings(settings("http://127.0.0.1:11434/v1", "key")).is_ok());
+    }
+
+    #[test]
+    fn workflow_run_ids_are_normalized_and_fail_closed() {
+        let valid = "wfr_ABCDEF0123456789ABCDEF0123456789";
+        assert_eq!(
+            requested_agent_run_id(Some(valid)).unwrap(),
+            valid.to_ascii_lowercase()
+        );
+        assert!(requested_agent_run_id(Some("run-untrusted")).is_err());
+        assert!(requested_agent_run_id(Some("wfr_../shared-output-0000000000000")).is_err());
+        assert!(requested_agent_run_id(None).unwrap().starts_with("wfr_"));
+    }
+
+    #[test]
+    fn api_keys_are_reused_only_inside_the_same_provider_endpoint() {
+        let previous = validate_model_settings(settings("https://api.minimaxi.com/v1", "key"))
+            .unwrap()
+            .0;
+        let same_endpoint = validate_model_settings(settings("https://api.minimaxi.com/v1/", ""))
+            .unwrap()
+            .0;
+        let deepseek = validate_model_settings(settings("https://api.deepseek.com", ""))
+            .unwrap()
+            .0;
+        assert!(same_credential_scope(&previous, &same_endpoint));
+        assert!(!same_credential_scope(&previous, &deepseek));
     }
 }

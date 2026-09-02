@@ -43,6 +43,8 @@ const DEFAULT_FIRST_MODEL_EVENT_TIMEOUT_SECS: u64 = 2 * 60;
 const PROGRESS_HEARTBEAT_SECS: u64 = 5;
 const MIN_WORKFLOW_TIMEOUT_SECS: u64 = 30;
 const MAX_WORKFLOW_TIMEOUT_SECS: u64 = 4 * 60 * 60;
+const MAX_CONCURRENT_WORKFLOW_TASKS: usize = 6;
+const MAX_CONCURRENT_TASKS_PER_PROJECT: usize = 3;
 
 #[derive(Deserialize)]
 struct WorkerBuildManifest {
@@ -61,14 +63,54 @@ struct ResolvedWorker {
 
 #[derive(Clone)]
 struct ActiveWorker {
+    project_id: String,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     turn_id: String,
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+enum ActiveRun {
+    Starting {
+        project_id: String,
+        cancelled: Arc<AtomicBool>,
+    },
+    Running(ActiveWorker),
+}
+
+impl ActiveRun {
+    fn project_id(&self) -> &str {
+        match self {
+            Self::Starting { project_id, .. } => project_id,
+            Self::Running(worker) => &worker.project_id,
+        }
+    }
+
+    fn cancelled(&self) -> Arc<AtomicBool> {
+        match self {
+            Self::Starting { cancelled, .. } => cancelled.clone(),
+            Self::Running(worker) => worker.cancelled.clone(),
+        }
+    }
+}
+
 pub struct WorkflowSupervisor {
     app_data_dir: PathBuf,
-    active_workers: Mutex<HashMap<String, ActiveWorker>>,
+    active_workers: Mutex<HashMap<String, ActiveRun>>,
+}
+
+struct RunReservation<'a> {
+    supervisor: &'a WorkflowSupervisor,
+    run_id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RunReservation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.supervisor.active_workers.lock() {
+            active.remove(&self.run_id);
+        }
+    }
 }
 
 impl WorkflowSupervisor {
@@ -197,12 +239,12 @@ impl WorkflowSupervisor {
 
     pub async fn respond_approval(
         &self,
-        project_id: &str,
+        run_id: &str,
         approval_id: &str,
         approved: bool,
         feedback: Option<&str>,
     ) -> AppResult<()> {
-        let worker = self.active_worker(project_id)?;
+        let worker = self.active_worker(run_id)?;
         self.send(
             &worker,
             json!({
@@ -217,31 +259,99 @@ impl WorkflowSupervisor {
         .await
     }
 
-    pub async fn cancel_turn(&self, project_id: &str) -> AppResult<bool> {
-        let worker = match self.active_worker(project_id) {
-            Ok(worker) => worker,
-            Err(_) => return Ok(false),
+    pub async fn cancel_turn(&self, run_id: &str) -> AppResult<bool> {
+        let active = {
+            let workers = self
+                .active_workers
+                .lock()
+                .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?;
+            workers.get(run_id).cloned()
         };
-        worker.cancelled.store(true, Ordering::Release);
-        self.send(
-            &worker,
-            json!({
-                "schema": WISP_RPC_SCHEMA,
-                "id": format!("cancel-{}", Uuid::new_v4().simple()),
-                "type": "cancel",
-            }),
-        )
-        .await?;
+        let Some(active) = active else {
+            return Ok(false);
+        };
+        active.cancelled().store(true, Ordering::Release);
+        if let ActiveRun::Running(worker) = active {
+            self.send(
+                &worker,
+                json!({
+                    "schema": WISP_RPC_SCHEMA,
+                    "id": format!("cancel-{}", Uuid::new_v4().simple()),
+                    "type": "cancel",
+                }),
+            )
+            .await?;
+        }
         Ok(true)
     }
 
-    fn active_worker(&self, project_id: &str) -> AppResult<ActiveWorker> {
-        self.active_workers
+    fn active_worker(&self, run_id: &str) -> AppResult<ActiveWorker> {
+        let active = self
+            .active_workers
             .lock()
             .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?
-            .get(project_id)
+            .get(run_id)
             .cloned()
-            .ok_or_else(|| AppError::Internal("当前项目没有等待操作的 WISP 运行".into()))
+            .ok_or_else(|| AppError::Internal("找不到对应的 WISP 运行任务".into()))?;
+        match active {
+            ActiveRun::Running(worker) => Ok(worker),
+            ActiveRun::Starting { .. } => {
+                Err(AppError::Internal("WISP 运行仍在启动，请稍后重试".into()))
+            }
+        }
+    }
+
+    fn reserve_run<'a>(&'a self, run_id: &str, project_id: &str) -> AppResult<RunReservation<'a>> {
+        let mut active = self
+            .active_workers
+            .lock()
+            .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?;
+        if active.contains_key(run_id) {
+            return Err(AppError::Internal("该科研任务已经启动".into()));
+        }
+        if active.len() >= MAX_CONCURRENT_WORKFLOW_TASKS {
+            return Err(AppError::Internal(format!(
+                "本机已有 {} 个科研任务在运行，请等待一个任务结束后重试",
+                MAX_CONCURRENT_WORKFLOW_TASKS
+            )));
+        }
+        let project_tasks = active
+            .values()
+            .filter(|run| run.project_id() == project_id)
+            .count();
+        if project_tasks >= MAX_CONCURRENT_TASKS_PER_PROJECT {
+            return Err(AppError::Internal(format!(
+                "当前项目已有 {} 个任务在运行；为保护本地资源，请等待一个任务结束后重试",
+                MAX_CONCURRENT_TASKS_PER_PROJECT
+            )));
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        active.insert(
+            run_id.to_owned(),
+            ActiveRun::Starting {
+                project_id: project_id.to_owned(),
+                cancelled: cancelled.clone(),
+            },
+        );
+        Ok(RunReservation {
+            supervisor: self,
+            run_id: run_id.to_owned(),
+            cancelled,
+        })
+    }
+
+    fn activate_run(&self, run_id: &str, worker: ActiveWorker) -> AppResult<()> {
+        let mut active = self
+            .active_workers
+            .lock()
+            .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?;
+        match active.get(run_id) {
+            Some(ActiveRun::Starting { project_id, .. }) if project_id == &worker.project_id => {
+                active.insert(run_id.to_owned(), ActiveRun::Running(worker));
+                Ok(())
+            }
+            _ => Err(AppError::Internal("WISP 运行租约已经失效".into())),
+        }
     }
 
     async fn send(&self, worker: &ActiveWorker, value: Value) -> AppResult<()> {
@@ -259,6 +369,7 @@ impl WorkflowSupervisor {
 
     pub async fn run_turn(
         &self,
+        run_id: &str,
         project: &WorkflowProject,
         settings: &WorkflowModelSettings,
         api_key: SecretString,
@@ -271,58 +382,15 @@ impl WorkflowSupervisor {
                 "工作流指令必须为 1–100000 个字符".into(),
             ));
         }
-        if let Some(response) = quick_response(prompt) {
-            let turn_id = format!("local-{}", Uuid::new_v4().simple());
-            let _ = channel.send(WorkflowAgentEvent::TurnStarted {
-                turn_id: turn_id.clone(),
-            });
-            let _ = channel.send(WorkflowAgentEvent::Progress {
-                phase: "local_fast_path".into(),
-                message: "已由本地快速路由处理；无需启动模型和生信工具".into(),
-                elapsed_ms: 0,
-            });
-            let _ = channel.send(WorkflowAgentEvent::TextDelta {
-                delta: response.to_owned(),
-            });
-            let _ = channel.send(WorkflowAgentEvent::Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                reasoning_tokens: 0,
-            });
-            let _ = channel.send(WorkflowAgentEvent::TurnCompleted {
-                ok: true,
-                error: None,
-            });
-            diagnostics::log(
-                "INFO",
-                "workflow_local_fast_path",
-                "trivial greeting completed without model or tool startup",
-            );
-            return Ok(WorkflowAgentCompletion {
-                turn_id,
-                text: response.to_owned(),
-                session_id: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                reasoning_tokens: 0,
-                changed_paths: Vec::new(),
-            });
-        }
         let turn_started_at = Instant::now();
         emit_progress(channel, "starting_engine", turn_started_at);
         let resolved_worker = self.resolve_worker()?.ok_or_else(|| {
             AppError::Internal("未找到 WISP Sidecar，请先构建或安装本地工作流引擎".into())
         })?;
         let worker_path = resolved_worker.path;
-        {
-            let active = self
-                .active_workers
-                .lock()
-                .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?;
-            if active.contains_key(&project.id) {
-                return Err(AppError::Internal("该项目已有 WISP 指令正在执行".into()));
-            }
-        }
+        let reservation = self.reserve_run(run_id, &project.id)?;
+        let isolated_output = format!("results/{run_id}");
+        let worker_prompt = isolated_worker_prompt(run_id, &isolated_output, prompt);
 
         let mut command = Command::new(&worker_path);
         command
@@ -336,6 +404,8 @@ impl WorkflowSupervisor {
             .env("WISP_API_URL", &settings.base_url)
             .env("WISP_MODEL", &settings.model)
             .env("WISP_API_KEY", api_key.expose_secret())
+            .env("WISP_RUN_ID", run_id)
+            .env("WISP_RUN_OUTPUT_DIR", &isolated_output)
             .env("WISP_APPROVAL_MODE", "safe")
             .env("WISP_RESTRICT_READS", "1")
             .env("WISP_MAX_ITER", "60")
@@ -423,14 +493,16 @@ impl WorkflowSupervisor {
 
         let turn_id = format!("turn-{}", Uuid::new_v4().simple());
         let worker = ActiveWorker {
+            project_id: project.id.clone(),
             stdin,
             turn_id: turn_id.clone(),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: reservation.cancelled.clone(),
         };
-        self.active_workers
-            .lock()
-            .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?
-            .insert(project.id.clone(), worker.clone());
+        if reservation.cancelled.load(Ordering::Acquire) {
+            let _ = child.kill().await;
+            return Err(AppError::Cancelled);
+        }
+        self.activate_run(run_id, worker.clone())?;
         if let Err(error) = self
             .send(
                 &worker,
@@ -438,15 +510,11 @@ impl WorkflowSupervisor {
                     "schema": WISP_RPC_SCHEMA,
                     "id": turn_id,
                     "type": "prompt",
-                    "prompt": prompt,
+                    "prompt": worker_prompt,
                 }),
             )
             .await
         {
-            self.active_workers
-                .lock()
-                .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?
-                .remove(&project.id);
             let _ = child.kill().await;
             return Err(error);
         }
@@ -670,10 +738,6 @@ impl WorkflowSupervisor {
                 }),
             )
             .await;
-        self.active_workers
-            .lock()
-            .map_err(|_| AppError::Internal("WISP 进程状态锁已损坏".into()))?
-            .remove(&project.id);
         if tokio::time::timeout(Duration::from_secs(3), child.wait())
             .await
             .is_err()
@@ -714,33 +778,9 @@ impl WorkflowSupervisor {
     }
 }
 
-fn quick_response(prompt: &str) -> Option<&'static str> {
-    let normalized = prompt
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    '!' | '?' | '.' | ',' | '！' | '？' | '。' | '，' | '~' | '～'
-                )
-        })
-        .to_lowercase();
-    matches!(
-        normalized.as_str(),
-        "hi"
-            | "hello"
-            | "hey"
-            | "hi there"
-            | "hello there"
-            | "你好"
-            | "您好"
-            | "嗨"
-            | "哈喽"
-            | "在吗"
-            | "你好呀"
-    )
-    .then_some(
-        "你好！我是稻芯智析的本地科研工作流助手。你可以让我读取当前项目 `input/` 中的数据，执行受控分析，并把结果写入 `results/` 与 `reports/`。",
+fn isolated_worker_prompt(run_id: &str, output_directory: &str, user_prompt: &str) -> String {
+    format!(
+        "[稻芯智析本地任务边界]\n任务 ID：{run_id}\n这是一个可与同项目其他任务并行的独立任务。读取项目文件时保持只读；新建结果默认写入 {output_directory}/，不得覆盖其他任务的输出。只有用户明确指定共享目标且完成冲突核对与操作审批后，才可以写入共享路径。\n\n[用户任务]\n{user_prompt}"
     )
 }
 
@@ -972,18 +1012,44 @@ mod tests {
     }
 
     #[test]
-    fn trivial_greetings_use_the_local_fast_path_without_capturing_real_tasks() {
-        for prompt in ["hi", " Hi! ", "你好", "您好！", "在吗？"] {
-            assert!(quick_response(prompt).is_some(), "{prompt}");
+    fn run_reservations_allow_controlled_parallel_tasks_and_release_on_drop() {
+        let supervisor = WorkflowSupervisor::new(Path::new("."));
+        let first = supervisor.reserve_run("run-1", "project-1").unwrap();
+        let second = supervisor.reserve_run("run-2", "project-1").unwrap();
+        let third = supervisor.reserve_run("run-3", "project-1").unwrap();
+        assert!(supervisor.reserve_run("run-4", "project-1").is_err());
+        drop(first);
+        assert!(supervisor.reserve_run("run-4", "project-1").is_ok());
+        drop((second, third));
+    }
+
+    #[test]
+    fn run_reservations_enforce_global_limit_and_unique_run_ids() {
+        let supervisor = WorkflowSupervisor::new(Path::new("."));
+        let mut reservations = Vec::new();
+        for index in 0..MAX_CONCURRENT_WORKFLOW_TASKS {
+            reservations.push(
+                supervisor
+                    .reserve_run(&format!("run-{index}"), &format!("project-{}", index / 3))
+                    .unwrap(),
+            );
         }
-        for prompt in [
-            "hi，请分析 input/counts.csv",
-            "你好，帮我运行 FastQC",
-            "解释 PCA",
-            "读取本地文件",
-        ] {
-            assert!(quick_response(prompt).is_none(), "{prompt}");
-        }
+        assert!(supervisor.reserve_run("run-overflow", "project-3").is_err());
+        assert!(supervisor.reserve_run("run-0", "project-0").is_err());
+        drop(reservations.pop());
+        assert!(supervisor.reserve_run("run-released", "project-3").is_ok());
+    }
+
+    #[test]
+    fn worker_prompt_keeps_user_request_and_assigns_an_isolated_output_directory() {
+        let prompt = isolated_worker_prompt(
+            "wfr_0123456789abcdef0123456789abcdef",
+            "results/wfr_0123456789abcdef0123456789abcdef",
+            "hi",
+        );
+        assert!(prompt.ends_with("[用户任务]\nhi"));
+        assert!(prompt.contains("不得覆盖其他任务的输出"));
+        assert!(prompt.contains("results/wfr_0123456789abcdef0123456789abcdef/"));
     }
 
     #[test]
