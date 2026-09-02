@@ -69,6 +69,7 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
   const [answer, setAnswer] = useState("");
   const [running, setRunning] = useState(false);
   const [reasoning, setReasoning] = useState(false);
+  const [progressMessage, setProgressMessage] = useState("");
   const [tools, setTools] = useState<ToolActivity[]>([]);
   const [approval, setApproval] = useState<Approval>();
   const [error, setError] = useState("");
@@ -97,12 +98,30 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
   }, []);
 
   useEffect(() => {
+    let active = true;
     setAnswer("");
     setTools([]);
     setApproval(undefined);
     setSelectedTurnId(undefined);
-    void refreshHistory().catch((reason) => setError(normalizeCommandError(reason).message));
-  }, [refreshHistory]);
+    setError("");
+    void listWorkflowAgentTurns(project.id)
+      .then((turns) => {
+        if (!active) return;
+        setHistory(turns);
+        const latest = turns.find((turn) => Boolean(turn.response));
+        if (latest) {
+          setSelectedTurnId(latest.id);
+          setAnswer(latest.response);
+          setError(latest.error || "");
+        }
+      })
+      .catch((reason) => {
+        if (active) setError(normalizeCommandError(reason).message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [project.id]);
 
   async function saveSettings(event: React.FormEvent) {
     event.preventDefault();
@@ -137,6 +156,7 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
     if (!prompt.trim() || running) return;
     setRunning(true);
     setReasoning(false);
+    setProgressMessage("正在启动并校验本地科研引擎…");
     setAnswer("");
     setTools([]);
     setError("");
@@ -144,24 +164,33 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
     channel.onmessage = (event) => {
       if (event.type === "text_delta") {
         setReasoning(false);
+        setProgressMessage("模型正在输出结果…");
         setAnswer((current) => current + event.delta);
+      } else if (event.type === "progress") {
+        setProgressMessage(event.message);
       } else if (event.type === "reasoning_active") {
         setReasoning(true);
+        setProgressMessage("模型正在规划科研任务…");
       } else if (event.type === "tool_started") {
+        setProgressMessage(`正在调用本地工具：${event.name}`);
         const id = event.call_id || `${event.name}-${Date.now()}`;
         setTools((current) => [...current, { id, name: event.name, preview: event.preview, status: "running" }]);
       } else if (event.type === "tool_finished") {
+        setProgressMessage("工具执行完成，正在核验结果…");
         setTools((current) => current.map((tool) => (
           tool.id === event.call_id || (!event.call_id && tool.name === event.name && tool.status === "running")
             ? { ...tool, status: event.ok ? "completed" : "failed", content: event.content }
             : tool
         )));
       } else if (event.type === "approval_required") {
+        setProgressMessage("工作流正在等待你的操作授权…");
         setApproval({ id: event.approval_id, message: event.message });
       } else if (event.type === "file_changed") {
         onFilesChanged();
       } else if (event.type === "engine_error") {
         setError(event.message);
+      } else if (event.type === "turn_completed") {
+        setProgressMessage("");
       }
     };
     try {
@@ -176,6 +205,7 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
     } finally {
       setRunning(false);
       setReasoning(false);
+      setProgressMessage("");
       setApproval(undefined);
     }
   }
@@ -217,7 +247,7 @@ export function WorkflowAgentPanel({ project, engine, onFilesChanged }: Props) {
 
       <div className="workflow-agent-transcript">
         {!answer && !running && <div className="workflow-agent-welcome"><Bot size={26} /><strong>让本地计算引擎处理科研文件</strong><p>例如：检查 input 目录中的 counts.csv，给出分析计划。执行写文件、Shell、Python 或 R 前会弹出审批。</p></div>}
-        {reasoning && <div className="workflow-agent-thinking"><LoaderCircle className="spin" size={15} />思考中…</div>}
+        {running && progressMessage && <div className="workflow-agent-thinking"><LoaderCircle className="spin" size={15} />{progressMessage}{reasoning && <small>思考中</small>}</div>}
         {tools.length > 0 && <div className="workflow-tool-list">{tools.map((tool) => <details key={tool.id} className={tool.status}><summary><TerminalSquare size={14} /><span>{tool.name}</span><small>{tool.status === "running" ? "执行中" : tool.status === "completed" ? "完成" : "失败"}</small></summary><p>{tool.preview}</p>{tool.content && <pre>{tool.content}</pre>}</details>)}</div>}
         {answer && <div className="workflow-agent-answer"><ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown></div>}
       </div>

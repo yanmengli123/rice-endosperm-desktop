@@ -106,6 +106,11 @@ pub enum WorkflowAgentEvent {
     TurnStarted {
         turn_id: String,
     },
+    Progress {
+        phase: String,
+        message: String,
+        elapsed_ms: u64,
+    },
     TextDelta {
         delta: String,
     },
@@ -223,4 +228,24 @@ pub struct WispRpcEnvelope {
     pub session_id: Option<String>,
     #[serde(flatten)]
     pub payload: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkflowAgentEvent;
+
+    #[test]
+    fn workflow_progress_event_matches_the_frontend_wire_contract() {
+        let value = serde_json::to_value(WorkflowAgentEvent::Progress {
+            phase: "waiting_model".into(),
+            message: "正在等待模型返回首个结果…".into(),
+            elapsed_ms: 5_000,
+        })
+        .expect("serialize progress event");
+
+        assert_eq!(value["type"], "progress");
+        assert_eq!(value["phase"], "waiting_model");
+        assert_eq!(value["message"], "正在等待模型返回首个结果…");
+        assert_eq!(value["elapsed_ms"], 5_000);
+    }
 }
