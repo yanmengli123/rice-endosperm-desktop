@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command},
     sync::Mutex as AsyncMutex,
-    time::Instant,
+    time::{Instant, MissedTickBehavior},
 };
 use uuid::Uuid;
 
@@ -37,7 +37,10 @@ const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_VISIBLE_TOOL_RESULT_BYTES: usize = 16 * 1024;
 const MAX_ACCUMULATED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_TURN_TIMEOUT_SECS: u64 = 2 * 60 * 60;
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3 * 60;
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30 * 60;
+const DEFAULT_FIRST_MODEL_EVENT_TIMEOUT_SECS: u64 = 2 * 60;
+const PROGRESS_HEARTBEAT_SECS: u64 = 5;
 const MIN_WORKFLOW_TIMEOUT_SECS: u64 = 30;
 const MAX_WORKFLOW_TIMEOUT_SECS: u64 = 4 * 60 * 60;
 
@@ -268,6 +271,45 @@ impl WorkflowSupervisor {
                 "工作流指令必须为 1–100000 个字符".into(),
             ));
         }
+        if let Some(response) = quick_response(prompt) {
+            let turn_id = format!("local-{}", Uuid::new_v4().simple());
+            let _ = channel.send(WorkflowAgentEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+            });
+            let _ = channel.send(WorkflowAgentEvent::Progress {
+                phase: "local_fast_path".into(),
+                message: "已由本地快速路由处理；无需启动模型和生信工具".into(),
+                elapsed_ms: 0,
+            });
+            let _ = channel.send(WorkflowAgentEvent::TextDelta {
+                delta: response.to_owned(),
+            });
+            let _ = channel.send(WorkflowAgentEvent::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+            });
+            let _ = channel.send(WorkflowAgentEvent::TurnCompleted {
+                ok: true,
+                error: None,
+            });
+            diagnostics::log(
+                "INFO",
+                "workflow_local_fast_path",
+                "trivial greeting completed without model or tool startup",
+            );
+            return Ok(WorkflowAgentCompletion {
+                turn_id,
+                text: response.to_owned(),
+                session_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                changed_paths: Vec::new(),
+            });
+        }
+        let turn_started_at = Instant::now();
+        emit_progress(channel, "starting_engine", turn_started_at);
         let resolved_worker = self.resolve_worker()?.ok_or_else(|| {
             AppError::Internal("未找到 WISP Sidecar，请先构建或安装本地工作流引擎".into())
         })?;
@@ -330,14 +372,25 @@ impl WorkflowSupervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 let mut count = 0_u64;
-                while matches!(lines.next_line().await, Ok(Some(_))) {
-                    count += 1;
+                let mut retries = 0_u64;
+                let mut errors = 0_u64;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    count = count.saturating_add(1);
+                    let normalized = line.to_ascii_lowercase();
+                    if normalized.contains("retry") {
+                        retries = retries.saturating_add(1);
+                    }
+                    if normalized.contains("error") || normalized.contains("failed") {
+                        errors = errors.saturating_add(1);
+                    }
                 }
                 if count > 0 {
                     diagnostics::log(
                         "INFO",
                         "workflow_worker_stderr",
-                        &format!("worker emitted {count} diagnostic lines; content suppressed"),
+                        &format!(
+                            "worker emitted {count} diagnostic lines (retries={retries}, errors={errors}); content suppressed"
+                        ),
                     );
                 }
             });
@@ -366,6 +419,7 @@ impl WorkflowSupervisor {
             model: payload_string(&ready, "model"),
             root: payload_string(&ready, "root"),
         });
+        emit_progress(channel, "waiting_model", turn_started_at);
 
         let turn_id = format!("turn-{}", Uuid::new_v4().simple());
         let worker = ActiveWorker {
@@ -405,12 +459,26 @@ impl WorkflowSupervisor {
         let mut input_tokens = 0_u64;
         let mut output_tokens = 0_u64;
         let mut reasoning_tokens = 0_u64;
-        let turn_started_at = Instant::now();
         let total_timeout =
             workflow_timeout("RICE_WORKFLOW_TURN_TIMEOUT_SECS", DEFAULT_TURN_TIMEOUT_SECS);
         let idle_timeout =
             workflow_timeout("RICE_WORKFLOW_IDLE_TIMEOUT_SECS", DEFAULT_IDLE_TIMEOUT_SECS);
+        let approval_timeout = workflow_timeout(
+            "RICE_WORKFLOW_APPROVAL_TIMEOUT_SECS",
+            DEFAULT_APPROVAL_TIMEOUT_SECS,
+        );
+        let first_model_event_timeout = workflow_timeout(
+            "RICE_WORKFLOW_FIRST_EVENT_TIMEOUT_SECS",
+            DEFAULT_FIRST_MODEL_EVENT_TIMEOUT_SECS,
+        );
         let total_deadline = turn_started_at + total_timeout;
+        let first_model_event_deadline = turn_started_at + first_model_event_timeout;
+        let mut last_worker_event_at = Instant::now();
+        let mut received_model_activity = false;
+        let mut phase = "waiting_model";
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(PROGRESS_HEARTBEAT_SECS));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        heartbeat.tick().await;
         let result = loop {
             let now = Instant::now();
             if now >= total_deadline {
@@ -419,40 +487,50 @@ impl WorkflowSupervisor {
                     total_timeout.as_secs()
                 )));
             }
-            let idle_deadline = now + idle_timeout;
-            let (read_deadline, timeout_message) = if total_deadline <= idle_deadline {
-                (
-                    total_deadline,
-                    format!(
-                        "WISP 工作流超过总时限（{} 秒），已安全终止；中间文件仍保留在项目目录",
-                        total_timeout.as_secs()
-                    ),
+            let effective_idle_timeout = if phase == "waiting_approval" {
+                approval_timeout
+            } else {
+                idle_timeout
+            };
+            let idle_deadline = last_worker_event_at + effective_idle_timeout;
+            let mut read_deadline = total_deadline.min(idle_deadline);
+            let mut timeout_message = if total_deadline <= idle_deadline {
+                format!(
+                    "WISP 工作流超过总时限（{} 秒），已安全终止；中间文件仍保留在项目目录",
+                    total_timeout.as_secs()
                 )
             } else {
-                (
-                    idle_deadline,
-                    format!(
-                        "WISP 工作流连续 {} 秒没有产生协议事件，已按卡死保护终止",
-                        idle_timeout.as_secs()
-                    ),
+                format!(
+                    "WISP 工作流连续 {} 秒没有产生协议事件，已按卡死保护终止",
+                    effective_idle_timeout.as_secs()
                 )
             };
-            let next_line = tokio::time::timeout_at(read_deadline, lines.next_line()).await;
-            let line = match next_line {
-                Err(_) => break Err(AppError::Protocol(timeout_message)),
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => break Err(AppError::Protocol("WISP 在完成指令前退出".into())),
-                Ok(Err(error)) => {
-                    break Err(AppError::Protocol(format!("WISP 流读取失败：{error}")));
+            if !received_model_activity && first_model_event_deadline < read_deadline {
+                read_deadline = first_model_event_deadline;
+                timeout_message = format!(
+                    "模型在 {} 秒内没有返回文本、推理或工具调用，已终止本轮；请检查模型服务、网络或 Base URL",
+                    first_model_event_timeout.as_secs()
+                );
+            }
+            let line = tokio::select! {
+                next_line = lines.next_line() => match next_line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break Err(AppError::Protocol("WISP 在完成指令前退出".into())),
+                    Err(error) => {
+                        break Err(AppError::Protocol(format!("WISP 流读取失败：{error}")));
+                    }
+                },
+                _ = tokio::time::sleep_until(read_deadline) => {
+                    break Err(AppError::Protocol(timeout_message));
+                },
+                _ = heartbeat.tick() => {
+                    emit_progress(channel, phase, turn_started_at);
+                    continue;
                 }
             };
-            // worker 在回合中可能输出空行（模型/工具路径的真实行为）；
-            // 空行不是协议帧，跳过而不是终止回合。
             if line.trim().is_empty() {
                 continue;
             }
-            // 防御纵深：worker stdout 上混入的非协议行（历史版本日志等）
-            // 记入诊断后跳过，不终止回合；协议纯度由 fork 的 stderr 日志保证。
             let event = match parse_frame(&line) {
                 Ok(event) => event,
                 Err(_) => {
@@ -464,6 +542,7 @@ impl WorkflowSupervisor {
                     continue;
                 }
             };
+            last_worker_event_at = Instant::now();
             if let (Some(previous), Some(current)) = (last_sequence, event.sequence)
                 && current <= previous
             {
@@ -473,11 +552,15 @@ impl WorkflowSupervisor {
             session_id = event.session_id.clone().or(session_id);
             match event.event_type.as_str() {
                 "turn_started" => {
+                    phase = "waiting_model";
                     let _ = channel.send(WorkflowAgentEvent::TurnStarted {
                         turn_id: worker.turn_id.clone(),
                     });
+                    emit_progress(channel, phase, turn_started_at);
                 }
                 "text" => {
+                    received_model_activity = true;
+                    phase = "streaming_answer";
                     let delta = payload_string(&event, "delta");
                     if text.len().saturating_add(delta.len()) > MAX_ACCUMULATED_TEXT_BYTES {
                         break Err(AppError::Protocol("WISP 回答超过 2 MB 安全上限".into()));
@@ -485,11 +568,19 @@ impl WorkflowSupervisor {
                     text.push_str(&delta);
                     let _ = channel.send(WorkflowAgentEvent::TextDelta { delta });
                 }
-                "reasoning" if !reasoning_announced => {
-                    reasoning_announced = true;
-                    let _ = channel.send(WorkflowAgentEvent::ReasoningActive);
+                "reasoning" => {
+                    received_model_activity = true;
+                    phase = "reasoning";
+                    if !reasoning_announced {
+                        reasoning_announced = true;
+                        let _ = channel.send(WorkflowAgentEvent::ReasoningActive);
+                        emit_progress(channel, phase, turn_started_at);
+                    }
                 }
                 "tool_call" => {
+                    received_model_activity = true;
+                    phase = "running_tool";
+                    emit_progress(channel, phase, turn_started_at);
                     let _ = channel.send(WorkflowAgentEvent::ToolStarted {
                         call_id: payload_optional_string(&event, "call_id"),
                         name: payload_string(&event, "name"),
@@ -497,6 +588,7 @@ impl WorkflowSupervisor {
                     });
                 }
                 "tool_result" => {
+                    phase = "verifying_result";
                     let content = truncate_utf8(
                         &payload_string(&event, "content"),
                         MAX_VISIBLE_TOOL_RESULT_BYTES,
@@ -508,12 +600,20 @@ impl WorkflowSupervisor {
                         content,
                         duration_ms: payload_u64(&event, "duration_ms"),
                     });
+                    emit_progress(channel, phase, turn_started_at);
                 }
                 "approval_required" => {
+                    received_model_activity = true;
+                    phase = "waiting_approval";
                     let _ = channel.send(WorkflowAgentEvent::ApprovalRequired {
                         approval_id: payload_string(&event, "approval_id"),
                         message: payload_string(&event, "message"),
                     });
+                    emit_progress(channel, phase, turn_started_at);
+                }
+                "approval_response_accepted" => {
+                    phase = "running_tool";
+                    emit_progress(channel, phase, turn_started_at);
                 }
                 "file_changed" => {
                     let path = payload_string(&event, "path");
@@ -591,6 +691,17 @@ impl WorkflowSupervisor {
             });
         }
         result?;
+        diagnostics::log(
+            "INFO",
+            "workflow_turn_completed",
+            &format!(
+                "elapsed_ms={} input_tokens={} output_tokens={} changed_paths={}",
+                turn_started_at.elapsed().as_millis(),
+                input_tokens,
+                output_tokens,
+                changed_paths.len()
+            ),
+        );
         Ok(WorkflowAgentCompletion {
             turn_id: worker.turn_id,
             text,
@@ -601,6 +712,58 @@ impl WorkflowSupervisor {
             changed_paths: changed_paths.into_iter().collect(),
         })
     }
+}
+
+fn quick_response(prompt: &str) -> Option<&'static str> {
+    let normalized = prompt
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '!' | '?' | '.' | ',' | '！' | '？' | '。' | '，' | '~' | '～'
+                )
+        })
+        .to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi"
+            | "hello"
+            | "hey"
+            | "hi there"
+            | "hello there"
+            | "你好"
+            | "您好"
+            | "嗨"
+            | "哈喽"
+            | "在吗"
+            | "你好呀"
+    )
+    .then_some(
+        "你好！我是稻芯智析的本地科研工作流助手。你可以让我读取当前项目 `input/` 中的数据，执行受控分析，并把结果写入 `results/` 与 `reports/`。",
+    )
+}
+
+fn emit_progress(channel: &Channel<WorkflowAgentEvent>, phase: &str, started_at: Instant) {
+    let message = match phase {
+        "starting_engine" => "正在启动并校验本地科研引擎…",
+        "waiting_model" => "本地引擎已就绪，正在等待模型响应…",
+        "reasoning" => "模型正在规划科研任务…",
+        "streaming_answer" => "模型正在输出结果…",
+        "running_tool" => "正在调用本地科研工具…",
+        "verifying_result" => "工具执行完成，正在核验结果…",
+        "waiting_approval" => "工作流正在等待你的操作授权…",
+        _ => "科研工作流正在运行…",
+    };
+    let _ = channel.send(WorkflowAgentEvent::Progress {
+        phase: phase.to_owned(),
+        message: message.into(),
+        elapsed_ms: started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    });
 }
 
 fn resource_tree_digest(resource_root: &Path) -> AppResult<String> {
@@ -806,6 +969,21 @@ mod tests {
         assert_eq!(bounded_timeout_secs(Some("999999"), 90).as_secs(), 14_400);
         assert_eq!(bounded_timeout_secs(Some("invalid"), 90).as_secs(), 90);
         assert_eq!(bounded_timeout_secs(None, 90).as_secs(), 90);
+    }
+
+    #[test]
+    fn trivial_greetings_use_the_local_fast_path_without_capturing_real_tasks() {
+        for prompt in ["hi", " Hi! ", "你好", "您好！", "在吗？"] {
+            assert!(quick_response(prompt).is_some(), "{prompt}");
+        }
+        for prompt in [
+            "hi，请分析 input/counts.csv",
+            "你好，帮我运行 FastQC",
+            "解释 PCA",
+            "读取本地文件",
+        ] {
+            assert!(quick_response(prompt).is_none(), "{prompt}");
+        }
     }
 
     #[test]

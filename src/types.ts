@@ -95,6 +95,7 @@ export type WorkflowAgentTurn = {
 export type WorkflowAgentEvent =
   | { type: "engine_ready"; protocol: string; model: string; root: string }
   | { type: "turn_started"; turn_id: string }
+  | { type: "progress"; phase: string; message: string; elapsed_ms: number }
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_active" }
   | { type: "tool_started"; call_id?: string; name: string; preview: string }
