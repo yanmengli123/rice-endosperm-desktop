@@ -192,25 +192,26 @@ export const runWorkflowAgent = (
   projectId: string,
   prompt: string,
   onEvent: Channel<WorkflowAgentEvent>,
+  runId?: string,
 ) => invoke<WorkflowAgentCompletion>("run_workflow_agent", {
-  request: { projectId, prompt },
+  request: { projectId, prompt, runId },
   onEvent,
 });
 
 export const respondWorkflowApproval = (
-  projectId: string,
+  runId: string,
   approvalId: string,
   approved: boolean,
   feedback?: string,
 ) => invoke<void>("respond_workflow_approval", {
-  projectId,
+  runId,
   approvalId,
   approved,
   feedback,
 });
 
-export const cancelWorkflowAgent = (projectId: string) =>
-  invoke<boolean>("cancel_workflow_agent", { projectId });
+export const cancelWorkflowAgent = (runId: string) =>
+  invoke<boolean>("cancel_workflow_agent", { runId });
 
 export function normalizeCommandError(
   error: unknown,

@@ -153,6 +153,8 @@ pub enum WorkflowAgentEvent {
 pub struct WorkflowAgentRequest {
     pub project_id: String,
     pub prompt: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
