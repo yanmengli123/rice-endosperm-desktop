@@ -1,7 +1,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
 import { cancelRun, normalizeCommandError, sendMessage } from "../services/tauri-client";
-import type { ChatCompletion, RunEvent } from "../types";
+import type { ChatCompletion, RunEvent, TraceEvent } from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { YUXI_ATTACHMENT_PART_NAME } from "./yuxi-attachment-adapter";
 import type { PendingChatAttachment } from "../types";
@@ -9,6 +9,8 @@ import type { PendingChatAttachment } from "../types";
 type AdapterCallbacks = {
   onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
   onCompleted?: (completion: ChatCompletion) => void;
+  /** 执行轨迹事件（yuxi.run-trace.v1 wire 原样透传），由 UI 层投影渲染。 */
+  onTraceEvent?: (event: TraceEvent) => void;
   bridgeAttachment?: PendingChatAttachment;
   onBridgeConsumed?: () => void;
 };
@@ -147,6 +149,8 @@ export function createYuxiAdapter(
           } else if (event.type === "text") {
             accumulatedText = sanitizeVisibleModelText(event.text);
             yield { content: [{ type: "text", text: accumulatedText }] };
+          } else if (event.type === "trace") {
+            callbacks.onTraceEvent?.(event.trace);
           } else if (event.type === "done") {
             sawDone = true;
             doneStatus = event.status;

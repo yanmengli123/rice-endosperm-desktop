@@ -1008,3 +1008,133 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .workflow-agent-console { grid-template-columns: 190px minmax(0, 1fr); }
   .workflow-agent-header-actions { width: 100%; justify-content: flex-end; }
 }
+
+/* ===== 本轮执行轨迹时间线（yuxi.run-trace.v1）===== */
+.trace-timeline {
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--gray-200, #e5e7eb);
+  border-radius: 10px;
+  background: var(--gray-50, #fafafa);
+  font-size: 13px;
+}
+
+.trace-timeline-summary {
+  color: var(--gray-600, #4b5563);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.trace-timeline-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.trace-span-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 3px 4px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 13px;
+  color: var(--gray-800, #1f2937);
+  border-radius: 6px;
+  cursor: default;
+}
+
+.trace-span-row.is-expandable {
+  cursor: pointer;
+}
+
+.trace-span-row.is-expandable:hover {
+  background: var(--gray-100, #f3f4f6);
+}
+
+.trace-span-status {
+  display: inline-flex;
+  color: var(--gray-500, #6b7280);
+}
+
+.trace-span-row .spin {
+  color: var(--blue-600, #2563eb);
+  animation: spin 1s linear infinite;
+}
+
+.trace-span-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-span-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--amber-600, #d97706);
+}
+
+.trace-span-duration {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--gray-500, #6b7280);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-span-chevron {
+  flex-shrink: 0;
+  color: var(--gray-400, #9ca3af);
+  transition: transform 0.15s ease;
+}
+
+.trace-span-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+.trace-span-detail {
+  margin: 0 4px 6px 26px;
+  padding: 6px 9px;
+  background: var(--gray-100, #f3f4f6);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.trace-span-detail-line {
+  font-size: 12px;
+  color: var(--gray-600, #4b5563);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.trace-attr-key {
+  color: var(--gray-500, #6b7280);
+  margin-right: 6px;
+}
+
+.trace-attr-key::after {
+  content: ":";
+}
+
+.trace-ok {
+  color: var(--green-600, #16a34a);
+}
+
+.trace-err {
+  color: var(--red-600, #dc2626);
+}
+
+.trace-warn {
+  color: var(--amber-600, #d97706);
+}
+
+.trace-span-children {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--gray-200, #e5e7eb);
+  margin-left: 11px;
+}

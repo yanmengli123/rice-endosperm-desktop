@@ -13,12 +13,12 @@ use tauri::Manager;
 
 use commands::{
     cancel_run, create_thread, delete_api_key, delete_thread, get_chat_model_preference,
-    get_public_settings, get_thread_run_context, import_model_configuration, list_accounts,
-    list_byok_credentials, list_chat_models, list_threads, load_messages, parse_chat_attachment,
-    remove_account, remove_byok_credential, rename_thread, save_byok_credential, save_connection,
-    save_connection_with_login, save_custom_model_credential, send_message,
-    set_chat_model_preference, switch_account, sync_pending_runs, test_connection,
-    upload_chat_attachment,
+    get_public_settings, get_run_trace, get_run_trace_events, get_thread_run_context,
+    import_model_configuration, list_accounts, list_byok_credentials, list_chat_models,
+    list_threads, load_messages, parse_chat_attachment, remove_account, remove_byok_credential,
+    rename_thread, save_byok_credential, save_connection, save_connection_with_login,
+    save_custom_model_credential, send_message, set_chat_model_preference, switch_account,
+    sync_pending_runs, test_connection, upload_chat_attachment,
 };
 use state::AppState;
 use workflow::{
@@ -67,6 +67,8 @@ pub fn run() {
             list_threads,
             load_messages,
             get_thread_run_context,
+            get_run_trace,
+            get_run_trace_events,
             sync_pending_runs,
             rename_thread,
             delete_thread,

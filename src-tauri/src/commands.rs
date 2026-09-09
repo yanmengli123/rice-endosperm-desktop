@@ -115,8 +115,6 @@ pub struct PendingRunSync {
 }
 
 #[derive(Debug, Clone, Serialize)]
-// rename_all 只作用于 enum 变体名；字段名必须用 rename_all_fields 才会输出
-// camelCase，否则前端读到的 runId/eventId 恒为 undefined。
 #[serde(
     tag = "type",
     rename_all = "snake_case",
@@ -135,6 +133,11 @@ pub enum RunEvent {
     Text {
         text: String,
         event_id: Option<String>,
+    },
+    Trace {
+        run_id: String,
+        /// yuxi.run-trace.v1 wire 事件原样透传，前端负责投影与渲染。
+        trace: Value,
     },
     Done {
         run_id: String,
@@ -531,6 +534,60 @@ pub async fn sync_pending_runs(state: State<'_, AppState>) -> Result<PendingRunS
         .map_err(CommandError::from)
 }
 
+/// 获取指定 run 的执行轨迹快照；供 UI 在终态后或重启恢复时渲染权威投影。
+#[tauri::command]
+pub async fn get_run_trace(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Value, CommandError> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(CommandError::from(AppError::Protocol(
+            "run_id 不能为空".into(),
+        )));
+    }
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .trace_snapshot(&gateway_url, &bearer, &run_id)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_run_trace_events(
+    run_id: String,
+    after_sequence: u64,
+    state: State<'_, AppState>,
+) -> Result<Value, CommandError> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(CommandError::from(AppError::Protocol(
+            "run_id 不能为空".into(),
+        )));
+    }
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .trace_events(&gateway_url, &bearer, &run_id, after_sequence)
+        .await
+        .map_err(CommandError::from)
+}
+
 async fn sync_pending_runs_inner(state: &AppState) -> AppResult<PendingRunSync> {
     let pending_runs = state.database.list_pending_runs().await?;
     if pending_runs.is_empty() {
@@ -886,6 +943,20 @@ async fn send_message_inner(
                         .get("thread_id")
                         .and_then(Value::as_str)
                         .is_none_or(|thread_id| thread_id == created.thread_id);
+                    // 执行轨迹帧（SSE event: trace）：整帧透传给前端投影，
+                    // 不参与文本累积与终态判定。
+                    if event.event == "trace" {
+                        if let Some(trace) = extract_run_trace_event(&value, &created.run_id) {
+                            send_channel(
+                                on_event,
+                                RunEvent::Trace {
+                                    run_id: created.run_id.clone(),
+                                    trace,
+                                },
+                            )?;
+                        }
+                        continue;
+                    }
                     if belongs_to_parent_thread && let Some(message) = run_progress_message(&value)
                     {
                         send_channel(
@@ -1211,6 +1282,17 @@ fn run_progress_message(value: &Value) -> Option<&str> {
         .then(|| chunk.get("message").and_then(Value::as_str))
         .flatten()
         .filter(|message| !message.trim().is_empty())
+}
+
+/// 从 SSE `event: trace` 帧中提取属于当前 run 的 wire 事件；
+/// 形状不符或 run_id 不匹配（防御未来跨 run 混流）时返回 None。
+fn extract_run_trace_event(value: &Value, run_id: &str) -> Option<Value> {
+    let trace = value.pointer("/payload/trace")?;
+    if trace.get("run_id").and_then(Value::as_str) != Some(run_id) {
+        return None;
+    }
+    trace.get("sequence").and_then(Value::as_i64)?;
+    Some(trace.clone())
 }
 
 fn error_is_reconnectable(error: &AppError) -> bool {
@@ -1546,9 +1628,58 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunEvent, SendMessageRequest, is_reasoning_protocol_failure, local_account_scope,
-        remote_principal_for_scope, run_progress_message, validate_send_request,
+        RunEvent, SendMessageRequest, extract_run_trace_event, is_reasoning_protocol_failure,
+        local_account_scope, remote_principal_for_scope, run_progress_message,
+        validate_send_request,
     };
+    use serde_json::json;
+
+    #[test]
+    fn trace_event_serializes_with_camel_case_wrapper_and_raw_wire_payload() {
+        // RunEvent::Trace 外壳字段是 camelCase；trace 载荷是服务端 wire
+        // 原样透传（snake_case），前端投影按 wire 字段解析。
+        let value = serde_json::to_value(RunEvent::Trace {
+            run_id: "run-1".into(),
+            trace: json!({
+                "schema_version": "yuxi.run-trace.v1",
+                "sequence": 7,
+                "run_id": "run-1",
+                "category": "TOOL",
+                "event_type": "tool.execution.completed",
+                "span_id": "tool-1",
+                "duration_ms": 812
+            }),
+        })
+        .expect("serialize trace");
+        assert_eq!(value["type"], "trace");
+        assert_eq!(value["runId"], "run-1");
+        assert_eq!(value["trace"]["event_type"], "tool.execution.completed");
+        assert_eq!(value["trace"]["sequence"], 7);
+    }
+
+    #[test]
+    fn extract_run_trace_event_filters_by_run_id_and_shape() {
+        let frame = json!({
+            "run_id": "run-1",
+            "event": "trace",
+            "payload": {
+                "trace": {
+                    "sequence": 3,
+                    "run_id": "run-1",
+                    "category": "MODEL",
+                    "event_type": "model.generation.started"
+                }
+            }
+        });
+        let extracted = extract_run_trace_event(&frame, "run-1").expect("match run");
+        assert_eq!(extracted["sequence"], 3);
+        // 其他 run 的 trace 帧（未来跨 run 混流防御）与缺 sequence 的畸形帧都拒绝
+        assert!(extract_run_trace_event(&frame, "run-other").is_none());
+        let malformed = json!({"payload": {"trace": {"run_id": "run-1"}}});
+        assert!(extract_run_trace_event(&malformed, "run-1").is_none());
+        let missing = json!({"payload": {}});
+        assert!(extract_run_trace_event(&missing, "run-1").is_none());
+    }
 
     #[test]
     fn run_events_serialize_fields_as_camel_case() {

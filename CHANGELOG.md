@@ -1,5 +1,14 @@
 # 更新日志
 
+## 0.4.8（2026-09-09）
+
+- 接入 AgentRun 事实型执行轨迹（`yuxi.run-trace.v1`，协议 1.4）：问答过程在本轮时间线中如实展示模型生成、工具/子智能体与知识检索——真实发生什么显示什么，纯问候不再出现未发生的检索或工具步骤。
+- Rust 侧识别独立轨迹流（SSE `trace` 帧）与消息流隔离；按 run_id 过滤跨 run 混流帧，旧版本二进制对新帧安全跳过；新增 `get_run_trace` / `get_run_trace_events` 命令对接服务端快照与 `after_sequence` 缺口补拉。
+- 桌面时间线（TraceTimeline）：树状 span（运行/模型/工具/知识检索）三态展示、可展开详情（模型与 token、检索计数、错误类型）；执行中实时推进，终态后以服务端权威快照刷新；重载历史会话可恢复最近一轮完整轨迹。
+- 恢复语义与 Web 端一致：sequence 单调幂等去重、缺口缓冲后单飞补拉、快照仅在投影水位不落后时覆盖；worker 失联收敛为 `span.interrupted`（worker_lost），不再出现永久"运行中"。
+- 隐私与安全：轨迹仅含事实摘要与引用（resource_refs），不含模型思维链、系统提示词、工具参数原文（服务端仅存 sha256 摘要）；token 计费权威仍在服务端 usage_ledger，界面数值仅作过程展示。
+- 测试：前端 59/59 通过（含新增 traceProjection 投影测试）；TypeScript + Vite 生产构建、cargo fmt 通过；Rust clippy/cargo test 由 Windows CI 执行（本机 MSVC 工具链不可用）。
+
 ## 0.4.7（2026-09-02）
 
 - 多任务起跑：同项目最多 3 个并行任务，本机全局最多 6 个；每个任务独立 run_id，审批、取消、流式事件不串任务；默认输出隔离到 results/<run_id>/。
