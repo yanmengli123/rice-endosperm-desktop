@@ -1291,9 +1291,7 @@ fn extract_run_trace_event(value: &Value, run_id: &str) -> Option<Value> {
     if trace.get("run_id").and_then(Value::as_str) != Some(run_id) {
         return None;
     }
-    if trace.get("sequence").and_then(Value::as_i64).is_none() {
-        return None;
-    }
+    trace.get("sequence").and_then(Value::as_i64)?;
     Some(trace.clone())
 }
 
