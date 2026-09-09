@@ -542,7 +542,7 @@ pub async fn get_run_trace(
 ) -> Result<Value, CommandError> {
     let run_id = run_id.trim().to_string();
     if run_id.is_empty() {
-        return Err(CommandError::from(AppError::Validation(
+        return Err(CommandError::from(AppError::Protocol(
             "run_id 不能为空".into(),
         )));
     }
@@ -569,7 +569,7 @@ pub async fn get_run_trace_events(
 ) -> Result<Value, CommandError> {
     let run_id = run_id.trim().to_string();
     if run_id.is_empty() {
-        return Err(CommandError::from(AppError::Validation(
+        return Err(CommandError::from(AppError::Protocol(
             "run_id 不能为空".into(),
         )));
     }
