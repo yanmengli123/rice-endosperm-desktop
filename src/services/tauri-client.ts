@@ -12,6 +12,8 @@ import type {
   ServerRunContext,
   SendMessageRequest,
   ThreadSummary,
+  TraceSnapshot,
+  TraceEventPage,
   WorkflowArtifact,
   WorkflowEngineStatus,
   WorkflowAgentCompletion,
@@ -55,6 +57,12 @@ export const loadMessages = (threadId: string) =>
 
 export const getThreadRunContext = (threadId: string) =>
   invoke<ServerRunContext | null>("get_thread_run_context", { threadId });
+
+export const getRunTrace = (runId: string) =>
+  invoke<TraceSnapshot>("get_run_trace", { runId });
+
+export const getRunTraceEvents = (runId: string, afterSequence: number) =>
+  invoke<TraceEventPage>("get_run_trace_events", { runId, afterSequence });
 
 export const syncPendingRuns = () =>
   invoke<PendingRunSync>("sync_pending_runs");

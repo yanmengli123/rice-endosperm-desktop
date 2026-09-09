@@ -590,6 +590,60 @@ impl YuxiClient {
         Ok(parse_run_result(&value))
     }
 
+    /// 获取 run 执行轨迹快照（summary + spans + snapshot_sequence）。
+    /// 桌面端在终态后或重启恢复时拉取，作为实时 trace 帧的权威投影。
+    pub async fn trace_snapshot(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        run_id: &str,
+    ) -> AppResult<Value> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}/api/agent/runs/{run_id}/trace"), api_key)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
+            return Err(AppError::Protocol("轨迹快照响应缺少 run_id".into()));
+        }
+        Ok(value)
+    }
+
+    pub async fn trace_events(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        run_id: &str,
+        after_sequence: u64,
+    ) -> AppResult<Value> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(
+                &format!(
+                    "{base}/api/agent/runs/{run_id}/trace/events?after_sequence={after_sequence}&limit=500"
+                ),
+                api_key,
+            )
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let value = ensure_success(response)
+            .await?
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
+            return Err(AppError::Protocol("轨迹事件响应缺少 run_id".into()));
+        }
+        Ok(value)
+    }
+
     pub async fn cancel_run(
         &self,
         gateway_url: &str,

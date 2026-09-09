@@ -248,4 +248,81 @@ export type RunEvent =
   | { type: "started"; runId: string; threadId: string; requestId: string }
   | { type: "status"; status: string; message: string }
   | { type: "text"; text: string; eventId?: string }
+  | { type: "trace"; runId: string; trace: TraceEvent }
   | { type: "done"; runId: string; status: string; text: string; context: ServerRunContext };
+
+/** yuxi.run-trace.v1 wire 事件（Rust 侧 Value 原样透传，保持服务端 snake_case）。 */
+export type TraceEvent = {
+  schema_version?: string;
+  event_id?: string;
+  trace_id?: string;
+  sequence: number;
+  run_id?: string;
+  thread_id?: string;
+  category: string;
+  operation: string;
+  event_type: string;
+  span_id?: string;
+  parent_span_id?: string;
+  occurred_at?: string;
+  duration_ms?: number | null;
+  title?: string | null;
+  summary?: string | null;
+  message_key?: string | null;
+  display_args?: Record<string, unknown>;
+  attributes?: Record<string, unknown>;
+  resource_refs?: { type: string; id: string }[];
+  visibility?: string;
+};
+
+export type TraceSpan = {
+  span_id: string;
+  parent_span_id?: string | null;
+  category: string;
+  operation?: string;
+  title?: string | null;
+  summary?: string | null;
+  message_key?: string | null;
+  display_args?: Record<string, unknown>;
+  visibility?: string;
+  status: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  error_type?: string | null;
+  retry_count?: number;
+  attributes?: Record<string, unknown>;
+};
+
+export type TraceSummary = {
+  run_id?: string;
+  status?: string | null;
+  agent_slug?: string | null;
+  duration_ms?: number | null;
+  ttft_ms?: number | null;
+  total_tokens?: number | null;
+  model_calls?: number;
+  tool_calls?: number;
+  mcp_calls?: number;
+  knowledge_calls?: number;
+  subagent_calls?: number;
+  skill_count?: number;
+  retry_count?: number;
+  error_count?: number;
+};
+
+export type TraceSnapshot = {
+  run_id: string;
+  summary: TraceSummary | null;
+  spans: TraceSpan[];
+  snapshot_sequence: number;
+  projection_sequence: number;
+};
+
+export type TraceEventPage = {
+  run_id: string;
+  events: TraceEvent[];
+  next_after_sequence: number;
+  scanned_through_sequence: number;
+  has_more: boolean;
+};

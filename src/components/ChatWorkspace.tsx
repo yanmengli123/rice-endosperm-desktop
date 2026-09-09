@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActionBarPrimitive,
   AssistantRuntimeProvider,
@@ -18,10 +18,19 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
-import type { ChatCompletion, LocalMessage, PendingChatAttachment } from "../types";
+import { getRunTrace, getRunTraceEvents } from "../services/tauri-client";
+import type { ChatCompletion, LocalMessage, PendingChatAttachment, TraceEvent } from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { normalizeRichAnswer } from "../utils/rich-answer";
+import {
+  applyTraceEvent,
+  applyTraceSnapshot,
+  createTraceState,
+  findLatestTraceRunId,
+  type TraceState,
+} from "../utils/traceProjection";
 import { CodeHeader, HtmlFencedCodeBlock, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
+import { TraceTimeline } from "./TraceTimeline";
 import { YuxiAttachmentAdapter } from "../runtime/yuxi-attachment-adapter";
 
 type Props = {
@@ -228,17 +237,125 @@ function Composer({ bridgeAttachment, onBridgeConsumed }: Pick<Props, "bridgeAtt
 
 function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed }: Props) {
   const attachmentAdapter = useMemo(() => new YuxiAttachmentAdapter(), []);
+  // 执行轨迹：实时 trace 帧应用 + 终态后用服务端快照刷新权威投影
+  const [trace, setTrace] = useState<TraceState>(createTraceState);
+  const [activeTraceRunId, setActiveTraceRunId] = useState<string | null>(null);
+  const traceCursor = useRef(0);
+  const restoredHistoricalRunId = useRef<string | null>(null);
+  const historicalTraceRunId = useMemo(() => findLatestTraceRunId(messages), [messages]);
+  const cloneTrace = useCallback((current: TraceState): TraceState => ({
+    ...current,
+    spans: Object.fromEntries(
+      Object.entries(current.spans).map(([key, span]) => [key, { ...span, attributes: { ...span.attributes } }]),
+    ),
+  }), []);
+  const handleTraceEvent = useCallback((event: TraceEvent) => {
+    setTrace((current) => {
+      const base =
+        event.run_id && current.runId !== event.run_id
+          ? { ...createTraceState(), runId: event.run_id }
+          : cloneTrace(current);
+      applyTraceEvent(base, event);
+      return base;
+    });
+  }, [cloneTrace]);
+  const refreshTraceSnapshot = useCallback((runId: string) => {
+    getRunTrace(runId)
+      .then((snapshot) =>
+        setTrace((current) => {
+          // A late terminal snapshot from the previous request must never
+          // overwrite a newer run already visible in the same conversation.
+          if (current.runId && current.runId !== runId) return current;
+          const next = cloneTrace(current);
+          applyTraceSnapshot(next, snapshot);
+          traceCursor.current = next.scannedThroughSequence;
+          return next;
+        }),
+      )
+      .catch(() => undefined);
+  }, [cloneTrace]);
+
+  useEffect(() => {
+    if (
+      !historicalTraceRunId
+      || activeTraceRunId
+      || restoredHistoricalRunId.current === historicalTraceRunId
+    ) return;
+    restoredHistoricalRunId.current = historicalTraceRunId;
+    setTrace((current) =>
+      current.runId === historicalTraceRunId
+        ? current
+        : { ...createTraceState(), runId: historicalTraceRunId },
+    );
+    // If a new run starts before this request resolves, refreshTraceSnapshot's
+    // run-id guard rejects the late historical response.
+    refreshTraceSnapshot(historicalTraceRunId);
+  }, [activeTraceRunId, historicalTraceRunId, refreshTraceSnapshot]);
+
+  useEffect(() => {
+    if (!activeTraceRunId) return undefined;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const page = await getRunTraceEvents(activeTraceRunId, traceCursor.current);
+        if (stopped) return;
+        setTrace((current) => {
+          const next = current.runId === activeTraceRunId
+            ? cloneTrace(current)
+            : { ...createTraceState(), runId: activeTraceRunId };
+          [...(page.events ?? [])]
+            .sort((left, right) => Number(left.sequence) - Number(right.sequence))
+            .forEach((event) => applyTraceEvent(next, event));
+          next.scannedThroughSequence = Math.max(
+            next.scannedThroughSequence,
+            Number(page.scanned_through_sequence ?? page.next_after_sequence) || 0,
+          );
+          traceCursor.current = next.scannedThroughSequence;
+          return next;
+        });
+        timer = setTimeout(poll, page.has_more ? 0 : 750);
+      } catch {
+        if (!stopped) timer = setTimeout(poll, 1500);
+      }
+    };
+    traceCursor.current = 0;
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeTraceRunId, cloneTrace]);
   const adapter = useMemo(
     () =>
       createYuxiAdapter(threadId, {
         // 附带本组件的 threadId，让上层能区分完成事件来自哪个会话
         //（切换会话后旧 run 的迟到回调不应污染新会话状态）。
-        onRunState: (state) => onRunState(state, threadId),
-        onCompleted: (completion) => onCompleted(completion, threadId),
+        onRunState: (state) => {
+          onRunState(state, threadId);
+          if (state.runId && state.status === "running") {
+            traceCursor.current = 0;
+            setTrace((current) =>
+              current.runId === state.runId
+                ? current
+                : { ...createTraceState(), runId: state.runId ?? null },
+            );
+            setActiveTraceRunId(state.runId);
+          }
+          if (["completed", "failed", "cancelled", "interrupted"].includes(state.status)) {
+            setActiveTraceRunId(null);
+            if (state.runId) refreshTraceSnapshot(state.runId);
+          }
+        },
+        onCompleted: (completion) => {
+          onCompleted(completion, threadId);
+          if (completion.runId) refreshTraceSnapshot(completion.runId);
+        },
+        onTraceEvent: handleTraceEvent,
         bridgeAttachment,
         onBridgeConsumed,
       }),
-    [threadId, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed],
+    [threadId, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed, handleTraceEvent, refreshTraceSnapshot],
   );
   const runtime = useLocalRuntime(adapter, {
     initialMessages: toInitialMessages(messages),
@@ -251,6 +368,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
         <ThreadPrimitive.Viewport className="thread-viewport">
           <Welcome />
           <ThreadPrimitive.Messages components={{ Message: ChatMessage }} />
+          <TraceTimeline trace={trace} />
           <AuiIf condition={(state) => state.thread.isRunning}>
             <div className="thinking-status" role="status" aria-live="polite">
               <LoaderCircle size={16} />
