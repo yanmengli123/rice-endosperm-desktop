@@ -242,6 +242,10 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
   const [activeTraceRunId, setActiveTraceRunId] = useState<string | null>(null);
   const traceCursor = useRef(0);
   const restoredHistoricalRunId = useRef<string | null>(null);
+  // 人工审批续跑：最近一个 interrupted run。下一次发送（用户批复）以 resume
+  // 载荷续跑该 run；ref 供 adapter 取值并清除，state 仅驱动提示条渲染。
+  const pendingResumeRunIdRef = useRef<string | null>(null);
+  const [pendingResumeRunId, setPendingResumeRunId] = useState<string | null>(null);
   const historicalTraceRunId = useMemo(() => findLatestTraceRunId(messages), [messages]);
   const cloneTrace = useCallback((current: TraceState): TraceState => ({
     ...current,
@@ -314,7 +318,9 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           traceCursor.current = next.scannedThroughSequence;
           return next;
         });
-        timer = setTimeout(poll, page.has_more ? 0 : 750);
+        // has_more 时也保持最小 150ms 轮询间隔：0ms 紧循环会撞网关 240/60s
+        // 限流，并放大会话刷新的并发竞态（与刷新单飞同版本发布）。
+        timer = setTimeout(poll, page.has_more ? 150 : 750);
       } catch {
         if (!stopped) timer = setTimeout(poll, 1500);
       }
@@ -335,12 +341,21 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           onRunState(state, threadId);
           if (state.runId && state.status === "running") {
             traceCursor.current = 0;
+            pendingResumeRunIdRef.current = null;
+            setPendingResumeRunId(null);
             setTrace((current) =>
               current.runId === state.runId
                 ? current
                 : { ...createTraceState(), runId: state.runId ?? null },
             );
             setActiveTraceRunId(state.runId);
+          }
+          if (state.status === "interrupted" && state.runId) {
+            pendingResumeRunIdRef.current = state.runId;
+            setPendingResumeRunId(state.runId);
+          } else if (["completed", "failed", "cancelled"].includes(state.status)) {
+            pendingResumeRunIdRef.current = null;
+            setPendingResumeRunId(null);
           }
           if (["completed", "failed", "cancelled", "interrupted"].includes(state.status)) {
             setActiveTraceRunId(null);
@@ -354,6 +369,12 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
         onTraceEvent: handleTraceEvent,
         bridgeAttachment,
         onBridgeConsumed,
+        consumeResumeRunId: () => {
+          const pending = pendingResumeRunIdRef.current ?? undefined;
+          pendingResumeRunIdRef.current = null;
+          setPendingResumeRunId(null);
+          return pending;
+        },
       }),
     [threadId, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed, handleTraceEvent, refreshTraceSnapshot],
   );
@@ -379,6 +400,25 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
             <ArrowDown size={18} />
           </ThreadPrimitive.ScrollToBottom>
           <ThreadPrimitive.ViewportFooter className="thread-footer">
+            {pendingResumeRunId && (
+              <div className="resume-banner" role="status">
+                <FlaskConical size={16} />
+                <span>
+                  本次运行在「等待人工确认」处暂停。在下方输入你的批复并发送即可继续运行；
+                  如需放弃，直接开启新的提问即可。
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    pendingResumeRunIdRef.current = null;
+                    setPendingResumeRunId(null);
+                  }}
+                  aria-label="放弃续跑"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
             <Composer bridgeAttachment={bridgeAttachment} onBridgeConsumed={onBridgeConsumed} />
           </ThreadPrimitive.ViewportFooter>
         </ThreadPrimitive.Viewport>

@@ -346,17 +346,48 @@ pub fn api_key_scope_id(api_key: &str) -> String {
     format!("api-key-sha256:{digest:x}")
 }
 
+/// 凭据形态校验：静态 Key 与会话令牌共用 Stronghold 存储，规则分流。
+///
+/// - `yxkey_` 静态 Key：保持严格规则（前缀 + 长度 24..=256 + ASCII 字母数字/下划线）；
+/// - 会话形态凭据：`yxrt_` 刷新令牌或三段 base64url 的 JWT——只认这两种形状，
+///   不得把任意第三方字符串写入安全存储。
 pub fn validate_api_key(api_key: &str) -> AppResult<()> {
-    let valid = api_key.starts_with("yxkey_")
-        && (24..=256).contains(&api_key.len())
-        && api_key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_');
-    if valid {
+    if api_key.starts_with("yxkey_") {
+        let strict = (24..=256).contains(&api_key.len())
+            && api_key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_');
+        return if strict {
+            Ok(())
+        } else {
+            Err(AppError::InvalidCredential)
+        };
+    }
+    if looks_like_session_credential(api_key) {
         Ok(())
     } else {
         Err(AppError::InvalidCredential)
     }
+}
+
+fn looks_like_session_credential(value: &str) -> bool {
+    if value.starts_with("yxrt_")
+        && (16..=512).contains(&value.len())
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return true;
+    }
+    // JWT：header.payload.signature 三段，每段非空且均为 base64url 字符。
+    let segments: Vec<&str> = value.split('.').collect();
+    segments.len() == 3
+        && segments.iter().all(|segment| {
+            (8..=2048).contains(&segment.len())
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
 }
 
 fn load_or_create_unlock_key() -> AppResult<(Vec<u8>, bool)> {
@@ -392,6 +423,21 @@ mod tests {
             api_key_hint("yxkey_1234567890abcdefghijkl"),
             "yxkey_123456••••••••"
         );
+    }
+
+    #[test]
+    fn accepts_session_shaped_credentials_but_rejects_garbage() {
+        // 会话 JWT（三段 base64url）与刷新令牌可通过
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3In0.c2lnbmF0dXJl";
+        assert!(validate_api_key(jwt).is_ok());
+        assert!(validate_api_key("yxrt_short-but-valid-token").is_ok());
+        // 过短、含空白/控制字符或普通文本仍被拒绝
+        assert!(validate_api_key("short").is_err());
+        assert!(validate_api_key("contains space\nand-control").is_err());
+        // 形似域名/版本号的点分文本不得误判为 JWT
+        assert!(validate_api_key("api.example.cn.v1").is_err());
+        // yxkey_ 前缀必须走严格规则（长度不足 24 拒绝）
+        assert!(validate_api_key("yxkey_short").is_err());
     }
 
     #[test]

@@ -82,20 +82,84 @@ fn rotate_if_needed(path: &Path) -> Result<(), std::io::Error> {
     fs::rename(path, previous)
 }
 
+/// 凭据脱敏：覆盖静态 Key（`yxkey_`）、刷新令牌（`yxrt_`）、激活码（`yxact_`）
+/// 与 JWT（`Bearer` 头或 JSON 值中的三段 base64url 令牌）。
+/// JWT 按「三段、每段 ≥8 个 base64url 字符」识别，避免误伤普通点分文本。
 fn redact_api_keys(value: &str) -> String {
+    let without_prefixed = redact_prefixed_tokens(value, &["yxkey_", "yxrt_", "yxact_"]);
+    redact_jwt_shaped_runs(&without_prefixed)
+}
+
+fn redact_prefixed_tokens(value: &str, prefixes: &[&str]) -> String {
     let mut result = String::with_capacity(value.len());
     let mut remaining = value;
-    while let Some(index) = remaining.find("yxkey_") {
+    while let Some(index) = find_earliest(remaining, prefixes) {
+        let prefix = prefixes
+            .iter()
+            .find(|prefix| remaining[index..].starts_with(*prefix))
+            .copied()
+            .unwrap_or(prefixes[0]);
         result.push_str(&remaining[..index]);
-        result.push_str("yxkey_[REDACTED]");
-        let secret = &remaining[index + "yxkey_".len()..];
+        result.push_str(prefix);
+        result.push_str("[REDACTED]");
+        let secret = &remaining[index + prefix.len()..];
         let end = secret
-            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+            })
             .unwrap_or(secret.len());
         remaining = &secret[end..];
     }
     result.push_str(remaining);
     result
+}
+
+fn find_earliest(value: &str, prefixes: &[&str]) -> Option<usize> {
+    prefixes
+        .iter()
+        .filter_map(|prefix| value.find(prefix))
+        .min()
+}
+
+fn redact_jwt_shaped_runs(value: &str) -> String {
+    fn is_token_char(character: char) -> bool {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+    }
+
+    let mut result = String::with_capacity(value.len());
+    let mut run = String::new();
+    for character in value.chars() {
+        if is_token_char(character) {
+            run.push(character);
+            continue;
+        }
+        flush_jwt_run(&mut result, &mut run);
+        result.push(character);
+    }
+    flush_jwt_run(&mut result, &mut run);
+    result
+}
+
+fn flush_jwt_run(result: &mut String, run: &mut String) {
+    if is_jwt_shaped(run) {
+        result.push_str("[REDACTED]");
+    } else {
+        result.push_str(run);
+    }
+    run.clear();
+}
+
+fn is_jwt_shaped(run: &str) -> bool {
+    // 字符校验在段内进行：点由外层 split 排除，若对整段 run 校验，
+    // 分隔点永远不在 base64url 白名单里，任何真 JWT 都会被漏放。
+    let segments: Vec<&str> = run.split('.').collect();
+    segments.len() == 3
+        && segments.iter().all(|segment| {
+            (8..=4096).contains(&segment.len())
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
 }
 
 #[cfg(windows)]
@@ -159,5 +223,37 @@ mod tests {
             "request yxkey_[REDACTED] failed"
         );
         assert_eq!(redact_api_keys("ordinary error"), "ordinary error");
+    }
+
+    #[test]
+    fn redacts_refresh_and_activation_tokens() {
+        assert_eq!(
+            redact_api_keys("refresh yxrt_deadbeef1234 rejected"),
+            "refresh yxrt_[REDACTED] rejected"
+        );
+        assert_eq!(
+            redact_api_keys("code yxact_99887766 invalid"),
+            "code yxact_[REDACTED] invalid"
+        );
+    }
+
+    #[test]
+    fn redacts_bearer_jwt_without_touching_plain_text() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3Iiwic2lkIjoiZjEifQ.c2lnbmF0dXJlLXNlZ21lbnQ";
+        assert_eq!(
+            redact_api_keys(&format!("Bearer {jwt} dropped")),
+            "Bearer [REDACTED] dropped"
+        );
+        // JSON 值中的令牌同样被清除
+        assert_eq!(
+            redact_api_keys(&format!(r#"{{"access_token":"{jwt}"}}"#)),
+            r#"{"access_token":"[REDACTED]"}"#
+        );
+        // 普通点分文本（域名/版本号）不得误伤
+        assert_eq!(
+            redact_api_keys("connect api.example.cn.v1 failed"),
+            "connect api.example.cn.v1 failed"
+        );
+        assert_eq!(redact_api_keys("a.b.c"), "a.b.c");
     }
 }

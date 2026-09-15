@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// 按账号作用域存放在 Stronghold 中的会话凭据。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 安全约束：不实现 `Debug`（防止 `{:?}` 把令牌打进日志/panic 信息），
+/// 也**不落盘原始 uid**——账号标识只用服务端签发的 `account_scope_id`。
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredSession {
     pub access_token: String,
@@ -11,6 +14,9 @@ pub struct StoredSession {
     pub family_id: String,
     /// 访问令牌过期时间（epoch 秒，UTC）。
     pub access_expires_at: i64,
+    /// 服务端签发的账号作用域；旧 blob 无此字段（空串）时跳过交叉校验。
+    #[serde(default)]
+    pub account_scope_id: String,
 }
 
 /// 从 JWT 第三段前的 payload 解析 exp 声明（不做签名校验——校验由服务端负责，
@@ -54,9 +60,21 @@ mod tests {
             refresh_token: "yxrt_abc".into(),
             family_id: "fam".into(),
             access_expires_at: 123,
+            account_scope_id: "yxacct_0123456789abcdef".into(),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: StoredSession = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.refresh_token, "yxrt_abc");
+        assert_eq!(parsed.account_scope_id, "yxacct_0123456789abcdef");
+        // 序列化不含 uid 字段（不落盘原始 uid 的回归护栏）
+        assert!(json.contains("accountScopeId"));
+        assert!(!json.contains("\"uid\""));
+    }
+
+    #[test]
+    fn legacy_blob_without_account_scope_id_still_deserializes() {
+        let json = r#"{"accessToken":"eyJ","refreshToken":"yxrt_abc","familyId":"fam","accessExpiresAt":123}"#;
+        let parsed: StoredSession = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.account_scope_id, "");
     }
 }
