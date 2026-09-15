@@ -150,14 +150,16 @@ fn flush_jwt_run(result: &mut String, run: &mut String) {
 }
 
 fn is_jwt_shaped(run: &str) -> bool {
+    // 字符校验在段内进行：点由外层 split 排除，若对整段 run 校验，
+    // 分隔点永远不在 base64url 白名单里，任何真 JWT 都会被漏放。
     let segments: Vec<&str> = run.split('.').collect();
     segments.len() == 3
-        && segments
-            .iter()
-            .all(|segment| (8..=4096).contains(&segment.len()))
-        && run
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && segments.iter().all(|segment| {
+            (8..=4096).contains(&segment.len())
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
 }
 
 #[cfg(windows)]

@@ -1371,9 +1371,13 @@ mod migration_tests {
         let database = Database::open(&root).await.expect("create test database");
         // 多账号机器：当前作用域已是权威账号，但目录里还有另一个账号——
         // 不自动认领（防止把 A 的历史挂到 B 名下），标记记为 skipped。
+        let gateway = "https://api.example.cn";
+        let scope_a = format!("{gateway}|yxacct_aaaa0123456789abcdef0123");
+        let scope_b = format!("{gateway}|yxacct_bbbb0123456789abcdef0123");
+        // 真实登录路径必然写账号目录（upsert_account）；多账号判定依据正是该表。
         database
             .activate_account(
-                "https://api.example.cn",
+                gateway,
                 "yxacct_aaaa0123456789abcdef0123",
                 "hint-a",
                 Some("A"),
@@ -1381,14 +1385,22 @@ mod migration_tests {
             .await
             .expect("activate account A");
         database
+            .upsert_account(&scope_a, "A", gateway)
+            .await
+            .expect("register account A in directory");
+        database
             .activate_account(
-                "https://api.example.cn",
+                gateway,
                 "yxacct_bbbb0123456789abcdef0123",
                 "hint-b",
                 Some("B"),
             )
             .await
             .expect("activate account B");
+        database
+            .upsert_account(&scope_b, "B", gateway)
+            .await
+            .expect("register account B in directory");
         sqlx::query(
             "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at)              VALUES('legacy-thread-m', '多账号旧会话', 'default-chatbot', 'legacy', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
         )
