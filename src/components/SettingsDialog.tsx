@@ -1,25 +1,30 @@
 import { useEffect, useMemo, useState } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { Bot, CircleUserRound, ExternalLink, KeyRound, LoaderCircle, Network, RefreshCw, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
+import { Activity, Bot, CircleUserRound, ExternalLink, Gauge, KeyRound, LoaderCircle, MonitorSmartphone, Network, RefreshCw, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  claimLegacyHistory,
   deleteApiKey,
   getChatModelPreference,
+  getUserQuota,
+  getUserUsage,
   importModelConfiguration,
   listAccounts,
+  listAuthSessions,
   listByokCredentials,
   listChatModels,
   normalizeCommandError,
   removeAccount,
   removeByokCredential,
+  revokeAuthSession,
   saveByokCredential,
   saveCustomModelCredential,
   switchAccount,
   setChatModelPreference,
   testConnection,
 } from "../services/tauri-client";
-import type { ByokCredential, ModelOption, PublicSettings } from "../types";
+import type { ByokCredential, DeviceSessionView, ModelOption, PublicSettings, QuotaSummary, UsageSummary } from "../types";
 import type { AccountSummary } from "../services/tauri-client";
 import {
   normalizeConfigurationForServer,
@@ -51,7 +56,12 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   const [customApiKey, setCustomApiKey] = useState("");
   const [customModel, setCustomModel] = useState("");
   const [configurationJson, setConfigurationJson] = useState("");
-  const [activeSection, setActiveSection] = useState<"connection" | "models" | "accounts" | "application">("models");
+  const [activeSection, setActiveSection] = useState<"connection" | "models" | "usage" | "accounts" | "application">("models");
+  // P5 自省：用量 / 配额 / 设备会话
+  const [quota, setQuota] = useState<QuotaSummary | null>(null);
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+  const [introspectionState, setIntrospectionState] = useState<"loading" | "ready" | "error">("loading");
+  const [sessions, setSessions] = useState<DeviceSessionView[]>([]);
 
   function navigateTo(section: typeof activeSection) {
     setActiveSection(section);
@@ -59,6 +69,42 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
   }
 
   const byokProviders = Array.from(new Set(models.map((model) => model.spec.split(":")[0])));
+
+  // BYOK 策略感知：platform_only 下禁用新增自有密钥（已有凭据仍可见——
+  // 服务端返回全部版本，隐藏会让用户误以为凭据丢失）；byok_required 给前置提示。
+  const byokDisabledByPolicy = quota?.modelAccessPolicy === "platform_only";
+  const byokRequiredByPolicy = quota?.modelAccessPolicy === "byok_required";
+
+  async function handleRevokeSession(sessionId: string) {
+    if (!window.confirm("下线该设备会话？下线后那台设备需要重新登录。")) return;
+    setBusy(true);
+    try {
+      await revokeAuthSession(sessionId);
+      setSessions((rows) => rows.filter((row) => row.sessionId !== sessionId));
+      setStatus("设备会话已下线");
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleClaimLegacy() {
+    if (!window.confirm("把旧版本（legacy）的本地会话历史归入当前账号？仅影响本机数据归属。")) return;
+    setBusy(true);
+    try {
+      const result = await claimLegacyHistory();
+      setStatus(
+        result.claimedThreads > 0 || result.claimedMessages > 0
+          ? `已认领 ${result.claimedThreads} 个会话、${result.claimedMessages} 条消息；刷新侧栏即可看到`
+          : "没有待认领的旧历史",
+      );
+    } catch (error) {
+      setStatus(normalizeCommandError(error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   // JSON 导入的本地解析预览：粘贴即校验，成功显示目标，失败给出可操作原因。
   const jsonPreview: ModelConfigurationPreview | undefined = useMemo(
@@ -188,6 +234,23 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
       } catch {
         // BYOK 加载失败不打断设置页
       }
+      // P5 自省：配额 + 用量 + 设备会话（同一账号安全分区）
+      try {
+        const [quotaSummary, usageSummary, sessionRows] = await Promise.all([
+          getUserQuota(),
+          getUserUsage(14),
+          listAuthSessions().catch(() => [] as DeviceSessionView[]),
+        ]);
+        if (cancelled) return;
+        setQuota(quotaSummary);
+        setUsage(usageSummary);
+        setSessions(sessionRows);
+        setIntrospectionState("ready");
+      } catch (error) {
+        if (cancelled) return;
+        setIntrospectionState("error");
+        setStatus(`用量与配额加载失败：${normalizeCommandError(error).message}`);
+      }
     })();
     return () => {
       cancelled = true;
@@ -316,7 +379,8 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
             <div className="settings-nav-label">工作空间设置</div>
             <button className={activeSection === "connection" ? "active" : ""} onClick={() => navigateTo("connection")}><Network size={17} /><span>服务连接<small>网关与智能体</small></span></button>
             <button className={activeSection === "models" ? "active" : ""} onClick={() => navigateTo("models")}><Bot size={17} /><span>模型与问答<small>默认模型与 BYOK</small></span></button>
-            <button className={activeSection === "accounts" ? "active" : ""} onClick={() => navigateTo("accounts")}><CircleUserRound size={17} /><span>账号与安全<small>多账号与本机凭证</small></span></button>
+            <button className={activeSection === "usage" ? "active" : ""} onClick={() => navigateTo("usage")}><Gauge size={17} /><span>用量与配额<small>权益与消耗自省</small></span></button>
+            <button className={activeSection === "accounts" ? "active" : ""} onClick={() => navigateTo("accounts")}><CircleUserRound size={17} /><span>账号与安全<small>多账号与设备会话</small></span></button>
             <button className={activeSection === "application" ? "active" : ""} onClick={() => navigateTo("application")}><Sparkles size={17} /><span>应用与更新<small>版本与项目主页</small></span></button>
             <div className="settings-security-note"><ShieldCheck size={17} /><span><strong>安全边界</strong>模型密钥仅发送到当前 Yuxi 服务端并加密保存。</span></div>
           </aside>
@@ -342,6 +406,12 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
 
               <div className="settings-field setting-row-stack model-config-section">
                 <span>我的大模型配置<span className="model-hint">（按账号隔离，API Key 仅在服务端加密保存）</span></span>
+                {byokDisabledByPolicy && (
+                  <div className="form-error" role="note">当前账号策略为「仅平台模型」，管理员未开放自有模型接入；已有密钥仍可查看与移除。</div>
+                )}
+                {byokRequiredByPolicy && !quota?.hasActiveByok && (
+                  <div className="form-error" role="note">当前账号策略要求先配置自有模型密钥，配置后即可开始问答。</div>
+                )}
                 <div className="model-config-tabs" role="tablist" aria-label="模型配置方式">
                   <button className={modelConfigMode === "manual" ? "active" : ""} onClick={() => setModelConfigMode("manual")} type="button">手动配置</button>
                   <button className={modelConfigMode === "json" ? "active" : ""} onClick={() => setModelConfigMode("json")} type="button">JSON 一键导入</button>
@@ -351,8 +421,8 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
                     <label><span>API 协议</span><select value={customProtocol} onChange={(event) => setCustomProtocol(event.target.value as "openai" | "anthropic")} disabled={busy}><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 兼容</option></select></label>
                     <label><span>API Base URL</span><input type="url" value={customBaseUrl} onChange={(event) => setCustomBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} disabled={busy} /></label>
                     <label><span>API Key</span><input type="password" value={customApiKey} onChange={(event) => setCustomApiKey(event.target.value)} placeholder="仅通过加密连接发送，不保存在本机" autoComplete="new-password" spellCheck={false} disabled={busy} /></label>
-                    <label><span>model</span><input value={customModel} onChange={(event) => setCustomModel(event.target.value)} placeholder="例如 glm-5.3-flash[1M]" autoComplete="off" spellCheck={false} disabled={busy} /></label>
-                    <button onClick={() => void saveCustomModel()} disabled={busy || !customBaseUrl.trim() || !customApiKey.trim() || !customModel.trim()}>保存并设为默认模型</button>
+                    <label><span>model</span><input value={customModel} onChange={(event) => setCustomModel(event.target.value)} placeholder="例如 glm-5.3-flash[1M]" autoComplete="off" spellCheck={false} disabled={busy || byokDisabledByPolicy} /></label>
+                    <button onClick={() => void saveCustomModel()} disabled={busy || byokDisabledByPolicy || !customBaseUrl.trim() || !customApiKey.trim() || !customModel.trim()}>保存并设为默认模型</button>
                   </div>
                 ) : (
                   <div className="json-model-form">
@@ -361,17 +431,59 @@ export function SettingsDialog({ settings, onClose, onCredentialDeleted }: Props
                       <div className="json-preview-ok"><div className="json-preview-title">已解析，可安全导入：</div><ul><li>协议：<strong>Anthropic 兼容</strong></li><li>Base URL：<code>{jsonPreview.baseUrl}</code></li><li>模型：<code>{jsonPreview.model}</code></li><li>密钥：<code>{jsonPreview.maskedApiKey}</code>（来源 {jsonPreview.resolvedSources.apiKey}）</li>{jsonPreview.ignoredFields.length > 0 && <li>忽略 {jsonPreview.ignoredFields.length} 个非模型字段</li>}</ul></div>
                     ) : <div className="json-preview-err">{jsonPreview?.error}</div>)}
                     <p>只读取 Base URL、API Key 和模型名；其他环境变量不会执行。密钥仅经加密连接发送，不落本机。</p>
-                    <button onClick={() => void importConfigurationJson()} disabled={busy || !jsonPreview?.ok}>{jsonPreview?.ok ? `导入并设为默认：${jsonPreview.model}` : "安全导入并设为默认模型"}</button>
+                    <button onClick={() => void importConfigurationJson()} disabled={busy || byokDisabledByPolicy || !jsonPreview?.ok}>{jsonPreview?.ok ? `导入并设为默认：${jsonPreview.model}` : "安全导入并设为默认模型"}</button>
                   </div>
                 )}
                 {byokList.length > 0 && <ul className="account-list">{byokList.map((cred) => <li key={cred.credentialId} className="account-row"><span className="account-name">{cred.modelId ? `${cred.modelId} · ${cred.protocol} · ${cred.baseUrl}` : cred.providerId}<small>{cred.label || "自有密钥"} · {cred.maskedHint}</small></span><span className="account-actions"><button className="danger-button" onClick={() => void removeByok(cred.credentialId)} disabled={busy}>移除</button></span></li>)}</ul>}
               </div>
-              {byokProviders.length > 0 && <details className="settings-field setting-row-stack legacy-byok-panel"><summary>仅配置平台已有供应商的 API Key</summary><div className="byok-form"><select className="model-select" value={byokProvider} onChange={(event) => setByokProvider(event.target.value)} aria-label="选择供应商" disabled={busy}><option value="">选择供应商…</option>{byokProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select><input type="password" value={byokKey} onChange={(event) => setByokKey(event.target.value)} placeholder="粘贴你在厂商处购买的 API Key" autoComplete="off" spellCheck={false} disabled={busy} /><button onClick={() => void saveByok()} disabled={busy || !byokProvider || !byokKey.trim()}>保存</button></div></details>}
+              {byokProviders.length > 0 && <details className="settings-field setting-row-stack legacy-byok-panel"><summary>仅配置平台已有供应商的 API Key</summary><div className="byok-form"><select className="model-select" value={byokProvider} onChange={(event) => setByokProvider(event.target.value)} aria-label="选择供应商" disabled={busy || byokDisabledByPolicy}><option value="">选择供应商…</option>{byokProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select><input type="password" value={byokKey} onChange={(event) => setByokKey(event.target.value)} placeholder="粘贴你在厂商处购买的 API Key" autoComplete="off" spellCheck={false} disabled={busy || byokDisabledByPolicy} /><button onClick={() => void saveByok()} disabled={busy || byokDisabledByPolicy || !byokProvider || !byokKey.trim()}>保存</button></div></details>}
+            </section>
+
+            <section className="settings-panel" id="settings-usage">
+              <div className="settings-panel-heading"><div><span>用量与配额</span><h3>本账号权益与消耗</h3><p>数据来自服务端权威计量；配额达到上限时问答会被拒绝并提示引导。</p></div><span className={`panel-status ${introspectionState === "ready" ? "success" : ""}`}>{introspectionState === "loading" ? "加载中" : introspectionState === "error" ? "暂不可用" : "已同步"}</span></div>
+              {introspectionState === "ready" && quota && usage && (
+                <>
+                  <div className="setting-row"><span>模型接入策略</span><strong>{quota.modelAccessPolicy === "platform_only" ? "仅平台模型" : quota.modelAccessPolicy === "byok_required" ? "需自有模型密钥" : "平台与自有可选"}</strong></div>
+                  <div className="setting-row"><span>每日问答上限</span><strong>{quota.dailyRunLimit != null ? `${quota.dailyRunLimit} 次` : "未设限"}</strong></div>
+                  <div className="setting-row"><span>平台模型月度 Token 上限</span><strong>{quota.monthlyTokenLimit != null ? `${quota.monthlyTokenLimit.toLocaleString()} tokens` : "未设限"}</strong></div>
+                  <div className="setting-row"><span>本月消耗（总 / 平台 / 自有）</span><strong>{usage.monthlyTokens.toLocaleString()} / {usage.monthlyPlatformTokens.toLocaleString()} / {usage.monthlyByokTokens.toLocaleString()} tokens</strong></div>
+                  <div className="setting-row setting-row-stack">
+                    <span><Activity size={15} /> 近 14 天问答次数</span>
+                    <div className="usage-days">
+                      {usage.daily.length === 0 && <small className="model-hint">近 14 天暂无问答记录</small>}
+                      {usage.daily.map((day) => (
+                        <div key={day.date} className="usage-day-row">
+                          <span className="usage-date">{day.date.slice(5)}</span>
+                          <span className="usage-bar" style={{ width: `${Math.min(100, Math.max(3, day.runCount * 8))}px` }} />
+                          <span className="usage-count">{day.runCount} 次 · {day.tokens.toLocaleString()} tokens</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
             </section>
 
             <section className="settings-panel" id="settings-accounts">
               <div className="settings-panel-heading"><div><span>账号与安全</span><h3>本机账号目录</h3><p>不同服务端账号的会话、模型偏好和本地历史互相隔离。</p></div></div>
               {accounts.length > 0 ? <ul className="account-list">{accounts.map((account) => <li key={account.accountScope} className="account-row"><span className="account-name">{account.displayName || account.accountScope}{account.isActive && <em className="account-active">当前</em>}<small>{account.gatewayUrl}</small></span>{!account.isActive && <span className="account-actions"><button onClick={() => void handleSwitch(account.accountScope)} disabled={busy}>切换</button><button className="danger-button" onClick={() => void handleRemove(account.accountScope)} disabled={busy}>移除</button></span>}</li>)}</ul> : <div className="settings-empty">当前只有一个安全会话账号。</div>}
+              <div className="settings-field setting-row-stack">
+                <span><MonitorSmartphone size={15} /> 设备会话（{sessions.length}）<small className="model-hint">服务端视角的活跃会话；下线后该设备需重新登录</small></span>
+                {sessions.length > 0 && <ul className="account-list">
+                  {sessions.map((session) => (
+                    <li key={session.sessionId} className="account-row">
+                      <span className="account-name">
+                        {session.sessionId.slice(0, 8)}…
+                        <small>创建于 {session.createdAt ? session.createdAt.replace("T", " ").slice(0, 16) : "未知"} · 最近刷新 {session.lastRefreshedAt ? session.lastRefreshedAt.replace("T", " ").slice(0, 16) : "未知"}</small>
+                      </span>
+                      <span className="account-actions"><button className="danger-button" onClick={() => void handleRevokeSession(session.sessionId)} disabled={busy}>下线</button></span>
+                    </li>
+                  ))}
+                </ul>}
+                <div className="settings-inline-actions">
+                  <button onClick={() => void handleClaimLegacy()} disabled={busy}>把旧版本历史归入当前账号</button>
+                </div>
+              </div>
               <div className="danger-zone"><div><strong>移除本机凭证</strong><span>不会删除服务端账号和本机历史会话；下次需要重新登录。</span></div><button className="danger-button" onClick={removeCredential} disabled={busy}><Trash2 size={16} />删除本机凭证</button></div>
             </section>
 

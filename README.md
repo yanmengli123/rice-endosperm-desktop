@@ -43,19 +43,40 @@
 
 ## 使用前提
 
-你的 Yuxi/APISIX 实例需要开放以下经过 API Key 认证的接口：
+桌面端从 v0.5 起以「设备会话」为主认证（短时访问令牌自动轮换 + 旋转刷新令牌），
+提供三种登录方式，按企业开通方式选择：
 
-- `POST /api/auth/desktop/login`：桌面端首次绑定时原子校验登录标识、密码和 API Key 归属（该端点自身不使用 Bearer Key，由网关限速保护）；
+1. **企业激活码（推荐）**：管理员开户后发放一次性激活码（`yxact_` 开头），
+   桌面端经 `POST /api/auth/onboarding/exchange` 兑换为设备会话——**不产生任何静态 API Key**；
+2. **浏览器授权**：已有账号的用户经 `POST /api/auth/cli/sessions` 创建授权会话，
+   在网页批准后本机获得会话（服务端会同时签发一个 90 天过渡 Key，桌面端兑换后立即撤销）；
+3. **账号密码 + API Key（兼容模式）**：`POST /api/auth/desktop/login` 三要素原子校验，
+   保留给尚未迁移激活码流程的存量用户，后续版本将逐步淘汰。
+
+你的 Yuxi/APISIX 实例需要开放以下接口（全部由网关显式白名单，无 catch-all）：
 
 ```text
+POST /api/auth/onboarding/exchange
+POST /api/auth/cli/sessions
+POST /api/auth/cli/sessions/token
+POST /api/auth/cli/token/refresh
 GET  /api/agent-invocation/credential-status
 GET  /api/agent/default
 POST /api/chat/thread
+POST /api/chat/attachments/tmp
+POST /api/chat/attachments/tmp/parse
+POST /api/chat/thread/{thread_id}/attachments/confirm
 POST /api/agent/runs
 GET  /api/agent/runs/{run_id}/events?verbose=false
 GET  /api/agent/runs/{run_id}/result
 POST /api/agent/runs/{run_id}/cancel
+GET  /api/user/quota
+GET  /api/user/usage
 ```
+
+会话续期走 `POST /api/auth/cli/token/refresh`（并发由客户端单飞锁保护，
+重放检测由服务端会话族承担）。桌面端所有请求默认携带 `X-Client-Version` 头，
+服务端可据此统计安装基数并规划静态 Key 的淘汰时点。
 
 从 v0.3.4 起，桌面端不再使用 `agent-call` 兼容包装。智能体、模型策略、知识范围、
 会话历史和最终答案均由 Yuxi 原生 AgentRun 链路决定；桌面安装包中的
@@ -104,6 +125,9 @@ Windows 首次编译 Stronghold 前请在当前 PowerShell 中点调用 `. .\.gi
 - 本地工作流文件不经过 Yuxi；但使用云端工作流模型时，Agent 选择的必要项目上下文会发送给该模型供应商。未发表或敏感数据应使用受信任的企业网关/本地模型，并逐项核对工具审批。
 - Artifact Bridge 默认关闭；只有用户点击指定产物后才上传，且上传前会复核登记时的 SHA-256。
 - 删除本机 API Key 不会删除本地历史会话；卸载策略与完整数据位置见 [隐私说明](PRIVACY.md)。
+- 设备会话与静态 Key 分开存放于 Stronghold（按账号作用域隔离）；会话账号刷新失败时
+  客户端 fail-closed，绝不回退静态 Key。工作流模型 Key 与服务端 BYOK 互不感知：
+  前者经本地工作流 worker 直连第三方模型，不进入 Yuxi 计量与策略。
 - 发现漏洞请按 [安全政策](SECURITY.md) 私下报告，不要在公开 Issue 中提交密钥或漏洞细节。
 
 ## 版本发布

@@ -12,11 +12,13 @@ mod yuxi;
 use tauri::Manager;
 
 use commands::{
-    cancel_run, create_thread, delete_api_key, delete_thread, get_chat_model_preference,
-    get_public_settings, get_run_trace, get_run_trace_events, get_thread_run_context,
-    import_model_configuration, list_accounts, list_byok_credentials, list_chat_models,
-    list_threads, load_messages, parse_chat_attachment, remove_account, remove_byok_credential,
-    rename_thread, save_byok_credential, save_connection, save_connection_with_login,
+    activate_enterprise_account, begin_device_login, cancel_run, claim_legacy_history,
+    create_thread, delete_api_key, delete_thread, get_chat_model_preference, get_public_settings,
+    get_run_trace, get_run_trace_events, get_thread_run_context, get_user_quota, get_user_usage,
+    import_model_configuration, list_accounts, list_auth_sessions, list_byok_credentials,
+    list_chat_models, list_threads, load_messages, open_authorization_page, parse_chat_attachment,
+    poll_device_login, remove_account, remove_byok_credential, rename_thread, revoke_auth_session,
+    save_byok_credential, save_connection, save_connection_with_login,
     save_custom_model_credential, send_message, set_chat_model_preference, switch_account,
     sync_pending_runs, test_connection, upload_chat_attachment,
 };
@@ -53,6 +55,12 @@ pub fn run() {
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             let state = tauri::async_runtime::block_on(AppState::open(&app_data_dir, &version))
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+            // 存量 legacy 作用域认领（v0.5 发布门）：启动触发，不依赖用户重新登录。
+            if let Err(error) =
+                tauri::async_runtime::block_on(state.database.maybe_claim_legacy_scope_on_startup())
+            {
+                diagnostics::log("WARN", "scope_migration_startup_failed", &error.to_string());
+            }
             app.manage(state);
             diagnostics::log("INFO", "startup_ready", "application state initialized");
             Ok(())
@@ -61,6 +69,10 @@ pub fn run() {
             get_public_settings,
             save_connection,
             save_connection_with_login,
+            activate_enterprise_account,
+            begin_device_login,
+            poll_device_login,
+            open_authorization_page,
             test_connection,
             delete_api_key,
             create_thread,
@@ -84,6 +96,11 @@ pub fn run() {
             list_chat_models,
             get_chat_model_preference,
             set_chat_model_preference,
+            get_user_quota,
+            get_user_usage,
+            list_auth_sessions,
+            revoke_auth_session,
+            claim_legacy_history,
             list_accounts,
             switch_account,
             remove_account,

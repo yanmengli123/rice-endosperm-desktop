@@ -13,6 +13,8 @@ type AdapterCallbacks = {
   onTraceEvent?: (event: TraceEvent) => void;
   bridgeAttachment?: PendingChatAttachment;
   onBridgeConsumed?: () => void;
+  /** 取走待续跑的父 run ID（人工审批续跑）：返回后即清除，下一次发送是普通提问。 */
+  consumeResumeRunId?: () => string | undefined;
 };
 
 class AsyncQueue<T> {
@@ -107,14 +109,19 @@ export function createYuxiAdapter(
       ) {
         attachments.push(callbacks.bridgeAttachment);
       }
-      if (!question && attachments.length === 0) throw new Error("请输入问题或添加附件后再发送");
+      // 人工审批续跑：本轮发送是对 interrupted run 的答复——以 resume 载荷
+      // 发送，不携带新附件；附件此时应留给下一轮普通提问。
+      const resumeRunId = callbacks.consumeResumeRunId?.();
+      const effectiveAttachments = resumeRunId ? [] : attachments;
+      if (!question) throw new Error("请输入问题或批复后再发送");
       const resolvedQuestion = question || "请分析随附文件。";
 
       const request = {
         threadId: localThreadId,
         question: resolvedQuestion,
         requestId: requestId(),
-        attachments,
+        attachments: effectiveAttachments,
+        resumeRunId,
       };
       const queue = new AsyncQueue<RunEvent>();
       const channel = new Channel<RunEvent>();
@@ -167,7 +174,12 @@ export function createYuxiAdapter(
           accumulatedText = completion.text;
           yield { content: [{ type: "text", text: accumulatedText }] };
         }
-        callbacks.onRunState?.({ runId: activeRunId, status: "completed" });
+        // interrupted 是可续跑态（等待用户批复），不是失败：如实上报，
+        // 由 ChatWorkspace 呈现续跑入口。
+        callbacks.onRunState?.({
+          runId: activeRunId,
+          status: completion.status === "interrupted" ? "interrupted" : "completed",
+        });
         callbacks.onCompleted?.(completion);
         if (callbacks.bridgeAttachment) callbacks.onBridgeConsumed?.();
       } catch (error) {

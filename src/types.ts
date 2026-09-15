@@ -3,6 +3,8 @@ export type CommandError = {
   message: string;
   retryable: boolean;
   status?: number;
+  action?: string;
+  traceId?: string;
 };
 
 export type PublicSettings = {
@@ -10,6 +12,59 @@ export type PublicSettings = {
   agentSlug: string;
   hasApiKey: boolean;
   apiKeyHint?: string;
+};
+
+/** 设备码创建结果（begin_device_login）。 */
+export type DeviceCodeStart = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete: string;
+  expiresIn: number;
+  interval: number;
+};
+
+/** 设备码轮询结果：pending = 等待浏览器授权。 */
+export type DeviceLoginPoll = {
+  status: "pending" | "done";
+  settings?: PublicSettings;
+};
+
+/** 用户权益（GET /api/user/quota）。 */
+export type QuotaSummary = {
+  dailyRunLimit?: number;
+  monthlyTokenLimit?: number;
+  modelAccessPolicy: string;
+  byokPlatformTokenExempt: boolean;
+  hasActiveByok: boolean;
+};
+
+/** 单日用量。 */
+export type UsageDay = {
+  date: string;
+  runCount: number;
+  tokens: number;
+};
+
+/** 用户用量（GET /api/user/usage）。 */
+export type UsageSummary = {
+  daily: UsageDay[];
+  monthlyTokens: number;
+  monthlyPlatformTokens: number;
+  monthlyByokTokens: number;
+};
+
+/** 设备会话摘要（账号与安全）。 */
+export type DeviceSessionView = {
+  sessionId: string;
+  createdAt?: string;
+  lastRefreshedAt?: string;
+};
+
+/** legacy 历史认领结果。 */
+export type LegacyClaimResult = {
+  claimedThreads: number;
+  claimedMessages: number;
 };
 
 export type WorkflowProject = {
@@ -141,6 +196,8 @@ export type SendMessageRequest = {
   question: string;
   requestId: string;
   attachments: PendingChatAttachment[];
+  /** 中断恢复（人工审批续跑）：被恢复的父 run ID。 */
+  resumeRunId?: string;
 };
 
 export type PendingChatAttachment = {

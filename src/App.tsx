@@ -48,6 +48,22 @@ export default function App() {
     return items;
   }, []);
 
+  // 统一命令错误出口：会话终态失败（Rust 已清除本地会话 blob）时重取设置，
+  // hasApiKey 归 false 后应用自然回落连接页；错误文案附带网关追踪号便于报障。
+  const handleCommandError = useCallback((reason: unknown) => {
+    const normalized = normalizeCommandError(reason);
+    if (normalized.code === "session_requires_relogin") {
+      void getPublicSettings()
+        .then((current) => setSettings(current))
+        .catch(() => undefined);
+    }
+    setError(
+      normalized.traceId
+        ? `${normalized.message}（追踪号 ${normalized.traceId}）`
+        : normalized.message,
+    );
+  }, []);
+
   const openThread = useCallback(async (threadId: string) => {
     const sequence = ++threadLoadSequence.current;
     try {
@@ -63,7 +79,7 @@ export default function App() {
       setActiveThreadId(threadId);
     } catch (reason) {
       if (sequence === threadLoadSequence.current) {
-        setError(normalizeCommandError(reason).message);
+        handleCommandError(reason);
       }
     }
   }, []);
@@ -98,7 +114,7 @@ export default function App() {
           await bootstrapWorkspace();
         }
       } catch (reason) {
-        setError(normalizeCommandError(reason).message);
+        handleCommandError(reason);
       } finally {
         setLoading(false);
       }
@@ -150,7 +166,7 @@ export default function App() {
       setThreads((current) => [thread, ...current]);
       await openThread(thread.id);
     } catch (reason) {
-      setError(normalizeCommandError(reason).message);
+      handleCommandError(reason);
     }
   }
 
@@ -165,7 +181,7 @@ export default function App() {
         await openThread(next.id);
       }
     } catch (reason) {
-      setError(normalizeCommandError(reason).message);
+      handleCommandError(reason);
     }
   }
 
@@ -176,7 +192,7 @@ export default function App() {
       await renameThread(threadId, title);
       await refreshThreads();
     } catch (reason) {
-      setError(normalizeCommandError(reason).message);
+      handleCommandError(reason);
     }
   }
 
@@ -221,7 +237,7 @@ export default function App() {
             setBridgeAttachment(uploaded);
             setProductMode("qa");
           } catch (reason) {
-            setError(normalizeCommandError(reason).message);
+            handleCommandError(reason);
             throw reason;
           }
         }}
@@ -238,7 +254,7 @@ export default function App() {
           setSettings(connected);
           setLoading(true);
           void bootstrapWorkspace()
-            .catch((reason) => setError(normalizeCommandError(reason).message))
+            .catch((reason) => handleCommandError(reason))
             .finally(() => setLoading(false));
         }}
       />
@@ -293,7 +309,7 @@ export default function App() {
                 setError("");
                 setLoading(true);
                 void bootstrapWorkspace()
-                  .catch((reason) => setError(normalizeCommandError(reason).message))
+                  .catch((reason) => handleCommandError(reason))
                   .finally(() => setLoading(false));
               }}
             >

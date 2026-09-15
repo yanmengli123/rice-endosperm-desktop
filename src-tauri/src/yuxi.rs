@@ -18,6 +18,13 @@ const CREATE_RUN_PATH: &str = "/api/agent/runs";
 const LEGACY_RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
 const CREDENTIAL_STATUS_PATH: &str = "/api/agent-invocation/credential-status";
 const TMP_ATTACHMENT_PATH: &str = "/api/chat/attachments/tmp";
+const ONBOARDING_EXCHANGE_PATH: &str = "/api/auth/onboarding/exchange";
+const CLI_SESSIONS_PATH: &str = "/api/auth/cli/sessions";
+const CLI_SESSIONS_TOKEN_PATH: &str = "/api/auth/cli/sessions/token";
+const AUTH_SESSIONS_PATH: &str = "/api/auth/sessions";
+const USER_QUOTA_PATH: &str = "/api/user/quota";
+const USER_USAGE_PATH: &str = "/api/user/usage";
+const GATEWAY_TRACE_HEADER: &str = "X-Gateway-Trace-ID";
 
 #[derive(Clone)]
 pub struct YuxiClient {
@@ -129,12 +136,21 @@ struct CreateThreadRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct CreateRunRequest<'a> {
-    query: &'a str,
+    /// 普通提问必填；resume run（人工审批续跑）整体省略——网关 schema 为
+    /// string，null 会被拒，必须不发送该字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<&'a str>,
     agent_slug: &'a str,
     thread_id: &'a str,
     meta: RunRequestMeta<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_spec: Option<&'a str>,
+    /// 中断恢复：传给 LangGraph 的输入载荷（人工审批场景为用户答复字符串），
+    /// 与 created_by_run_id 成对出现；沿用父 run 的冻结模型，不得携带新 model_spec。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_by_run_id: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,9 +217,14 @@ struct TmpAttachmentConfirmRequest<'a> {
 #[derive(Debug, Serialize)]
 struct TmpAttachmentConfirmItem<'a> {
     file_name: &'a str,
+    // 网关 confirm 闭集对可选字段的声明是 type:string（不接受 null）：
+    // 未解析附件（parsed_object_name=None）与未知 MIME（file_type=None）
+    // 必须整体省略字段；服务端 pydantic 对缺省字段取 None 默认值。
+    #[serde(skip_serializing_if = "Option::is_none")]
     file_type: Option<&'a str>,
     bucket_name: &'a str,
     object_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parsed_object_name: Option<&'a str>,
     truncated: bool,
 }
@@ -220,10 +241,19 @@ struct ConfirmedAttachment {
 
 impl YuxiClient {
     pub fn new(app_version: &str) -> AppResult<Self> {
+        let mut default_headers = header::HeaderMap::new();
+        // 版本可见性：服务端据此统计安装基数，决定 desktop_legacy 静态 Key 的
+        // 淘汰时点（先开关后删码，不一步到 410）。
+        default_headers.insert(
+            "X-Client-Version",
+            header::HeaderValue::from_str(app_version)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        );
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("RiceEndospermDesktop/{app_version}"))
+            .default_headers(default_headers)
             .build()?;
         Ok(Self { client })
     }
@@ -296,17 +326,22 @@ impl YuxiClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // 网关契约字段逐一显式传参，避免引入参数对象
-    pub async fn create_run(
+    /// 中断恢复变体：`resume` 为 LangGraph 输入载荷（人工审批答复），`created_by_run_id`
+    /// 指向被恢复的父 run；此时 `question` 传 None。服务端会 recheck BYOK 凭据并
+    /// 沿用父 run 冻结模型。普通提问走同一入口（resume=None）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_run_with_resume(
         &self,
         gateway_url: &str,
         agent_slug: &str,
         api_key: &SecretString,
-        question: &str,
+        question: Option<&str>,
         yuxi_thread_id: &str,
         request_id: &str,
         model_spec: Option<&str>,
         attachment_file_ids: &[String],
+        resume: Option<&Value>,
+        created_by_run_id: Option<&str>,
     ) -> AppResult<CreatedRun> {
         let base = validate_gateway_url(gateway_url)?;
         let mut last_error = None;
@@ -327,6 +362,8 @@ impl YuxiClient {
                             .collect(),
                     },
                     model_spec,
+                    resume,
+                    created_by_run_id,
                 })
                 .timeout(Duration::from_secs(45))
                 .send()
@@ -749,6 +786,269 @@ impl YuxiClient {
         parse_desktop_login_response(&value)
     }
 
+    /// P5 企业激活码开户：一次性激活码换取设备会话对。
+    /// 服务端对兑换**只签发会话、绝不发静态 Key**（响应无 api_key 字段）；
+    /// 激活码一次性消费，错误以 detail.{error,message} 表达（404/409/410/403）。
+    pub async fn exchange_onboarding_activation(
+        &self,
+        gateway_url: &str,
+        activation_code: &SecretString,
+        device_name: &str,
+    ) -> AppResult<OnboardingExchange> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .client
+            .post(format!("{base}{ONBOARDING_EXCHANGE_PATH}"))
+            .json(&json!({
+                "activation_code": activation_code.expose_secret(),
+                "device_name": device_name,
+            }))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_onboarding_exchange(&value)
+    }
+
+    /// P2b 设备码第一步：创建待授权会话，返回浏览器授权页与轮询参数。
+    pub async fn start_cli_session(
+        &self,
+        gateway_url: &str,
+        key_name: Option<&str>,
+    ) -> AppResult<DeviceCodeStart> {
+        let base = validate_gateway_url(gateway_url)?;
+        let mut payload = json!({});
+        if let Some(name) = key_name.filter(|value| !value.trim().is_empty()) {
+            payload["key_name"] = json!(name.trim().chars().take(100).collect::<String>());
+        }
+        let response = self
+            .client
+            .post(format!("{base}{CLI_SESSIONS_PATH}"))
+            .json(&payload)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_device_code_start(&value)
+    }
+
+    /// P2b 设备码轮询：返回 `Ok(None)` 表示 `authorization_pending`（继续按
+    /// interval 轮询，不是错误）；批准后返回会话对 + 过渡静态 Key。
+    pub async fn poll_cli_session_token(
+        &self,
+        gateway_url: &str,
+        device_code: &SecretString,
+    ) -> AppResult<Option<DeviceCodeExchange>> {
+        use secrecy::ExposeSecret as _;
+
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .client
+            .post(format!("{base}{CLI_SESSIONS_TOKEN_PATH}"))
+            .json(&json!({"device_code": device_code.expose_secret()}))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        if response.status().as_u16() == 400 {
+            let trace_id = gateway_trace_id(response.headers());
+            let value = response.json::<Value>().await.ok();
+            let code = value
+                .as_ref()
+                .and_then(|value| value.pointer("/detail/error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if code.as_deref() == Some("authorization_pending") {
+                return Ok(None);
+            }
+            let message = value
+                .as_ref()
+                .and_then(|value| value.pointer("/detail/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("设备授权轮询失败")
+                .to_owned();
+            return Err(AppError::from_server_parts(
+                400, message, code, None, trace_id,
+            ));
+        }
+        let response = ensure_success(response).await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        parse_device_code_exchange(&value)
+    }
+
+    /// 撤销静态 API Key（设备码兑换后清理 90 天过渡 Key，防孤儿）。
+    /// 404 视为成功（幂等：Key 已被撤销或过期）。
+    pub async fn delete_api_key_by_id(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        api_key_id: i64,
+    ) -> AppResult<()> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_delete(&format!("{base}/api/user/apikey/{api_key_id}"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            200 | 202 | 204 | 404 => Ok(()),
+            _ => Err(response_error(response).await),
+        }
+    }
+
+    /// 列出当前用户的活跃设备会话（P2b 远程下线入口）。
+    pub async fn list_device_sessions(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+    ) -> AppResult<Vec<DeviceSessionView>> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{AUTH_SESSIONS_PATH}"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        let value = ensure_success(response)
+            .await?
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let items = value
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
+            .iter()
+            .map(|item| DeviceSessionView {
+                session_id: item
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                created_at: optional_string(item, "created_at"),
+                last_refreshed_at: optional_string(item, "last_refreshed_at"),
+            })
+            .filter(|session| !session.session_id.is_empty())
+            .collect())
+    }
+
+    /// 远程下线指定设备会话族。
+    pub async fn revoke_device_session(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        family_id: &str,
+    ) -> AppResult<()> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_delete(&format!("{base}{AUTH_SESSIONS_PATH}/{family_id}"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        ensure_success(response).await?;
+        Ok(())
+    }
+
+    /// P5 自省：当前用户权益（策略 + 配额）。
+    pub async fn get_user_quota(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+    ) -> AppResult<QuotaSummary> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{USER_QUOTA_PATH}"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        let value = ensure_success(response)
+            .await?
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        Ok(QuotaSummary {
+            daily_run_limit: value.get("daily_run_limit").and_then(Value::as_i64),
+            monthly_token_limit: value.get("monthly_token_limit").and_then(Value::as_i64),
+            model_access_policy: value
+                .get("model_access_policy")
+                .and_then(Value::as_str)
+                .unwrap_or("byok_optional")
+                .to_owned(),
+            byok_platform_token_exempt: value
+                .get("byok_platform_token_exempt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            has_active_byok: value
+                .get("has_active_byok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    /// P5 自省：近 N 天用量与本月汇总。
+    pub async fn get_user_usage(
+        &self,
+        gateway_url: &str,
+        bearer: &SecretString,
+        days: u32,
+    ) -> AppResult<UsageSummary> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{USER_USAGE_PATH}?days={days}"), bearer)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        let value = ensure_success(response)
+            .await?
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        let days = value
+            .get("daily")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(UsageSummary {
+            daily: days
+                .iter()
+                .map(|item| UsageDay {
+                    date: item
+                        .get("date")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    run_count: item.get("run_count").and_then(Value::as_i64).unwrap_or(0),
+                    tokens: item.get("tokens").and_then(Value::as_i64).unwrap_or(0),
+                })
+                .collect(),
+            monthly_tokens: value
+                .get("monthly_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            monthly_platform_tokens: value
+                .get("monthly_platform_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            monthly_byok_tokens: value
+                .get("monthly_byok_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
     /// P5 BYOK：列出当前用户的自有模型凭据（仅掩码，无明文）。
     pub async fn list_byok_credentials(
         &self,
@@ -998,6 +1298,83 @@ pub struct RotatedSession {
     pub refresh_token: String,
 }
 
+/// 服务端签发的设备会话对（onboarding 与 CLI 两种兑换共用同一形状）。
+#[derive(Debug, Clone)]
+pub struct SessionPair {
+    pub session_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_in: i64,
+}
+
+/// 企业激活码兑换结果：只有会话对，无任何静态 Key。
+#[derive(Debug, Clone)]
+pub struct OnboardingExchange {
+    pub session: SessionPair,
+    pub user_name: String,
+    pub account_scope_id: String,
+}
+
+/// 设备码创建结果（浏览器授权页与轮询参数）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCodeStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: i64,
+    pub interval: i64,
+}
+
+/// 设备码兑换结果：会话对为主，过渡静态 Key 仅用于旧服务端兜底与即时撤销。
+#[derive(Debug, Clone)]
+pub struct DeviceCodeExchange {
+    pub session: Option<SessionPair>,
+    pub user_name: String,
+    pub account_scope_id: String,
+    pub transition_key_id: Option<i64>,
+    pub transition_key_secret: Option<String>,
+}
+
+/// 设备会话摘要（设置页「账号与安全」展示用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSessionView {
+    pub session_id: String,
+    pub created_at: Option<String>,
+    pub last_refreshed_at: Option<String>,
+}
+
+/// 用户权益摘要（GET /api/user/quota）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaSummary {
+    pub daily_run_limit: Option<i64>,
+    pub monthly_token_limit: Option<i64>,
+    pub model_access_policy: String,
+    pub byok_platform_token_exempt: bool,
+    pub has_active_byok: bool,
+}
+
+/// 用户用量摘要（GET /api/user/usage）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummary {
+    pub daily: Vec<UsageDay>,
+    pub monthly_tokens: i64,
+    pub monthly_platform_tokens: i64,
+    pub monthly_byok_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDay {
+    pub date: String,
+    pub run_count: i64,
+    pub tokens: i64,
+}
+
 /// 账号、密码和 API Key 联合认证后的服务端权威身份。
 #[derive(Debug, Clone)]
 pub struct DesktopLoginIdentity {
@@ -1103,6 +1480,136 @@ fn parse_desktop_login_response(value: &Value) -> AppResult<DesktopLoginIdentity
         user_name,
         user_uid,
     })
+}
+
+/// 解析 onboarding exchange：`{session, user:{uid,username}, account_scope_id}`。
+/// 企业开户路径**绝不携带 api_key 字段**——出现即视为契约违约，拒绝绑定。
+fn parse_onboarding_exchange(value: &Value) -> AppResult<OnboardingExchange> {
+    if value.get("api_key").is_some() || value.get("secret").is_some() {
+        return Err(AppError::Protocol(
+            "服务端在激活码兑换中签发了静态 Key，违反企业开户契约；已拒绝绑定".into(),
+        ));
+    }
+    let session = parse_session_pair(value.get("session"))?;
+    let user_name = value
+        .pointer("/user/username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Protocol("激活码兑换响应缺少用户名".into()))?
+        .to_string();
+    let account_scope_id = value
+        .get("account_scope_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("yxacct_") && value.len() >= 24)
+        .ok_or_else(|| AppError::Protocol("激活码兑换响应缺少账号作用域标识".into()))?
+        .to_string();
+    Ok(OnboardingExchange {
+        session,
+        user_name,
+        account_scope_id,
+    })
+}
+
+/// 解析设备码创建响应：六字段全量校验，缺一即拒绝（轮询依赖这些参数）。
+fn parse_device_code_start(value: &Value) -> AppResult<DeviceCodeStart> {
+    let required = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::Protocol(format!("设备码响应字段缺失：{key}")))
+    };
+    let expires_in = value
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| AppError::Protocol("设备码响应缺少有效期".into()))?;
+    let interval = value
+        .get("interval")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| AppError::Protocol("设备码响应缺少轮询间隔".into()))?;
+    Ok(DeviceCodeStart {
+        device_code: required("device_code")?,
+        user_code: required("user_code")?,
+        verification_uri: required("verification_uri")?,
+        verification_uri_complete: required("verification_uri_complete")?,
+        expires_in,
+        interval,
+    })
+}
+
+/// 解析设备码兑换响应：`{api_key:dict, secret, user, account_scope_id, session|null}`。
+/// 与 onboarding 结构不同（多 api_key/secret、session 可空），必须分开解析。
+fn parse_device_code_exchange(value: &Value) -> AppResult<Option<DeviceCodeExchange>> {
+    let user_name = value
+        .pointer("/user/username")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .pointer("/user/display_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| AppError::Protocol("设备码兑换响应缺少用户名".into()))?;
+    let account_scope_id = value
+        .get("account_scope_id")
+        .and_then(Value::as_str)
+        .filter(|text| text.starts_with("yxacct_") && text.len() >= 24)
+        .ok_or_else(|| AppError::Protocol("设备码兑换响应缺少账号作用域标识".into()))?
+        .to_string();
+    let session = match value.get("session").filter(|session| !session.is_null()) {
+        Some(session_value) => Some(parse_session_pair(Some(session_value))?),
+        None => None,
+    };
+    let transition_key_id = value
+        .pointer("/api_key/id")
+        .and_then(Value::as_i64)
+        .or_else(|| value.pointer("/api_key/api_key_id").and_then(Value::as_i64));
+    let transition_key_secret = value
+        .get("secret")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    Ok(Some(DeviceCodeExchange {
+        session,
+        user_name,
+        account_scope_id,
+        transition_key_id,
+        transition_key_secret,
+    }))
+}
+
+/// 解析服务端签发的会话对；字段不全或为空即失败关闭。
+fn parse_session_pair(value: Option<&Value>) -> AppResult<SessionPair> {
+    let value = value.ok_or_else(|| AppError::Protocol("会话响应缺失".into()))?;
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::Protocol("会话响应字段缺失".into()))
+    };
+    Ok(SessionPair {
+        session_id: field("session_id")?,
+        access_token: field("access_token")?,
+        refresh_token: field("refresh_token")?,
+        access_expires_in: value
+            .get("access_expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(30 * 60),
+    })
+}
+
+fn gateway_trace_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(GATEWAY_TRACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn connection_error_is_retryable(error: &AppError) -> bool {
@@ -1441,17 +1948,108 @@ async fn ensure_success(response: Response) -> AppResult<Response> {
     }
 }
 
-async fn response_error(response: Response) -> AppError {
-    let status = response.status();
-    let detail = response.json::<Value>().await.ok().and_then(|value| {
-        value
-            .get("detail")
+/// 错误体解析结果：兼容服务端三种形态——
+///
+/// 1. `{"detail": {"code", "message", "action"}}`（AgentRun/配额类业务错误）
+/// 2. `{"detail": {"error", "message"}}`（onboarding / cli-sessions 授权错误）
+/// 3. `{"detail": "纯字符串"}`（refresh 端点与部分 FastAPI 默认错误）
+///
+/// 以及网关自身的 `{"error_msg": ...}` 与 text/plain（request-validation 拒绝体）。
+#[derive(Default)]
+struct ParsedErrorBody {
+    code: Option<String>,
+    action: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_error_body(body: &str) -> ParsedErrorBody {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        let trimmed = body.trim();
+        return ParsedErrorBody {
+            message: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+            ..Default::default()
+        };
+    };
+    let mut parsed = ParsedErrorBody::default();
+    if let Some(detail) = value.get("detail").filter(|detail| !detail.is_null()) {
+        if let Some(text) = detail.as_str() {
+            parsed.message = (!text.trim().is_empty()).then(|| text.to_owned());
+        } else {
+            parsed.code = detail
+                .get("code")
+                .and_then(Value::as_str)
+                .or_else(|| detail.get("error").and_then(Value::as_str))
+                .map(str::to_owned);
+            parsed.action = detail
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            parsed.message = detail
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    if parsed.message.is_none() {
+        parsed.message = value
+            .get("message")
             .and_then(Value::as_str)
-            .or_else(|| value.pointer("/detail/message").and_then(Value::as_str))
-            .or_else(|| value.get("message").and_then(Value::as_str))
-            .map(str::to_owned)
-    });
-    AppError::from_status(status, detail)
+            .map(str::to_owned);
+    }
+    if parsed.message.is_none() {
+        parsed.message = value
+            .get("error_msg")
+            .and_then(Value::as_str)
+            .map(|text| format!("网关错误：{text}"))
+            .or_else(|| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+    }
+    parsed
+}
+
+fn default_status_message(status: u16) -> String {
+    match status {
+        400 => "请求被拒绝（HTTP 400）：请求字段与服务端契约不匹配，请升级桌面端".into(),
+        401 => "认证失败，请检查凭证是否有效或已被禁用".into(),
+        403 => "当前请求被服务端拒绝，请检查账号状态或模型接入策略".into(),
+        404 => {
+            "请求的接口不存在（HTTP 404）：网关可能未放行该路由，请联系管理员更新网关配置".into()
+        }
+        429 => "请求过于频繁，请稍后重试".into(),
+        _ => format!("HTTP {status}"),
+    }
+}
+
+async fn response_error(response: Response) -> AppError {
+    let status = response.status().as_u16();
+    // 必须在消费 body 前读取响应头（reqwest 消费 body 不影响 headers，但显式先取）。
+    let trace_id = gateway_trace_id(response.headers());
+    let lock_remaining = response
+        .headers()
+        .get("X-Lock-Remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let body = response.text().await.unwrap_or_default();
+    let parsed = parse_error_body(&body);
+    let message = parsed
+        .message
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| default_status_message(status));
+    let message = apply_lock_remaining(status, message, lock_remaining);
+    AppError::from_server_parts(status, message, parsed.code, parsed.action, trace_id)
+}
+
+/// 423 登录锁定：把服务端 `X-Lock-Remaining` 头换算成可行动的等待提示。
+fn apply_lock_remaining(status: u16, message: String, remaining: Option<u64>) -> String {
+    if status == 423 && remaining.is_some_and(|seconds| seconds > 0) {
+        format!("{message}（请 {} 秒后重试）", remaining.unwrap_or_default())
+    } else {
+        message
+    }
 }
 
 #[cfg(test)]
@@ -1461,15 +2059,17 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CreateRunRequest, ProgressText, RunRequestMeta, connection_error_for_gateway, final_output,
-        parse_default_agent_slug, parse_desktop_login_response, parse_run_result,
+        CreateRunRequest, ProgressText, RunRequestMeta, TmpAttachmentConfirmItem,
+        connection_error_for_gateway, default_status_message, final_output,
+        parse_default_agent_slug, parse_desktop_login_response, parse_device_code_exchange,
+        parse_device_code_start, parse_error_body, parse_onboarding_exchange, parse_run_result,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
 
     #[test]
     fn serializes_the_same_native_agent_run_contract_as_web() {
         let value = serde_json::to_value(CreateRunRequest {
-            query: "水稻胚乳发育的关键调控基因有哪些？",
+            query: Some("水稻胚乳发育的关键调控基因有哪些？"),
             agent_slug: "default-chatbot",
             thread_id: "thread-1",
             meta: RunRequestMeta {
@@ -1478,6 +2078,8 @@ mod tests {
                 attachment_file_ids: vec![],
             },
             model_spec: None,
+            resume: None,
+            created_by_run_id: None,
         })
         .expect("serialize native AgentRun request");
 
@@ -1488,12 +2090,37 @@ mod tests {
         assert!(value.get("messages").is_none());
         assert!(value.get("async_mode").is_none());
         assert!(value.get("model_spec").is_none());
+        assert!(value.get("resume").is_none());
+    }
+
+    #[test]
+    fn serializes_resume_payload_only_when_present() {
+        let resume = json!({"values": {"step1": "确认继续"}});
+        let value = serde_json::to_value(CreateRunRequest {
+            query: None,
+            agent_slug: "default-chatbot",
+            thread_id: "thread-1",
+            meta: RunRequestMeta {
+                request_id: "desktop-request-resume-1",
+                client: "rice-endosperm-desktop",
+                attachment_file_ids: vec![],
+            },
+            model_spec: None,
+            resume: Some(&resume),
+            created_by_run_id: Some("run-parent-1"),
+        })
+        .expect("serialize resume run request");
+
+        assert_eq!(value["created_by_run_id"], "run-parent-1");
+        assert_eq!(value["resume"]["values"]["step1"], "确认继续");
+        // query 必须整体省略：网关 schema 的 string 类型不接受 null
+        assert!(value.get("query").is_none());
     }
 
     #[test]
     fn serializes_confirmed_attachment_ids_inside_run_meta() {
         let value = serde_json::to_value(CreateRunRequest {
-            query: "总结附件",
+            query: Some("总结附件"),
             agent_slug: "default-chatbot",
             thread_id: "thread-1",
             meta: RunRequestMeta {
@@ -1502,6 +2129,8 @@ mod tests {
                 attachment_file_ids: vec!["file-1", "file-2"],
             },
             model_spec: None,
+            resume: None,
+            created_by_run_id: None,
         })
         .expect("serialize attachment run request");
 
@@ -1509,6 +2138,42 @@ mod tests {
             value["meta"]["attachment_file_ids"],
             json!(["file-1", "file-2"])
         );
+    }
+
+    #[test]
+    fn confirm_item_omits_null_optional_fields_for_gateway_closed_set() {
+        // 网关 confirm schema 的可选字段是 type:string，null 会被 400 拒绝；
+        // 未解析附件与未知 MIME 是合法场景，字段必须整体省略。
+        let unparsed = TmpAttachmentConfirmItem {
+            file_name: "evidence.pdf",
+            file_type: None,
+            bucket_name: "chat-tmp",
+            object_name: "tmp/o-1",
+            parsed_object_name: None,
+            truncated: false,
+        };
+        let value = serde_json::to_value(&unparsed).expect("serialize unparsed confirm item");
+        assert!(
+            value.get("file_type").is_none(),
+            "file_type=null 会被网关 400"
+        );
+        assert!(
+            value.get("parsed_object_name").is_none(),
+            "parsed_object_name=null 会被网关 400"
+        );
+        assert_eq!(value["truncated"], false);
+
+        let parsed = TmpAttachmentConfirmItem {
+            file_name: "evidence.pdf",
+            file_type: Some("application/pdf"),
+            bucket_name: "chat-tmp",
+            object_name: "tmp/o-1",
+            parsed_object_name: Some("tmp/p-1"),
+            truncated: true,
+        };
+        let value = serde_json::to_value(&parsed).expect("serialize parsed confirm item");
+        assert_eq!(value["file_type"], "application/pdf");
+        assert_eq!(value["parsed_object_name"], "tmp/p-1");
     }
 
     #[test]
@@ -1564,6 +2229,151 @@ mod tests {
         );
         assert_eq!(identity.user_name, "Rice Researcher");
         assert_eq!(identity.user_uid, "rice_researcher");
+    }
+
+    #[test]
+    fn decodes_onboarding_exchange_without_any_static_key() {
+        let exchange = parse_onboarding_exchange(&json!({
+            "session": {
+                "session_id": "fam-1",
+                "access_token": "eyJhbGciOi.eyJzdWIiOjdcInw.c2ln",
+                "refresh_token": "yxrt_0123456789abcdef",
+                "access_expires_in": 1800
+            },
+            "user": {"uid": "rice_researcher", "username": "Rice Researcher"},
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef"
+        }))
+        .expect("decode onboarding exchange");
+
+        assert_eq!(exchange.session.session_id, "fam-1");
+        assert_eq!(exchange.session.access_expires_in, 1800);
+        assert_eq!(exchange.user_name, "Rice Researcher");
+        assert_eq!(
+            exchange.account_scope_id,
+            "yxacct_0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn rejects_onboarding_exchange_that_issuances_static_key() {
+        let mut payload = json!({
+            "session": {
+                "session_id": "fam-1",
+                "access_token": "eyJhbGciOi.eyJzdWIiOjdcInw.c2ln",
+                "refresh_token": "yxrt_0123456789abcdef",
+                "access_expires_in": 1800
+            },
+            "user": {"uid": "u", "username": "n"},
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef"
+        });
+        payload["secret"] = json!("yxkey_should_not_exist");
+        assert!(parse_onboarding_exchange(&payload).is_err());
+    }
+
+    #[test]
+    fn decodes_device_code_start_and_exchange() {
+        let start = parse_device_code_start(&json!({
+            "device_code": "dc-1",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://web.example.cn/auth/cli/authorize",
+            "verification_uri_complete": "https://web.example.cn/auth/cli/authorize?user_code=ABCD-1234",
+            "expires_in": 600,
+            "interval": 2
+        }))
+        .expect("decode device code start");
+        assert_eq!(start.user_code, "ABCD-1234");
+        assert_eq!(start.interval, 2);
+
+        let exchange = parse_device_code_exchange(&json!({
+            "api_key": {"id": 77, "key_prefix": "yxkey_99"},
+            "secret": "yxkey_transition_0123456789",
+            "user": {"uid": "u", "username": "Rice"},
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef",
+            "session": {
+                "session_id": "fam-2",
+                "access_token": "a.b.c2lnbmF0dXJl",
+                "refresh_token": "yxrt_fedcba9876543210",
+                "access_expires_in": 1800
+            }
+        }))
+        .expect("decode device exchange")
+        .expect("session present");
+        assert_eq!(
+            exchange.session.as_ref().expect("session").session_id,
+            "fam-2"
+        );
+        assert_eq!(exchange.transition_key_id, Some(77));
+        assert!(
+            exchange
+                .transition_key_secret
+                .as_deref()
+                .is_some_and(|secret| secret.starts_with("yxkey_"))
+        );
+
+        // 旧服务端无 session 字段：静态 Key 兜底路径必须仍可解析
+        let legacy = parse_device_code_exchange(&json!({
+            "api_key": {"id": 78},
+            "secret": "yxkey_legacy_0123456789",
+            "user": {"uid": "u", "username": "Rice"},
+            "account_scope_id": "yxacct_0123456789abcdef0123456789abcdef"
+        }))
+        .expect("decode legacy exchange")
+        .expect("legacy exchange present");
+        assert!(legacy.session.is_none());
+    }
+
+    #[test]
+    fn parses_all_server_error_body_dialects() {
+        // 形态 1：detail.{code,message,action}（配额类业务错误）
+        let quota = parse_error_body(
+            r#"{"detail": {"code": "daily_run_quota_exceeded", "message": "今日问答次数已达上限", "action": "contact_admin"}}"#,
+        );
+        assert_eq!(quota.code.as_deref(), Some("daily_run_quota_exceeded"));
+        assert_eq!(quota.action.as_deref(), Some("contact_admin"));
+        assert_eq!(quota.message.as_deref(), Some("今日问答次数已达上限"));
+
+        // 形态 2：detail.{error,message}（onboarding / cli 授权错误）
+        let auth =
+            parse_error_body(r#"{"detail": {"error": "expired", "message": "激活码已过期"}}"#);
+        assert_eq!(auth.code.as_deref(), Some("expired"));
+        assert_eq!(auth.message.as_deref(), Some("激活码已过期"));
+
+        // 形态 3：detail 纯字符串（refresh 端点）
+        let refresh = parse_error_body(r#"{"detail": "检测到刷新令牌重放，会话已撤销"}"#);
+        assert_eq!(
+            refresh.message.as_deref(),
+            Some("检测到刷新令牌重放，会话已撤销")
+        );
+        assert!(refresh.code.is_none());
+
+        // 网关 404 与 text/plain 校验拒绝体
+        let gateway = parse_error_body(r#"{"error_msg": "404 Route Not Found"}"#);
+        assert_eq!(
+            gateway.message.as_deref(),
+            Some("网关错误：404 Route Not Found")
+        );
+        let plain = parse_error_body("invalid request");
+        assert_eq!(plain.message.as_deref(), Some("invalid request"));
+
+        assert!(default_status_message(404).contains("网关"));
+    }
+
+    #[test]
+    fn login_lockdown_appends_actionable_wait_seconds() {
+        use super::apply_lock_remaining;
+        assert_eq!(
+            apply_lock_remaining(423, "登录失败次数过多".into(), Some(300)),
+            "登录失败次数过多（请 300 秒后重试）"
+        );
+        // 非锁定状态或剩余 0 秒不加尾巴
+        assert_eq!(
+            apply_lock_remaining(429, "请求过于频繁".into(), Some(300)),
+            "请求过于频繁"
+        );
+        assert_eq!(
+            apply_lock_remaining(423, "登录失败次数过多".into(), Some(0)),
+            "登录失败次数过多"
+        );
     }
 
     #[test]

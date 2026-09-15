@@ -7,6 +7,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{State, ipc::Channel};
+use tauri_plugin_opener::OpenerExt;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
@@ -26,7 +27,7 @@ use crate::{
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
 const MAX_EMPTY_COMPLETED_POLLS: i64 = 4;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
     pub thread_id: String,
@@ -34,6 +35,10 @@ pub struct SendMessageRequest {
     pub request_id: String,
     #[serde(default)]
     pub attachments: Vec<PendingChatAttachment>,
+    /// 中断恢复（人工审批续跑）：被恢复的父 run ID。存在时 `question` 是
+    /// 用户对审批的答复，以 resume 载荷发送而非新 query，且不得带附件。
+    #[serde(default)]
+    pub resume_run_id: Option<String>,
 }
 
 #[tauri::command]
@@ -315,6 +320,439 @@ fn device_label(username: &str) -> String {
     format!("桌面端-{username}")
 }
 
+/// 从本地作用域（`{gateway}|{principal}`）解出服务端 principal；
+/// 无 `|` 的旧格式（legacy / api-key-sha256）原样返回。
+fn principal_of_scope(scope: &str) -> &str {
+    scope
+        .rsplit_once('|')
+        .map_or(scope, |(_, principal)| principal)
+}
+
+// ==== P5 企业激活码与设备码开户 ====
+
+/// 企业激活码开户（P0 主路径）：一次性激活码在服务端兑换为设备会话对，
+/// **不产生任何静态 Key**。兑换成功即完成会话 blob 的**首次落盘**——这是
+/// 会话生命周期的起点，`ensure_active_bearer` 的会话分支自此可达。
+#[tauri::command]
+pub async fn activate_enterprise_account(
+    mut activation_code: String,
+    gateway_url: String,
+    device_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<PublicSettings, CommandError> {
+    let result = activate_enterprise_account_inner(
+        &activation_code,
+        &gateway_url,
+        device_name.as_deref(),
+        &state,
+    )
+    .await;
+    activation_code.zeroize();
+    result.map_err(CommandError::from)
+}
+
+async fn activate_enterprise_account_inner(
+    activation_code: &str,
+    gateway_url: &str,
+    device_name: Option<&str>,
+    state: &AppState,
+) -> AppResult<PublicSettings> {
+    let code = activation_code.trim();
+    if !code.starts_with("yxact_") || code.len() < 8 || code.len() > 256 {
+        return Err(AppError::InvalidCredential);
+    }
+    let gateway = validate_gateway_url(gateway_url)?;
+    let secret = SecretString::from(code.to_owned());
+    let exchange = state
+        .yuxi
+        .exchange_onboarding_activation(&gateway, &secret, device_name.unwrap_or("桌面端"))
+        .await?;
+    let label = device_label(&exchange.user_name);
+    let server_agent_slug = persist_device_session(
+        state,
+        &gateway,
+        &exchange.account_scope_id,
+        &exchange.user_name,
+        &exchange.session,
+        &label,
+    )
+    .await?;
+    Ok(PublicSettings {
+        gateway_url: gateway,
+        agent_slug: server_agent_slug,
+        has_api_key: true,
+        api_key_hint: None,
+    })
+}
+
+/// 会话对的统一落盘：blob 写入（Stronghold）→ activate_account（SQLite 事务）
+/// → upsert_account。Stronghold 与 SQLite 无共同事务，SQLite 失败时补偿清除
+/// 刚写入的 blob，避免孤儿会话凭据。返回服务端权威默认智能体。
+async fn persist_device_session(
+    state: &AppState,
+    gateway: &str,
+    account_scope_id: &str,
+    user_name: &str,
+    session: &crate::yuxi::SessionPair,
+    key_name: &str,
+) -> AppResult<String> {
+    use crate::session::StoredSession;
+
+    let local_scope = local_account_scope(gateway, account_scope_id);
+    let now = chrono::Utc::now().timestamp();
+    let stored = StoredSession {
+        access_token: session.access_token.clone(),
+        refresh_token: session.refresh_token.clone(),
+        family_id: session.session_id.clone(),
+        access_expires_at: crate::session::parse_jwt_exp(&session.access_token)
+            .unwrap_or(now + session.access_expires_in),
+        account_scope_id: account_scope_id.to_owned(),
+    };
+    let json =
+        serde_json::to_string(&stored).map_err(|error| AppError::Internal(error.to_string()))?;
+    state.credentials.save_session_blob(&local_scope, &json)?;
+    if let Err(database_error) = state
+        .database
+        .activate_account(gateway, account_scope_id, "", Some(key_name))
+        .await
+    {
+        // 补偿：清除孤儿 blob，保持 Stronghold 与账号目录一致。
+        if let Err(cleanup_error) = state.credentials.delete_scope_records(&local_scope) {
+            diagnostics::log(
+                "ERROR",
+                "session_activation_rollback_failed",
+                &format!("{database_error}; {cleanup_error}"),
+            );
+        }
+        return Err(database_error);
+    }
+    if let Err(error) = state
+        .database
+        .upsert_account(&local_scope, user_name, gateway)
+        .await
+    {
+        diagnostics::log("WARN", "session_account_upsert_failed", &error.to_string());
+    }
+
+    let bearer = SecretString::from(session.access_token.clone());
+    let server_agent_slug = match refresh_server_agent_slug(state, gateway, &bearer).await {
+        Ok(slug) => slug,
+        Err(error) => {
+            diagnostics::log(
+                "WARN",
+                "session_agent_slug_refresh_failed",
+                &error.to_string(),
+            );
+            state.database.server_agent_slug().await?
+        }
+    };
+    diagnostics::log(
+        "INFO",
+        "session_established",
+        "device session persisted (scope record and family id redacted)",
+    );
+    Ok(server_agent_slug)
+}
+
+/// 设备码第一步：创建待授权会话。前端用返回的 `verification_uri_complete`
+/// 经 `open_authorization_page` 打开浏览器授权页，并提示用户核对 user_code。
+#[tauri::command]
+pub async fn begin_device_login(
+    gateway_url: String,
+    state: State<'_, AppState>,
+) -> Result<crate::yuxi::DeviceCodeStart, CommandError> {
+    let gateway = validate_gateway_url(&gateway_url).map_err(CommandError::from)?;
+    state
+        .yuxi
+        .start_cli_session(&gateway, None)
+        .await
+        .map_err(CommandError::from)
+}
+
+/// 设备码轮询结果：`pending` 表示等待浏览器授权（前端按 interval 继续轮询）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLoginPoll {
+    pub status: String,
+    pub settings: Option<PublicSettings>,
+}
+
+/// 设备码轮询兑换（P1 自服务会话路径）。兑换成功后：
+/// 1. 会话对走 `persist_device_session` 首次落盘；
+/// 2. **立即撤销服务端同时签发的 90 天过渡静态 Key**（用新会话令牌调用，
+///    404 幂等；失败仅 WARN 不阻断登录）——保证任何账号都不会同时持有
+///    「活会话 + 活静态 Key」，让 fail-closed 在结构上闭合；
+/// 3. 旧服务端无 session 字段时回退过渡 Key（静态 Key 账号路径）。
+#[tauri::command]
+pub async fn poll_device_login(
+    mut device_code: String,
+    gateway_url: String,
+    state: State<'_, AppState>,
+) -> Result<DeviceLoginPoll, CommandError> {
+    let result = poll_device_login_inner(&device_code, &gateway_url, &state).await;
+    device_code.zeroize();
+    result.map_err(CommandError::from)
+}
+
+async fn poll_device_login_inner(
+    device_code: &str,
+    gateway_url: &str,
+    state: &AppState,
+) -> AppResult<DeviceLoginPoll> {
+    let gateway = validate_gateway_url(gateway_url)?;
+    let secret = SecretString::from(device_code.trim().to_owned());
+    let Some(exchange) = state.yuxi.poll_cli_session_token(&gateway, &secret).await? else {
+        return Ok(DeviceLoginPoll {
+            status: "pending".into(),
+            settings: None,
+        });
+    };
+    match &exchange.session {
+        Some(session) => {
+            let label = device_label(&exchange.user_name);
+            let server_agent_slug = persist_device_session(
+                state,
+                &gateway,
+                &exchange.account_scope_id,
+                &exchange.user_name,
+                session,
+                &label,
+            )
+            .await?;
+            if let Some(key_id) = exchange.transition_key_id {
+                let bearer = SecretString::from(session.access_token.clone());
+                if let Err(error) = state
+                    .yuxi
+                    .delete_api_key_by_id(&gateway, &bearer, key_id)
+                    .await
+                {
+                    diagnostics::log(
+                        "WARN",
+                        "transition_key_revoke_failed",
+                        &format!("api_key_id={key_id}: {error}"),
+                    );
+                }
+            }
+            Ok(DeviceLoginPoll {
+                status: "done".into(),
+                settings: Some(PublicSettings {
+                    gateway_url: gateway,
+                    agent_slug: server_agent_slug,
+                    has_api_key: true,
+                    api_key_hint: None,
+                }),
+            })
+        }
+        None => {
+            // 旧服务端未签发会话对：过渡 Key 即主凭据，按静态 Key 账号落盘。
+            let secret = exchange
+                .transition_key_secret
+                .as_deref()
+                .map(SecretString::from)
+                .ok_or(AppError::Protocol(
+                    "服务端既未签发会话也未返回过渡密钥".into(),
+                ))?;
+            validate_api_key(secret.expose_secret())?;
+            let hint = api_key_hint(secret.expose_secret());
+            persist_local_connection(
+                state,
+                &gateway,
+                &exchange.account_scope_id,
+                &hint,
+                Some(device_label(&exchange.user_name).as_str()),
+                &secret,
+            )
+            .await?;
+            let local_scope = local_account_scope(&gateway, &exchange.account_scope_id);
+            if let Err(error) = state
+                .database
+                .upsert_account(&local_scope, &exchange.user_name, &gateway)
+                .await
+            {
+                diagnostics::log("WARN", "desktop_account_upsert_failed", &error.to_string());
+            }
+            // 旧服务端路径不撤销过渡 Key：没有会话对时它就是该账号的主凭据。
+            let server_agent_slug = refresh_server_agent_slug(state, &gateway, &secret).await?;
+            Ok(DeviceLoginPoll {
+                status: "done".into(),
+                settings: Some(PublicSettings {
+                    gateway_url: gateway,
+                    agent_slug: server_agent_slug,
+                    has_api_key: true,
+                    api_key_hint: Some(hint),
+                }),
+            })
+        }
+    }
+}
+
+/// 打开设备码浏览器授权页。不直接放行任意 URL：仅接受 HTTPS（本机调试允许
+/// loopback HTTP）、禁止内嵌凭证，把 opener 权限收敛在 Rust 侧校验之后。
+#[tauri::command]
+pub async fn open_authorization_page(
+    url: String,
+    app: tauri::AppHandle,
+) -> Result<(), CommandError> {
+    let parsed = url::Url::parse(url.trim())
+        .map_err(|_| CommandError::from(AppError::Protocol("授权页地址格式无效".into())))?;
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    let allowed = parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback);
+    if !allowed
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(CommandError::from(AppError::Protocol(
+            "授权页地址必须是 HTTPS（本机调试除外）且不携带凭据".into(),
+        )));
+    }
+    app.opener()
+        .open_url(parsed.to_string(), None::<&str>)
+        .map_err(|error| CommandError::from(AppError::Internal(error.to_string())))
+}
+
+// ==== P5 自省：配额 / 用量 / 设备会话管理 ====
+
+#[tauri::command]
+pub async fn get_user_quota(
+    state: State<'_, AppState>,
+) -> Result<crate::yuxi::QuotaSummary, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .get_user_quota(&gateway_url, &bearer)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn get_user_usage(
+    days: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<crate::yuxi::UsageSummary, CommandError> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .get_user_usage(&gateway_url, &bearer, days)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn list_auth_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::yuxi::DeviceSessionView>, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .list_device_sessions(&gateway_url, &bearer)
+        .await
+        .map_err(CommandError::from)
+}
+
+/// 远程下线指定设备会话族；若下线的是本机会话，同步清除本地 blob 并引导重登。
+#[tauri::command]
+pub async fn revoke_auth_session(
+    family_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let family_id = family_id.trim().to_string();
+    if family_id.is_empty() || family_id.len() > 128 {
+        return Err(CommandError::from(AppError::Protocol(
+            "会话标识格式无效".into(),
+        )));
+    }
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    state
+        .yuxi
+        .revoke_device_session(&gateway_url, &bearer, &family_id)
+        .await
+        .map_err(CommandError::from)?;
+    let scope = state
+        .database
+        .current_account_scope()
+        .await
+        .unwrap_or_default();
+    let matches_local_session = state
+        .credentials
+        .session_blob(&scope)
+        .ok()
+        .flatten()
+        .and_then(|blob| serde_json::from_str::<crate::session::StoredSession>(&blob).ok())
+        .is_some_and(|stored| stored.family_id == family_id);
+    if matches_local_session && let Err(error) = state.credentials.delete_scope_records(&scope) {
+        diagnostics::log("ERROR", "local_session_cleanup_failed", &error.to_string());
+    }
+    Ok(())
+}
+
+/// 多账号机器的旧历史人工认领：把 `legacy` 作用域的会话归入当前账号。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyClaimResult {
+    pub claimed_threads: u64,
+    pub claimed_messages: u64,
+}
+
+#[tauri::command]
+pub async fn claim_legacy_history(
+    state: State<'_, AppState>,
+) -> Result<LegacyClaimResult, CommandError> {
+    let scope = state
+        .database
+        .current_account_scope()
+        .await
+        .map_err(CommandError::from)?;
+    if !principal_of_scope(&scope).starts_with("yxacct_") {
+        return Err(CommandError::from(AppError::Protocol(
+            "当前账号不是服务端权威账号，无法认领旧历史".into(),
+        )));
+    }
+    state
+        .database
+        .claim_legacy_scope(&scope)
+        .await
+        .map(|(threads, messages)| LegacyClaimResult {
+            claimed_threads: threads,
+            claimed_messages: messages,
+        })
+        .map_err(CommandError::from)
+}
+
 /// Stronghold、账号目录和会话统一使用「规范网关|服务端账号作用域」。
 /// 兼容已经采用该格式的记录，避免账号切换时重复拼接网关。
 fn local_account_scope(gateway_url: &str, principal: &str) -> String {
@@ -347,55 +785,126 @@ async fn refresh_server_agent_slug(
 
 /// P2b：返回当前应使用的 Bearer 凭证。
 ///
-/// 会话访问令牌仍有效时优先使用；临近过期（<120s）自动旋转一次。
+/// 会话访问令牌仍有效时优先使用；临近过期（<120s）经**按作用域单飞锁**旋转一次
+/// ——服务端对已消费的刷新令牌判重放并撤销整个会话族，并发刷新会自己把自己
+/// 踢下线；等待者拿到锁后**双重检查**（重读 blob、重解析 exp），只复用新令牌。
 ///
-/// P5 fail-closed：会话型账号（存在会话 blob）在旋转失败时**禁止回退静态 API Key**——
-/// 管理员撤销设备后静态 Key 不能成为旁路。返回 SessionRequiresRelogin 让前端引导
-/// 重新登录；仅"无任何会话记录"的传统手动 Key 账号继续走 api_key() 路径。
+/// P5 fail-closed：会话型账号（存在会话 blob）在旋转失败时**禁止回退静态 API Key**
+/// ——管理员撤销设备后静态 Key 不能成为旁路。刷新令牌终态死亡（401 族）时清除
+/// 该作用域的会话 blob 并返回 SessionRequiresRelogin 引导重新登录；网络类瞬态
+/// 失败（超时/5xx）原样返回可重试错误，不清 blob。仅"无任何会话记录"的传统
+/// 手动 Key 账号继续走 api_key() 路径。
 pub(crate) async fn ensure_active_bearer(state: &AppState) -> AppResult<SecretString> {
     use crate::session::{StoredSession, parse_jwt_exp};
 
     let gateway = state.database.gateway_url().await?;
     let scope = state.database.current_account_scope().await?;
-    let blob = match state.credentials.session_blob(&scope)? {
-        Some(blob) => blob,
-        None => return state.credentials.api_key(),
-    };
-    let stored = serde_json::from_str::<StoredSession>(&blob).map_err(|error| {
-        diagnostics::log("ERROR", "session_blob_corrupted", &error.to_string());
-        AppError::SessionRequiresRelogin
-    })?;
-
-    let now = chrono::Utc::now().timestamp();
-    let expires_at = parse_jwt_exp(&stored.access_token).unwrap_or(stored.access_expires_at);
-    if expires_at.saturating_sub(now) > 120 {
-        return Ok(SecretString::from(stored.access_token));
+    if state.credentials.session_blob(&scope)?.is_none() {
+        return state.credentials.api_key();
+    }
+    if session_access_still_valid(state, &scope) {
+        return session_access_token(state, &scope);
     }
 
-    let refresh_secret = SecretString::from(stored.refresh_token.clone());
-    match state
+    // 单飞：同作用域并发刷新只有一个任务真正发起 HTTP 轮换。
+    let lock = state.session_refresh_lock(&scope)?;
+    let _guard = lock.lock().await;
+    // 双重检查：拿到锁时其他任务可能已完成轮换，直接复用新令牌。
+    if session_access_still_valid(state, &scope) {
+        return session_access_token(state, &scope);
+    }
+
+    let (stored, refresh_secret) = match load_stored_session(state, &scope) {
+        Ok(stored) => (
+            stored.clone(),
+            SecretString::from(stored.refresh_token.clone()),
+        ),
+        Err(error) => return Err(error),
+    };
+    let rotated = match state
         .yuxi
         .refresh_cli_session(&gateway, &refresh_secret)
         .await
     {
-        Ok(rotated) => {
-            let new_expires = parse_jwt_exp(&rotated.access_token).unwrap_or(now + 30 * 60);
-            let updated = StoredSession {
-                access_token: rotated.access_token.clone(),
-                refresh_token: rotated.refresh_token,
-                family_id: stored.family_id,
-                access_expires_at: new_expires,
-            };
-            if let Ok(json) = serde_json::to_string(&updated) {
-                state.credentials.save_session_blob(&scope, &json)?;
-            }
-            Ok(SecretString::from(rotated.access_token))
-        }
+        Ok(rotated) => rotated,
         Err(error) => {
             diagnostics::log("WARN", "session_refresh_failed", &error.to_string());
-            Err(AppError::SessionRequiresRelogin)
+            // 刷新端点的 401 一律终态（invalid_grant/revoked/reuse/过期共用，
+            // detail 为纯字符串没有结构化 code）：清除死 blob，让 has_session
+            // 归 false、前端自然回落连接设置；网络类瞬态失败原样透传。
+            let terminal = error.is_session_terminal() || matches!(error, AppError::Unauthorized);
+            if terminal {
+                if let Err(cleanup_error) = state.credentials.delete_scope_records(&scope) {
+                    diagnostics::log(
+                        "ERROR",
+                        "session_blob_cleanup_failed",
+                        &cleanup_error.to_string(),
+                    );
+                }
+                return Err(AppError::SessionRequiresRelogin);
+            }
+            return Err(error);
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let new_expires = parse_jwt_exp(&rotated.access_token).unwrap_or(now + 30 * 60);
+    let updated = StoredSession {
+        access_token: rotated.access_token.clone(),
+        refresh_token: rotated.refresh_token,
+        family_id: stored.family_id,
+        access_expires_at: new_expires,
+        account_scope_id: stored.account_scope_id,
+    };
+    match serde_json::to_string(&updated) {
+        Ok(json) => {
+            if let Err(save_error) = state.credentials.save_session_blob(&scope, &json) {
+                // 轮换已发生但本地无法固化新刷新令牌：保留旧 blob 会在下次用已
+                // 消费的令牌重放，必须清除并要求重新登录。
+                diagnostics::log(
+                    "ERROR",
+                    "session_blob_write_failed",
+                    &save_error.to_string(),
+                );
+                let _ = state.credentials.delete_scope_records(&scope);
+                return Err(AppError::SessionRequiresRelogin);
+            }
+        }
+        Err(error) => {
+            diagnostics::log("ERROR", "session_blob_serialize_failed", &error.to_string());
+            let _ = state.credentials.delete_scope_records(&scope);
+            return Err(AppError::SessionRequiresRelogin);
         }
     }
+    Ok(SecretString::from(rotated.access_token))
+}
+
+/// 读取并解析当前作用域的会话 blob；损坏视同需要重新登录。
+fn load_stored_session(state: &AppState, scope: &str) -> AppResult<crate::session::StoredSession> {
+    let blob = state
+        .credentials
+        .session_blob(scope)?
+        .ok_or(AppError::SessionRequiresRelogin)?;
+    serde_json::from_str(&blob).map_err(|error| {
+        diagnostics::log("ERROR", "session_blob_corrupted", &error.to_string());
+        AppError::SessionRequiresRelogin
+    })
+}
+
+fn session_access_still_valid(state: &AppState, scope: &str) -> bool {
+    let Ok(stored) = load_stored_session(state, scope) else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expires_at =
+        crate::session::parse_jwt_exp(&stored.access_token).unwrap_or(stored.access_expires_at);
+    expires_at.saturating_sub(now) > 120
+}
+
+fn session_access_token(state: &AppState, scope: &str) -> AppResult<SecretString> {
+    Ok(SecretString::from(
+        load_stored_session(state, scope)?.access_token,
+    ))
 }
 
 /// Stronghold 与 SQLite 无法组成同一个物理事务，因此显式保留旧凭证并补偿回滚。
@@ -446,13 +955,16 @@ pub async fn test_connection(state: State<'_, AppState>) -> Result<(), CommandEr
         .gateway_url()
         .await
         .map_err(CommandError::from)?;
-    let api_key = state.credentials.api_key().map_err(CommandError::from)?;
-    state
-        .yuxi
-        .test_connection(&gateway_url, agent_slug(), &api_key)
+    // 会话感知：纯会话账号（无静态 Key）也必须能通过连接测试。
+    let bearer = ensure_active_bearer(&state)
         .await
         .map_err(CommandError::from)?;
-    refresh_server_agent_slug(&state, &gateway_url, &api_key)
+    state
+        .yuxi
+        .test_connection(&gateway_url, agent_slug(), &bearer)
+        .await
+        .map_err(CommandError::from)?;
+    refresh_server_agent_slug(&state, &gateway_url, &bearer)
         .await
         .map_err(CommandError::from)?;
     Ok(())
@@ -464,6 +976,18 @@ pub async fn delete_api_key(state: State<'_, AppState>) -> Result<(), CommandErr
         .credentials
         .delete_api_key()
         .map_err(CommandError::from)?;
+    // 登出时同时清掉当前作用域的 Key/会话记录，防止残留凭据串到下次登录。
+    let scope = state
+        .database
+        .current_account_scope()
+        .await
+        .map_err(CommandError::from)?;
+    if !scope.is_empty()
+        && scope != "legacy"
+        && let Err(error) = state.credentials.delete_scope_records(&scope)
+    {
+        diagnostics::log("WARN", "scope_records_cleanup_failed", &error.to_string());
+    }
     state
         .database
         .save_setting("api_key_hint", "")
@@ -818,17 +1342,27 @@ async fn send_message_inner(
             &request.attachments,
         )
         .await?;
+    // 续跑（人工审批）：query 省略，用户答复以 resume 载荷发送；
+    // 沿用父 run 冻结模型，不携带请求级 model_spec。
+    let resume_payload = request.resume_run_id.as_deref().and_then(|parent_run_id| {
+        (!parent_run_id.trim().is_empty()).then(|| {
+            let answer = serde_json::Value::String(question.to_owned());
+            (answer, parent_run_id.trim().to_owned())
+        })
+    });
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-        result = state.yuxi.create_run(
+        result = state.yuxi.create_run_with_resume(
             &gateway_url,
             &run_agent_slug,
             &api_key,
-            question,
+            if resume_payload.is_some() { None } else { Some(question) },
             &yuxi_thread_id,
             &request.request_id,
             None,
             &attachment_file_ids,
+            resume_payload.as_ref().map(|(answer, _)| answer),
+            resume_payload.as_ref().map(|(_, parent)| parent.as_str()),
         ) => result?,
     };
     state.set_request_run_id(&request.request_id, &created.run_id)?;
@@ -873,6 +1407,7 @@ async fn send_message_inner(
     let mut progress_text = ProgressText::default();
     let mut last_event_id: Option<String> = None;
     let mut terminal_received = false;
+    let mut error_frame_received = false;
 
     for attempt in 0..4 {
         if attempt > 0 {
@@ -993,13 +1528,16 @@ async fn send_message_inner(
                         break;
                     }
                     if event.event == "error" {
+                        // error 帧不再盲目重连：转 wait_for_result 以结果端点
+                        // （权威）裁决终态，避免对已失败任务叠加 4 次重连。
+                        error_frame_received = true;
                         break;
                     }
                 }
                 Some(Err(_)) | None => break,
             }
         }
-        if terminal_received {
+        if terminal_received || error_frame_received {
             break;
         }
     }
@@ -1089,13 +1627,58 @@ async fn send_message_inner(
         }
         "cancelled" => Err(AppError::Cancelled),
         _ => {
-            let message = final_result.error.unwrap_or_else(|| {
-                if final_result.status == "interrupted" {
-                    "服务端已中断本次运行，请在 Yuxi 服务端处理需要人工确认的步骤后重试".into()
+            if final_result.status == "interrupted" {
+                // 可续跑态（人工审批等待）：不是错误。已流式产出的内容先落库，
+                // 向 UI 发 Done(status=interrupted)，前端呈现「继续运行」入口，
+                // 用户答复经 SendMessageRequest.resume_run_id 以 resume 续跑。
+                let persisted_text = if final_text.trim().is_empty() {
+                    accumulated.clone()
                 } else {
-                    "Agent 运行失败".into()
+                    final_text.clone()
+                };
+                if !persisted_text.trim().is_empty() {
+                    state
+                        .database
+                        .append_message(
+                            &format!("assistant-{}", created.run_id),
+                            &request.thread_id,
+                            "assistant",
+                            &persisted_text,
+                        )
+                        .await?;
                 }
-            });
+                state
+                    .database
+                    .update_run_progress(
+                        &created.run_id,
+                        "interrupted",
+                        last_event_id.as_deref(),
+                        &persisted_text,
+                        Some("awaiting_approval"),
+                        true,
+                    )
+                    .await?;
+                send_channel(
+                    on_event,
+                    RunEvent::Done {
+                        run_id: created.run_id.clone(),
+                        status: "interrupted".into(),
+                        text: persisted_text.clone(),
+                        context: Box::new(context.clone()),
+                    },
+                )?;
+                return Ok(ChatCompletion {
+                    run_id: created.run_id,
+                    thread_id: created.thread_id,
+                    request_id: created.request_id,
+                    status: "interrupted".into(),
+                    text: persisted_text,
+                    context,
+                });
+            }
+            let message = final_result
+                .error
+                .unwrap_or_else(|| "Agent 运行失败".into());
             let error = if is_reasoning_protocol_failure(&message) {
                 AppError::ServerUpgradeRequired
             } else {
@@ -1131,7 +1714,7 @@ async fn send_message_inner(
                     &final_result.status,
                     last_event_id.as_deref(),
                     persisted_text,
-                    final_result.error_code.as_deref().or(Some(error.code())),
+                    final_result.error_code.as_deref().or(Some(&error.code())),
                     true,
                 )
                 .await?;
@@ -1238,6 +1821,10 @@ async fn cancel_local_run<T>(state: &AppState, run_id: &str, text: &str) -> AppR
 }
 
 fn validate_send_request(request: &SendMessageRequest) -> AppResult<()> {
+    let is_resume = request
+        .resume_run_id
+        .as_deref()
+        .is_some_and(|run_id| !run_id.trim().is_empty());
     if request.question.trim().is_empty() || request.question.chars().count() > 20_000 {
         return Err(AppError::Protocol(
             "问题长度必须为 1 至 20000 个字符".into(),
@@ -1245,6 +1832,19 @@ fn validate_send_request(request: &SendMessageRequest) -> AppResult<()> {
     }
     if request.attachments.len() > 6 {
         return Err(AppError::Protocol("每次最多添加 6 个附件".into()));
+    }
+    if is_resume && !request.attachments.is_empty() {
+        return Err(AppError::Protocol("续跑请求不能携带新附件".into()));
+    }
+    if is_resume {
+        let parent_run_id = request.resume_run_id.as_deref().unwrap_or_default();
+        let valid_shape = (1..=128).contains(&parent_run_id.len())
+            && parent_run_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character));
+        if !valid_shape {
+            return Err(AppError::Protocol("续跑的父任务标识格式无效".into()));
+        }
     }
     if request.attachments.iter().any(|attachment| {
         attachment.tmp_file_id.is_empty()
@@ -1350,19 +1950,33 @@ pub async fn switch_account(
         .cloned()
         .ok_or_else(|| CommandError::from(AppError::MissingCredential))?;
 
-    // 2) 从 Stronghold 取该作用域的 Key，拷贝为 ACTIVE 记录；失败不触碰现有指针
-    let key = state
+    // 2) 从 Stronghold 取该作用域的凭据：静态 Key 拷贝为 ACTIVE 记录；
+    //    纯会话账号没有 Key——清除 ACTIVE 缓存（blob 本身按作用域直读，
+    //    ensure_active_bearer 不经过 ACTIVE）。两者都缺才是坏账号。
+    let scoped_key = state.credentials.api_key_for_scope(&account_scope)?;
+    let has_session = state
         .credentials
-        .api_key_for_scope(&account_scope)?
-        .ok_or(AppError::MissingCredential)?;
-    let hint = api_key_hint(key.expose_secret());
+        .session_blob(&account_scope)
+        .map_err(CommandError::from)?
+        .is_some();
+    if scoped_key.is_none() && !has_session {
+        return Err(CommandError::from(AppError::MissingCredential));
+    }
+    let hint = scoped_key
+        .as_ref()
+        .map(|key| api_key_hint(key.expose_secret()))
+        .unwrap_or_default();
 
     let previous_active = if state.credentials.has_api_key()? {
         Some(state.credentials.api_key()?)
     } else {
         None
     };
-    state.credentials.save_api_key(key.expose_secret())?;
+    match &scoped_key {
+        Some(key) => state.credentials.save_api_key(key.expose_secret())?,
+        // 切到纯会话账号时清掉残留的旧 ACTIVE Key，避免 has_api_key 误报连接。
+        None => state.credentials.delete_api_key()?,
+    }
     let remote_principal = remote_principal_for_scope(&target.gateway_url, &account_scope);
     if let Err(database_error) = state
         .database
@@ -1374,9 +1988,13 @@ pub async fn switch_account(
         )
         .await
     {
-        let rollback = match previous_active {
-            Some(previous) => state.credentials.save_api_key(previous.expose_secret()),
-            None => state.credentials.delete_api_key(),
+        let rollback = match (previous_active, &scoped_key) {
+            (Some(previous), _) => state.credentials.save_api_key(previous.expose_secret()),
+            (None, Some(_)) => {
+                // 原本无 ACTIVE Key（纯会话账号）却被我们写入了 Key：删除恢复。
+                state.credentials.delete_api_key()
+            }
+            (None, None) => Ok(()),
         };
         if let Err(rollback_error) = rollback {
             diagnostics::log(
@@ -1628,11 +2246,14 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunEvent, SendMessageRequest, extract_run_trace_event, is_reasoning_protocol_failure,
-        local_account_scope, remote_principal_for_scope, run_progress_message,
-        validate_send_request,
+        AppState, RunEvent, SendMessageRequest, ensure_active_bearer, extract_run_trace_event,
+        is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
+        remote_principal_for_scope, run_progress_message, validate_send_request,
     };
+    use crate::yuxi::PendingChatAttachment;
+    use secrecy::ExposeSecret as _;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn trace_event_serializes_with_camel_case_wrapper_and_raw_wire_payload() {
@@ -1742,8 +2363,45 @@ mod tests {
             question: "水稻胚乳何时完成细胞化？".into(),
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
             attachments: vec![],
+            resume_run_id: None,
         };
         assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn resume_requests_reject_attachments_and_bad_parent_ids() {
+        let base = SendMessageRequest {
+            thread_id: "thread-1".into(),
+            question: "确认继续".into(),
+            request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
+            attachments: vec![],
+            resume_run_id: Some("run-parent-1".into()),
+        };
+        assert!(validate_send_request(&base).is_ok());
+
+        let with_attachment = SendMessageRequest {
+            attachments: vec![PendingChatAttachment {
+                tmp_file_id: "tmp-1".into(),
+                file_name: "a.pdf".into(),
+                file_type: Some("application/pdf".into()),
+                file_size: 128,
+                bucket_name: "b".into(),
+                object_name: "o".into(),
+                parse_supported: true,
+                parse_methods: vec![],
+                parsed_object_name: None,
+                parse_method: None,
+                truncated: false,
+            }],
+            ..base.clone()
+        };
+        assert!(validate_send_request(&with_attachment).is_err());
+
+        let bad_parent = SendMessageRequest {
+            resume_run_id: Some("bad parent id!".into()),
+            ..base
+        };
+        assert!(validate_send_request(&bad_parent).is_err());
     }
 
     #[test]
@@ -1759,6 +2417,21 @@ mod tests {
     }
 
     #[test]
+    fn extracts_principal_from_local_scope_for_all_generations() {
+        // 新格式：网关|yxacct_
+        assert_eq!(
+            principal_of_scope("https://api.example.cn|yxacct_0123456789abcdef"),
+            "yxacct_0123456789abcdef"
+        );
+        // 旧格式：legacy / api-key-sha256 摘要（无竖线，原样返回）
+        assert_eq!(principal_of_scope("legacy"), "legacy");
+        assert_eq!(
+            principal_of_scope("api-key-sha256:0123abcd"),
+            "api-key-sha256:0123abcd"
+        );
+    }
+
+    #[test]
     fn detects_reasoning_protocol_failure_from_legacy_server() {
         let message = "Model call failed after 3 attempts with BadRequestError: The `reasoning_content` in the thinking mode must be passed back to the API.";
         assert!(is_reasoning_protocol_failure(message));
@@ -1769,5 +2442,138 @@ mod tests {
         assert!(!is_reasoning_protocol_failure(
             "reasoning_content is an API field described in this answer"
         ));
+    }
+
+    // ---- 单飞锁并发测试：8 个并发 ensure_active_bearer 只允许一次 HTTP 轮换 ----
+    //
+    // 这是 P0 安全验收（并发刷新不得触发服务端 reuse_detected 整族撤销）的
+    // 机器判据。刷新端点用测试内手写的极简 HTTP 计数服务模拟（std TcpListener
+    // + 原子计数，不引入 mock 依赖），每个请求一条连接、Connection: close。
+
+    /// 生成形如 header.payload.signature 的 JWT；exp 可指定（epoch 秒）。
+    fn fake_jwt(exp: i64) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp},"sub":"7"}}"#));
+        format!("{header}.{payload}.c2ln")
+    }
+
+    /// 在 127.0.0.1 随机端口起一个「刷新端点」：返回新会话对并计数收到的请求。
+    fn spawn_refresh_counter_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind counter server");
+        let addr = listener.local_addr().expect("local addr");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_thread = counter.clone();
+        std::thread::spawn(move || {
+            let now = chrono::Utc::now().timestamp();
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                counter_for_thread.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let body = format!(
+                    r#"{{"access_token":"{}","refresh_token":"yxrt_rotated_new"}}"#,
+                    fake_jwt(now + 30 * 60)
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), counter)
+    }
+
+    #[tokio::test]
+    async fn concurrent_bearer_refresh_rotates_exactly_once() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        let root =
+            std::env::temp_dir().join(format!("daoxin-single-flight-{}", uuid::Uuid::new_v4()));
+        // Arc 包装以便 8 个 'static 任务共享同一 AppState（字段均已内部同步）。
+        let state = Arc::new(AppState::open(&root, "test").await.expect("open app state"));
+
+        let (gateway_url, counter) = spawn_refresh_counter_server();
+        let scope = "http://127.0.0.1:9088|yxacct_concurrent0123456789";
+        state
+            .database
+            .save_setting("gateway_url", &gateway_url)
+            .await
+            .expect("save gateway");
+        state
+            .database
+            .save_setting("current_account_scope", scope)
+            .await
+            .expect("save scope");
+        // 过期访问令牌 + 有效刷新令牌：所有并发任务都会进入刷新路径
+        let now = chrono::Utc::now().timestamp();
+        let stored = crate::session::StoredSession {
+            access_token: fake_jwt(now - 3600),
+            refresh_token: "yxrt_original".into(),
+            family_id: "fam-concurrent".into(),
+            access_expires_at: now - 3600,
+            account_scope_id: "yxacct_concurrent0123456789".into(),
+        };
+        state
+            .credentials
+            .save_session_blob(scope, &serde_json::to_string(&stored).expect("serialize"))
+            .expect("save session blob");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state_for_task = state.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_active_bearer(&state_for_task).await
+            }));
+        }
+        let mut tokens = Vec::new();
+        for handle in handles {
+            let token = handle.await.expect("join").expect("bearer ok");
+            tokens.push(token.expose_secret().to_owned());
+        }
+
+        // 全部拿到同一个新访问令牌，且刷新端点只被调用一次
+        assert!(tokens.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "并发刷新必须单飞");
+        assert!(tokens[0] != stored.access_token);
+
+        // 回写的新 blob 已替换旧刷新令牌
+        let updated = state
+            .credentials
+            .session_blob(scope)
+            .expect("read blob")
+            .expect("blob exists");
+        assert!(updated.contains("yxrt_rotated_new"));
+
+        drop(state);
+        remove_state_test_directory(&root).await;
+    }
+
+    async fn remove_state_test_directory(path: &std::path::Path) {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("remove state test directory: {:?}", last_error.unwrap());
     }
 }

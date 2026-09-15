@@ -255,6 +255,80 @@ impl Database {
         Ok(())
     }
 
+    /// 存量 `legacy` 作用域认领（v0.5 升级路径）：把旧版本的本地会话历史
+    /// 归入当前权威账号。幂等——由调用方用 `scope_migration_v1_done` 标记守卫；
+    /// **不加编号迁移**（sqlx 编号迁移会造成不可回退点，v0.5 必须能回装 v0.4.8）。
+    pub async fn claim_legacy_scope(&self, target_scope: &str) -> AppResult<(u64, u64)> {
+        let timestamp = now();
+        let mut transaction = self.pool.begin().await?;
+        let threads = sqlx::query(
+            "UPDATE threads SET account_scope = ?, updated_at = ? WHERE account_scope = 'legacy'",
+        )
+        .bind(target_scope)
+        .bind(&timestamp)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        // messages 按 thread 归属反推：仅认领已划入目标作用域的线程下的 legacy 消息
+        //（复用 0006 的作用域联动策略，避免把其他账号的 legacy 行误领）。
+        let messages = sqlx::query(
+            "UPDATE messages SET account_scope = ? WHERE account_scope = 'legacy' \
+             AND thread_id IN (SELECT id FROM threads WHERE account_scope = ?)",
+        )
+        .bind(target_scope)
+        .bind(target_scope)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok((threads, messages))
+    }
+
+    /// 启动时的自动认领（发布门）：仅当当前作用域已是服务端权威账号
+    /// （principal 以 yxacct_ 开头）、标记未置位、且**认领前账号目录行数 ≤ 1**
+    /// （三要素登录必然已写 accounts，「表为空」会把单账号机器误判为多账号）
+    /// 才执行。多账号机器不自动认领（标记记为 skipped，设置页人工触发），
+    /// 防止把 A 账号的历史挂到 B 账号名下。
+    pub async fn maybe_claim_legacy_scope_on_startup(&self) -> AppResult<()> {
+        const MARKER: &str = "scope_migration_v1_done";
+        if self
+            .setting(MARKER)
+            .await?
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Ok(());
+        }
+        let current = self.current_account_scope().await?;
+        let principal = current
+            .rsplit_once('|')
+            .map_or(current.as_str(), |(_, p)| p);
+        if !principal.starts_with("yxacct_") {
+            return Ok(());
+        }
+        let account_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&self.pool)
+            .await?;
+        if account_rows > 1 {
+            // 多账号：永不自动认领，留给设置页的人工按钮。
+            self.save_setting(MARKER, "skipped_multi_account").await?;
+            diagnostics::log(
+                "INFO",
+                "scope_migration_skipped_multi_account",
+                &format!("accounts={account_rows}"),
+            );
+            return Ok(());
+        }
+        let (threads, messages) = self.claim_legacy_scope(&current).await?;
+        self.save_setting(MARKER, "1").await?;
+        diagnostics::log(
+            "INFO",
+            "scope_migration_claimed",
+            &format!("threads={threads} messages={messages}"),
+        );
+        Ok(())
+    }
+
     pub async fn create_thread(&self) -> AppResult<ThreadSummary> {
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
@@ -1198,6 +1272,193 @@ mod migration_tests {
         remove_test_directory(&root).await;
     }
 
+    // ---- v0.5 legacy 作用域认领：幂等 / 单账号自动 / 多账号跳过 ----
+
+    #[tokio::test]
+    async fn startup_claim_runs_once_for_single_account_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("daoxin-claim-single-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        let scope = "https://api.example.cn|yxacct_0123456789abcdef0123456789abcdef";
+        database
+            .activate_account(
+                "https://api.example.cn",
+                "yxacct_0123456789abcdef0123456789abcdef",
+                "yxacct_0123456789abcdef0123456789abcdef",
+                Some("A"),
+            )
+            .await
+            .expect("activate authoritative account");
+        // 旧版本遗留：legacy 作用域下的历史会话与消息
+        sqlx::query(
+            "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at)              VALUES('legacy-thread-1', '旧会话', 'default-chatbot', 'legacy', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert legacy thread");
+        sqlx::query(
+            "INSERT INTO messages(id, thread_id, role, content, attachments_json, position, account_scope, created_at)              VALUES('legacy-msg-1', 'legacy-thread-1', 'user', '旧问题', '[]', 0, 'legacy', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert legacy message");
+
+        database
+            .maybe_claim_legacy_scope_on_startup()
+            .await
+            .expect("startup claim");
+        assert_eq!(
+            database
+                .list_threads()
+                .await
+                .expect("threads in new scope")
+                .len(),
+            1,
+            "legacy 会话应归入当前权威账号"
+        );
+        assert_eq!(
+            database
+                .setting("scope_migration_v1_done")
+                .await
+                .expect("marker")
+                .as_deref(),
+            Some("1")
+        );
+
+        // 幂等：再次启动不得重复执行（标记已置位）
+        database
+            .maybe_claim_legacy_scope_on_startup()
+            .await
+            .expect("second startup claim");
+        assert_eq!(
+            database
+                .setting("scope_migration_v1_done")
+                .await
+                .expect("marker")
+                .as_deref(),
+            Some("1")
+        );
+
+        // 新建的 legacy 行也不会在标记置位后被误领
+        sqlx::query(
+            "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at)              VALUES('legacy-thread-2', '后到旧会话', 'default-chatbot', 'legacy', '2025-01-02T00:00:00Z', '2025-01-02T00:00:00Z')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert second legacy thread");
+        database
+            .maybe_claim_legacy_scope_on_startup()
+            .await
+            .expect("third startup claim");
+        let scopes: Vec<String> =
+            sqlx::query_scalar("SELECT account_scope FROM threads ORDER BY id")
+                .fetch_all(&database.pool)
+                .await
+                .expect("thread scopes");
+        assert_eq!(
+            scopes,
+            vec![scope.to_owned(), "legacy".to_owned()],
+            "标记置位后不得再认领"
+        );
+
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
+    async fn startup_claim_skips_machines_with_multiple_accounts() {
+        let root = std::env::temp_dir().join(format!("daoxin-claim-multi-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        // 多账号机器：当前作用域已是权威账号，但目录里还有另一个账号——
+        // 不自动认领（防止把 A 的历史挂到 B 名下），标记记为 skipped。
+        database
+            .activate_account(
+                "https://api.example.cn",
+                "yxacct_aaaa0123456789abcdef0123",
+                "hint-a",
+                Some("A"),
+            )
+            .await
+            .expect("activate account A");
+        database
+            .activate_account(
+                "https://api.example.cn",
+                "yxacct_bbbb0123456789abcdef0123",
+                "hint-b",
+                Some("B"),
+            )
+            .await
+            .expect("activate account B");
+        sqlx::query(
+            "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at)              VALUES('legacy-thread-m', '多账号旧会话', 'default-chatbot', 'legacy', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert legacy thread");
+
+        database
+            .maybe_claim_legacy_scope_on_startup()
+            .await
+            .expect("startup claim on multi-account machine");
+
+        let marker = database
+            .setting("scope_migration_v1_done")
+            .await
+            .expect("marker")
+            .unwrap_or_default();
+        assert!(
+            marker.contains("skipped"),
+            "多账号机器应记 skipped，实际：{marker}"
+        );
+        // legacy 行保持原状，等待设置页人工认领
+        let legacy_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM threads WHERE account_scope = 'legacy'")
+                .fetch_one(&database.pool)
+                .await
+                .expect("count legacy threads");
+        assert_eq!(legacy_count, 1, "多账号机器不得自动认领");
+
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
+    #[tokio::test]
+    async fn startup_claim_noops_without_authoritative_scope() {
+        let root = std::env::temp_dir().join(format!("daoxin-claim-noop-{}", Uuid::new_v4()));
+        let database = Database::open(&root).await.expect("create test database");
+        // 当前作用域是 legacy（未登录新账号）：启动认领必须 no-op
+        sqlx::query(
+            "INSERT INTO threads(id, title, agent_slug, account_scope, created_at, updated_at)              VALUES('legacy-thread-n', '未登录旧会话', 'default-chatbot', 'legacy', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("insert legacy thread");
+
+        database
+            .maybe_claim_legacy_scope_on_startup()
+            .await
+            .expect("startup claim no-op");
+        assert_eq!(
+            database
+                .setting("scope_migration_v1_done")
+                .await
+                .expect("marker"),
+            None,
+            "无权威账号时不得置标记"
+        );
+        let legacy_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM threads WHERE account_scope = 'legacy'")
+                .fetch_one(&database.pool)
+                .await
+                .expect("count legacy threads");
+        assert_eq!(legacy_count, 1);
+
+        database.pool.close().await;
+        drop(database);
+        remove_test_directory(&root).await;
+    }
+
     async fn remove_test_directory(path: &std::path::Path) {
         let mut last_error = None;
         for _ in 0..20 {
@@ -1214,7 +1475,9 @@ mod migration_tests {
     fn decode_hex(value: &str) -> Vec<u8> {
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("ASCII checksum");
                 u8::from_str_radix(pair, 16).expect("hex checksum")
