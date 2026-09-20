@@ -2537,14 +2537,13 @@ mod tests {
 
     use super::{
         ClarificationQuestion, CreateRunRequest, OTHER_OPTION_VALUE, ProgressText, QuestionAnswer,
-        QuestionOption, RunRequestMeta, ServerRunContext, TmpAttachmentConfirmItem,
-        build_resume_payload, connection_error_for_gateway, default_status_message, final_output,
+        QuestionOption, RunRequestMeta, TmpAttachmentConfirmItem, build_resume_payload,
+        connection_error_for_gateway, default_status_message, final_output,
         parse_default_agent_slug, parse_desktop_login_response, parse_device_code_exchange,
         parse_device_code_start, parse_error_body, parse_interrupt_questions,
         parse_onboarding_exchange, parse_protocol_info, parse_run_result, protocol_major,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
-    // 保持与历史测试同路径：部分用例直接构造 ServerRunContext 字面量。
 
     #[test]
     fn serializes_the_same_native_agent_run_contract_as_web() {
