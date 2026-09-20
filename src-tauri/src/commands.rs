@@ -22,10 +22,10 @@ use crate::{
     state::AppState,
     yuxi::{
         CitationRef, ClarificationQuestion, FigureCardAsset, LocatorCandidate, ModelOption,
-        PendingChatAttachment, ProgressText, ProtocolInfo, QuestionAnswer, QuestionOption,
-        RunResult, ServerRunContext, build_resume_payload, parse_citation_ready,
-        parse_custom_warning, parse_interrupt_questions, parse_locator_candidates,
-        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
+        PendingChatAttachment, ProgressText, ProtocolInfo, QuestionAnswer, RunResult,
+        ServerRunContext, build_resume_payload, parse_citation_ready, parse_custom_warning,
+        parse_interrupt_questions, parse_locator_candidates, sanitize_visible_model_text,
+        terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -2560,12 +2560,12 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ClarificationQuestion, QuestionAnswer, QuestionOption, RunEvent,
-        SendMessageRequest, ensure_active_bearer, extract_run_trace_event, is_known_sse_event,
-        is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
+        AppState, CitationRef, ClarificationQuestion, LocatorCandidate, QuestionAnswer, RunEvent,
+        SendMessageRequest, ensure_active_bearer, extract_run_trace_event, is_known_custom_event,
+        is_known_sse_event, is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
         remote_principal_for_scope, run_progress_message, validate_send_request,
     };
-    use crate::yuxi::PendingChatAttachment;
+    use crate::yuxi::{PendingChatAttachment, QuestionOption};
     use secrecy::ExposeSecret as _;
     use serde_json::json;
     use std::sync::Arc;
