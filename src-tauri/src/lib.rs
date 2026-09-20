@@ -14,7 +14,7 @@ use tauri::Manager;
 use commands::{
     activate_enterprise_account, begin_device_login, cancel_run, claim_legacy_history,
     create_thread, delete_api_key, delete_thread, get_chat_model_preference, get_figure_asset,
-    get_public_settings, get_protocol_capabilities, get_run_trace, get_run_trace_events,
+    get_protocol_capabilities, get_public_settings, get_run_trace, get_run_trace_events,
     get_thread_run_context, get_user_quota, get_user_usage, import_model_configuration,
     list_accounts, list_auth_sessions, list_byok_credentials, list_chat_models, list_threads,
     load_messages, open_authorization_page, parse_chat_attachment, poll_device_login,

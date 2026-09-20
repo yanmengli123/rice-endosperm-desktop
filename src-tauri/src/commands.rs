@@ -21,8 +21,8 @@ use crate::{
     error::{AppError, AppResult, CommandError},
     state::AppState,
     yuxi::{
-        ClarificationQuestion, CitationRef, FigureCardAsset, LocatorCandidate, ModelOption,
-        PendingChatAttachment, ProtocolInfo, ProgressText, QuestionAnswer, QuestionOption,
+        CitationRef, ClarificationQuestion, FigureCardAsset, LocatorCandidate, ModelOption,
+        PendingChatAttachment, ProgressText, ProtocolInfo, QuestionAnswer, QuestionOption,
         RunResult, ServerRunContext, build_resume_payload, parse_citation_ready,
         parse_custom_warning, parse_interrupt_questions, parse_locator_candidates,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,

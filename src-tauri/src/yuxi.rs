@@ -143,9 +143,14 @@ pub struct FigureCardAsset {
 impl FigureCardAsset {
     /// 取图硬前置：四键齐备且非空才允许构造资产 URL（fail-closed）。
     pub fn is_fetchable(&self) -> bool {
-        [&self.kb_id, &self.file_id, &self.revision_id, &self.asset_name]
-            .into_iter()
-            .all(|key| key.as_deref().is_some_and(|value| !value.trim().is_empty()))
+        [
+            &self.kb_id,
+            &self.file_id,
+            &self.revision_id,
+            &self.asset_name,
+        ]
+        .into_iter()
+        .all(|key| key.as_deref().is_some_and(|value| !value.trim().is_empty()))
     }
 }
 
@@ -222,9 +227,7 @@ fn sanitize_asset_segment(segment: &str) -> AppResult<&str> {
         || trimmed.contains('\\')
         || trimmed == "."
         || trimmed == ".."
-        || trimmed
-            .chars()
-            .any(|character| character.is_control())
+        || trimmed.chars().any(|character| character.is_control())
     {
         return Err(AppError::Protocol("知识库资产地址段包含非法字符".into()));
     }
@@ -263,8 +266,7 @@ pub fn knowledge_asset_url(
 
 /// 图卡资产 MIME 白名单，与服务端 _MEDIA_TYPE_BY_SUFFIX、Web 端
 /// ALLOWED_IMAGE_TYPES 同源——白名单外的 content-type 一律拒绝渲染。
-const ALLOWED_ASSET_MEDIA_TYPES: [&str; 4] =
-    ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const ALLOWED_ASSET_MEDIA_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 /// 单张图卡资产的字节上限：超限视为异常载荷，拒绝进入 IPC。
 const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
@@ -1042,11 +1044,7 @@ impl YuxiClient {
         {
             return Err(AppError::Protocol("知识库资产超过 8 MB 上限".into()));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(AppError::from)?
-            .to_vec();
+        let bytes = response.bytes().await.map_err(AppError::from)?.to_vec();
         if bytes.is_empty() || bytes.len() > MAX_ASSET_BYTES {
             return Err(AppError::Protocol("知识库资产为空或超过 8 MB 上限".into()));
         }
@@ -3168,8 +3166,9 @@ mod contract_fixtures {
     use super::{
         ClarificationQuestion, FigureCardAsset, ProgressText, QuestionAnswer, QuestionOption,
         ServerRunContext, build_resume_payload, knowledge_asset_url, parse_citation_ready,
-        parse_custom_warning, parse_error_body, parse_interrupt_questions, parse_locator_candidates,
-        parse_protocol_info, parse_run_result, validate_authoritative_run_context,
+        parse_custom_warning, parse_error_body, parse_interrupt_questions,
+        parse_locator_candidates, parse_protocol_info, parse_run_result,
+        validate_authoritative_run_context,
     };
     use crate::error::AppError;
     use serde_json::{Value, json};
@@ -3315,7 +3314,10 @@ mod contract_fixtures {
             let name = data.pointer("/payload/name").and_then(Value::as_str);
             match name {
                 Some("yuxi.citation_ready") => {
-                    assert!(parse_citation_ready(&data).is_some(), "compact citation 帧必须可解析");
+                    assert!(
+                        parse_citation_ready(&data).is_some(),
+                        "compact citation 帧必须可解析"
+                    );
                 }
                 Some("yuxi.locator_candidates") => {
                     assert!(
@@ -3324,7 +3326,10 @@ mod contract_fixtures {
                     );
                 }
                 Some("yuxi.warning") => {
-                    assert!(parse_custom_warning(&data).is_some(), "compact warning 帧必须可解析");
+                    assert!(
+                        parse_custom_warning(&data).is_some(),
+                        "compact warning 帧必须可解析"
+                    );
                 }
                 _ => {}
             }
@@ -3385,7 +3390,8 @@ mod contract_fixtures {
             let status = sample["status"].as_u64().unwrap() as u16;
             let message = detail["message"].as_str().unwrap_or_default().to_owned();
             let action = detail["action"].as_str().map(str::to_owned);
-            let error = AppError::from_server_parts(status, message, Some(code.into()), action, None);
+            let error =
+                AppError::from_server_parts(status, message, Some(code.into()), action, None);
             let command = crate::error::CommandError::from(error);
             let (_, want_retryable) = expected_retryable
                 .iter()
