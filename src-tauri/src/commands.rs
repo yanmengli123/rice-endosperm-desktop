@@ -1591,15 +1591,15 @@ async fn send_message_inner(
                     // custom 帧二级白名单：语义名在 payload.name，一级白名单
                     // 恒命中 custom，未知 custom 名单独计数（否则新增证据类
                     // 事件会被静默丢弃且无告警）。
-                    let custom_event_name = (event.event == "custom")
-                        .then(|| {
-                            value
-                                .pointer("/payload/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned()
-                        })
-                        .unwrap_or_default();
+                    let custom_event_name = if event.event == "custom" {
+                        value
+                            .pointer("/payload/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    } else {
+                        String::new()
+                    };
                     if event.event == "custom" && !is_known_custom_event(&custom_event_name) {
                         frames_unknown_custom += 1;
                         diagnostics::log(
@@ -1656,6 +1656,22 @@ async fn send_message_inner(
                         match custom_event_name.as_str() {
                             "yuxi.citation_ready" => {
                                 if let Some((citation, figures)) = parse_citation_ready(&value) {
+                                    // 取图硬前置（Rust 侧 fail-closed 观测）：缺键图卡不阻断
+                                    // 事件下发，前端按题注降级渲染；这里只保证方法在生产路径
+                                    // 被调用，不猜测补全。
+                                    for figure in &figures {
+                                        if !figure.is_fetchable() {
+                                            diagnostics::log(
+                                                "DEBUG",
+                                                "figure_not_fetchable",
+                                                &format!(
+                                                    "run={}: figure_id={}",
+                                                    created.run_id,
+                                                    figure.figure_id.as_deref().unwrap_or_default()
+                                                ),
+                                            );
+                                        }
+                                    }
                                     send_channel(
                                         on_event,
                                         RunEvent::CitationsReady {

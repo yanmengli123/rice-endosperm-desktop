@@ -2254,9 +2254,7 @@ pub fn parse_protocol_info(value: &Value) -> Option<ProtocolInfo> {
         .and_then(Value::as_str)?
         .trim()
         .to_owned();
-    if protocol_major(&protocol_version).is_none() {
-        return None;
-    }
+    protocol_major(&protocol_version)?;
     Some(ProtocolInfo {
         min_supported_protocol_version: value
             .get("min_supported_protocol_version")
@@ -2305,7 +2303,7 @@ pub fn parse_interrupt_questions(value: &Value) -> Option<Vec<ClarificationQuest
         .iter()
         .filter_map(|item| {
             let wire = serde_json::from_value::<WireClarificationQuestion>(item.clone()).ok()?;
-            (!wire.question.trim().is_empty()).then(|| ClarificationQuestion {
+            (!wire.question.trim().is_empty()).then_some(ClarificationQuestion {
                 question_id: wire.question_id,
                 question: wire.question,
                 options: wire.options,
@@ -2538,12 +2536,15 @@ mod tests {
     use crate::error::AppError;
 
     use super::{
-        CreateRunRequest, ProgressText, RunRequestMeta, TmpAttachmentConfirmItem,
-        connection_error_for_gateway, default_status_message, final_output,
+        ClarificationQuestion, CreateRunRequest, OTHER_OPTION_VALUE, ProgressText, QuestionAnswer,
+        QuestionOption, RunRequestMeta, ServerRunContext, TmpAttachmentConfirmItem,
+        build_resume_payload, connection_error_for_gateway, default_status_message, final_output,
         parse_default_agent_slug, parse_desktop_login_response, parse_device_code_exchange,
-        parse_device_code_start, parse_error_body, parse_onboarding_exchange, parse_run_result,
+        parse_device_code_start, parse_error_body, parse_interrupt_questions,
+        parse_onboarding_exchange, parse_protocol_info, parse_run_result, protocol_major,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     };
+    // 保持与历史测试同路径：部分用例直接构造 ServerRunContext 字面量。
 
     #[test]
     fn serializes_the_same_native_agent_run_contract_as_web() {
@@ -3346,8 +3347,8 @@ mod contract_fixtures {
         assert!(!items.is_empty());
         for case in items {
             let name = case["name"].as_str().unwrap_or_default();
-            let input = case["input"];
-            let expected = case["expected"];
+            let input = case["input"].clone();
+            let expected = case["expected"].clone();
             let mut verbose_progress = ProgressText::default();
             let mut compact_progress = ProgressText::default();
             let verbose_frame = json!({"payload": {"chunk": input.clone()}});

@@ -113,13 +113,12 @@ impl AppError {
             return Self::Unauthorized;
         }
         if status == 426 || server_code.as_deref() == Some("protocol_version_unsupported") {
-            return Self::ProtocolIncompatible(
+            let fallback = "客户端与服务端协议版本不兼容，请升级后重试".to_string();
+            return Self::ProtocolIncompatible(if message.trim().is_empty() {
+                fallback
+            } else {
                 message
-                    .trim()
-                    .is_empty()
-                    .then(|| "客户端与服务端协议版本不兼容，请升级后重试".to_string())
-                    .unwrap_or(message),
-            );
+            });
         }
         if (500..=599).contains(&status) && server_code.is_none() {
             return Self::ServiceUnavailable;
@@ -127,22 +126,20 @@ impl AppError {
         if server_code.is_none() {
             match status {
                 403 | 422 => {
-                    return Self::Forbidden(
+                    let fallback = default_forbidden_message();
+                    return Self::Forbidden(if message.trim().is_empty() {
+                        fallback
+                    } else {
                         message
-                            .trim()
-                            .is_empty()
-                            .then(default_forbidden_message)
-                            .unwrap_or(message),
-                    );
+                    });
                 }
                 423 | 429 => {
-                    return Self::RateLimited(
+                    let fallback = default_rate_limited_message();
+                    return Self::RateLimited(if message.trim().is_empty() {
+                        fallback
+                    } else {
                         message
-                            .trim()
-                            .is_empty()
-                            .then(default_rate_limited_message)
-                            .unwrap_or(message),
-                    );
+                    });
                 }
                 _ => {}
             }
