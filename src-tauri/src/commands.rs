@@ -1665,9 +1665,12 @@ async fn send_message_inner(
                                                 "DEBUG",
                                                 "figure_not_fetchable",
                                                 &format!(
-                                                    "run={}: figure_id={}",
+                                                    "run={}: asset={}",
                                                     created.run_id,
-                                                    figure.figure_id.as_deref().unwrap_or_default()
+                                                    figure
+                                                        .asset_name
+                                                        .as_deref()
+                                                        .unwrap_or_default()
                                                 ),
                                             );
                                         }
