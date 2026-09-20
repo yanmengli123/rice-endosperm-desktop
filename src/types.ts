@@ -182,6 +182,81 @@ export type LocalMessage = {
   content: string;
   createdAt: string;
   attachments: LocalMessageAttachment[];
+  /** 证据平面元数据（citation 芯片/图卡/候选文献/运行提示）：仅在 SSE 流上
+   * 实际观测到时非空，重开历史会话时从本地真源恢复。 */
+  evidence?: MessageEvidence;
+};
+
+/** citation_ready v2 的九键引用：基线七键 + 取图三段式硬前置（kbId/revisionId）。
+ * 所有键均可缺席——渲染层按实值展示，缺席不猜测补全。 */
+export type CitationRef = {
+  status?: string;
+  evidenceId?: string;
+  fileId?: string;
+  filename?: string;
+  zone?: string;
+  page?: number;
+  anchorId?: string;
+  kbId?: string;
+  revisionId?: string;
+};
+
+/** 图卡选择元数据（PublishableFigure.selection，服务端确定性投影）。 */
+export type FigureSelection = {
+  assetCount?: number;
+  rule?: string;
+};
+
+/** 服务端 PublishableFigure 完整投影。字段全部可缺席：硬前置四键
+ * （kbId/fileId/revisionId/assetName）齐备才可取图，缺键 fail-closed 不渲染图卡。 */
+export type FigureCardAsset = {
+  bindingId?: string;
+  kbId?: string;
+  fileId?: string;
+  revisionId?: string;
+  assetName?: string;
+  assetSha256?: string;
+  mediaType?: string;
+  page?: number;
+  panelMatch?: string;
+  evidenceId?: string;
+  figureLabel?: string;
+  caption?: string;
+  width?: number;
+  height?: number;
+  role?: string;
+  groupIndex?: number;
+  panelLabel?: string;
+  assetPage?: number;
+  selection?: FigureSelection;
+};
+
+/** locator_candidates 候选文献（跨文献歧义清单，只含文档身份三键）。 */
+export type LocatorCandidate = {
+  fileId: string;
+  kbId: string;
+  filename: string;
+};
+
+/** 一次 run 观测到的证据平面快照（权威投影原样存档，恢复时不做二次推断）。 */
+export type MessageEvidence = {
+  citations: CitationRef[];
+  figures: FigureCardAsset[];
+  locatorCandidates: LocatorCandidate[];
+  warnings: string[];
+};
+
+/** GET /api/agent/protocol 能力快照（渲染分支的能力位真源）。 */
+export type ProtocolInfo = {
+  protocolVersion: string;
+  minSupportedProtocolVersion?: string;
+  capabilities: string[];
+};
+
+/** 图卡资产字节（base64 通道，前端拼 data URL；不落盘）。 */
+export type FigureAssetPayload = {
+  mediaType: string;
+  dataBase64: string;
 };
 
 export type LocalMessageAttachment = {
@@ -198,6 +273,32 @@ export type SendMessageRequest = {
   attachments: PendingChatAttachment[];
   /** 中断恢复（人工审批续跑）：被恢复的父 run ID。 */
   resumeRunId?: string;
+  /** 澄清问题续跑（ask_user_question_required）：AskUserQuestion 事件原样
+   * 回传的问题定义与用户作答；Rust 侧组装 {questionId: 答案} resume 载荷。 */
+  resumeQuestions?: ClarificationQuestion[];
+  resumeAnswers?: QuestionAnswer[];
+};
+
+/** 澄清问题选项（wire {label, value}，服务端归一化）。 */
+export type QuestionOption = {
+  label: string;
+  value: string;
+};
+
+/** 服务端澄清问题（Rust 侧 camelCase IPC 形态）。 */
+export type ClarificationQuestion = {
+  questionId: string;
+  question: string;
+  options: QuestionOption[];
+  multiSelect: boolean;
+  allowOther: boolean;
+};
+
+/** 用户对单个澄清问题的作答（selected 含 "其他" 保留值时携带 otherText）。 */
+export type QuestionAnswer = {
+  questionId: string;
+  selected: string[];
+  otherText?: string;
 };
 
 export type PendingChatAttachment = {
@@ -306,6 +407,10 @@ export type RunEvent =
   | { type: "status"; status: string; message: string }
   | { type: "text"; text: string; eventId?: string }
   | { type: "trace"; runId: string; trace: TraceEvent }
+  | { type: "ask_user_question"; runId: string; questions: ClarificationQuestion[] }
+  | { type: "citations_ready"; runId: string; citation: CitationRef; figures: FigureCardAsset[] }
+  | { type: "locator_candidates"; runId: string; candidates: LocatorCandidate[] }
+  | { type: "warning"; message: string }
   | { type: "done"; runId: string; status: string; text: string; context: ServerRunContext };
 
 /** yuxi.run-trace.v1 wire 事件（Rust 侧 Value 原样透传，保持服务端 snake_case）。 */

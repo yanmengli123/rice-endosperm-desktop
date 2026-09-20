@@ -1,0 +1,31 @@
+{
+  "protocol_version": "1.4",
+  "agent_slug": "default-chatbot",
+  "thread_id": "th-demo-01",
+  "request_id": "desktop-7c9e16af2d3b4f5e",
+  "result_authority": "yuxi_server",
+  "model_spec": null,
+  "knowledge_scope": {
+    "scope_id": null,
+    "scope_version": null,
+    "scope_mode": null,
+    "knowledge_strategy": null,
+    "retrieval_mode": null,
+    "allow_web": false,
+    "kb_count": 1,
+    "members": [
+      {
+        "kb_id": "kb-0001",
+        "kb_name": "水稻胚乳文献库",
+        "kb_type": "document",
+        "priority": 1,
+        "document_enabled": true,
+        "graph_enabled": true,
+        "structured_enabled": false,
+        "wiki_navigation_enabled": true,
+        "included_via": "direct"
+      }
+    ]
+  },
+  "knowledge_retrievals": []
+}

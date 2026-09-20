@@ -14,18 +14,57 @@ use zeroize::Zeroize;
 use crate::{
     config::{agent_slug, validate_gateway_url},
     credentials::{api_key_hint, api_key_scope_id, validate_api_key},
-    database::{LocalMessage, LocalMessageAttachment, PublicSettings, ThreadSummary},
+    database::{
+        LocalMessage, LocalMessageAttachment, MessageEvidence, PublicSettings, ThreadSummary,
+    },
     diagnostics,
     error::{AppError, AppResult, CommandError},
     state::AppState,
     yuxi::{
-        ModelOption, PendingChatAttachment, ProgressText, RunResult, ServerRunContext,
+        ClarificationQuestion, CitationRef, FigureCardAsset, LocatorCandidate, ModelOption,
+        PendingChatAttachment, ProtocolInfo, ProgressText, QuestionAnswer, QuestionOption,
+        RunResult, ServerRunContext, build_resume_payload, parse_citation_ready,
+        parse_custom_warning, parse_interrupt_questions, parse_locator_candidates,
         sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     },
 };
 
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "failed", "cancelled", "interrupted"];
 const MAX_EMPTY_COMPLETED_POLLS: i64 = 4;
+/// SSE 事件名白名单（verbose=false 契约 + 遗留兼容形态）。白名单外的命名事件
+/// 记 WARN 并计数——这是发现「服务端发了新事件而桌面端未消费」的唯一信号。
+const KNOWN_SSE_EVENTS: [&str; 7] = [
+    "messages",
+    "custom",
+    "interrupt",
+    "error",
+    "end",
+    "trace",
+    "message",
+];
+
+/// `event: custom` 帧的二级白名单：custom 帧的事件名都是 "custom"，语义名在
+/// `payload.name`。一级白名单对 custom 恒命中，若不做二级校验，服务端新增
+/// custom 名（如新的证据类事件）会被静默丢弃且无任何告警——这里把未知
+/// custom 名记 WARN 并计入会话摘要（sse_custom_unknown）。
+const KNOWN_CUSTOM_EVENT_NAMES: [&str; 4] = [
+    // 已知且刻意不渲染：进度语义由 messages 帧（status=progress）承载。
+    "yuxi.agent_state",
+    // 证据平面三件套 + 运行提示（1.4 capabilities 对应的 custom 载荷名）。
+    "yuxi.warning",
+    "yuxi.citation_ready",
+    "yuxi.locator_candidates",
+];
+
+fn is_known_sse_event(name: &str) -> bool {
+    // 未命名事件（默认 data 帧）按已知处理：服务端信封的事件名只在 SSE
+    // event: 行上，白名单只针对命名事件。
+    name.is_empty() || KNOWN_SSE_EVENTS.contains(&name)
+}
+
+fn is_known_custom_event(name: &str) -> bool {
+    name.is_empty() || KNOWN_CUSTOM_EVENT_NAMES.contains(&name)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +78,12 @@ pub struct SendMessageRequest {
     /// 用户对审批的答复，以 resume 载荷发送而非新 query，且不得带附件。
     #[serde(default)]
     pub resume_run_id: Option<String>,
+    /// 澄清问题续跑（ask_user_question_required）：随 AskUserQuestion 事件
+    /// 原样回传的问题定义与用户作答，Rust 侧组装成 {question_id: 答案} 载荷。
+    #[serde(default)]
+    pub resume_questions: Vec<ClarificationQuestion>,
+    #[serde(default)]
+    pub resume_answers: Vec<QuestionAnswer>,
 }
 
 #[tauri::command]
@@ -143,6 +188,31 @@ pub enum RunEvent {
         run_id: String,
         /// yuxi.run-trace.v1 wire 事件原样透传，前端负责投影与渲染。
         trace: Value,
+    },
+    /// 澄清问题中断（ask_user_question_required）：questions 为服务端权威
+    /// 定义（questionId/question/options/multiSelect/allowOther），UI 渲染
+    /// 选项卡片，用户作答后以 resume 载荷续跑本 run。
+    AskUserQuestion {
+        run_id: String,
+        questions: Vec<ClarificationQuestion>,
+    },
+    /// 证据平面：结构化引用（citation_ready v2 九键）与可选图卡投影。
+    /// figures 缺席 ⟺ 本 run 未发布图卡；成员缺取图硬前置键时渲染层
+    /// fail-closed 不展示，不猜测补全。
+    CitationsReady {
+        run_id: String,
+        citation: CitationRef,
+        figures: Vec<FigureCardAsset>,
+    },
+    /// 跨文献歧义候选清单（locator_candidates）：只含文档身份三键，展示用；
+    /// 「一键重问」依赖服务端 mention.v2 落地后再开。
+    LocatorCandidates {
+        run_id: String,
+        candidates: Vec<LocatorCandidate>,
+    },
+    /// 运行内非阻塞提示（yuxi.warning）：不影响终态，UI 以可关闭的提示条呈现。
+    Warning {
+        message: String,
     },
     Done {
         run_id: String,
@@ -1342,14 +1412,20 @@ async fn send_message_inner(
             &request.attachments,
         )
         .await?;
-    // 续跑（人工审批）：query 省略，用户答复以 resume 载荷发送；
-    // 沿用父 run 冻结模型，不携带请求级 model_spec。
-    let resume_payload = request.resume_run_id.as_deref().and_then(|parent_run_id| {
-        (!parent_run_id.trim().is_empty()).then(|| {
-            let answer = serde_json::Value::String(question.to_owned());
-            (answer, parent_run_id.trim().to_owned())
-        })
-    });
+    // 续跑（人工审批/澄清问题）：query 省略，用户答复以 resume 载荷发送；
+    // 沿用父 run 冻结模型，不携带请求级 model_spec。澄清问题的答复组装为
+    // {question_id: 答案}（与 Web 端同构），人工审批仍是纯字符串。
+    let resume_payload = match request.resume_run_id.as_deref() {
+        Some(parent_run_id) if !parent_run_id.trim().is_empty() => {
+            let answer = if request.resume_answers.is_empty() {
+                Value::String(question.to_owned())
+            } else {
+                build_resume_payload(&request.resume_questions, &request.resume_answers)?
+            };
+            Some((answer, parent_run_id.trim().to_owned()))
+        }
+        _ => None,
+    };
     let created = tokio::select! {
         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
         result = state.yuxi.create_run_with_resume(
@@ -1408,8 +1484,18 @@ async fn send_message_inner(
     let mut last_event_id: Option<String> = None;
     let mut terminal_received = false;
     let mut error_frame_received = false;
+    // 帧级观测：未知命名事件、未知 custom 名与非 JSON 帧的计数进入会话摘要
+    // 日志，用于发现服务端新增而桌面端尚未消费的事件（静默忽略 = 不可诊断）。
+    let mut frames_total: u64 = 0;
+    let mut frames_unknown_event: u64 = 0;
+    let mut frames_unknown_custom: u64 = 0;
+    let mut frames_skipped_non_json: u64 = 0;
+    let mut attempts_used: u32 = 0;
+    // 证据平面收集器：本 run 实际观测到的权威投影，终态时随助手消息落库。
+    let mut run_evidence = MessageEvidence::default();
 
     for attempt in 0..4 {
+        attempts_used = attempt + 1;
         if attempt > 0 {
             send_channel(
                 on_event,
@@ -1458,6 +1544,7 @@ async fn send_message_inner(
             };
             match next {
                 Some(Ok(event)) => {
+                    frames_total += 1;
                     if !event.id.is_empty() {
                         last_event_id = Some(event.id.clone());
                     }
@@ -1466,6 +1553,7 @@ async fn send_message_inner(
                     let value = match serde_json::from_str::<Value>(&event.data) {
                         Ok(value) => value,
                         Err(error) => {
+                            frames_skipped_non_json += 1;
                             diagnostics::log(
                                 "WARN",
                                 "sse_frame_skipped",
@@ -1478,8 +1566,64 @@ async fn send_message_inner(
                         .get("thread_id")
                         .and_then(Value::as_str)
                         .is_none_or(|thread_id| thread_id == created.thread_id);
-                    // 执行轨迹帧（SSE event: trace）：整帧透传给前端投影，
-                    // 不参与文本累积与终态判定。
+                    // 白名单外的命名事件：不中断，但必须可见——这是服务端
+                    // 新增事件未被消费时的唯一诊断信号。
+                    if !event.event.is_empty() && !is_known_sse_event(&event.event) {
+                        frames_unknown_event += 1;
+                        diagnostics::log(
+                            "WARN",
+                            "sse_event_unknown",
+                            &format!(
+                                "run={}: event={} keys={}",
+                                created.run_id,
+                                event.event,
+                                value
+                                    .as_object()
+                                    .map(|object| object
+                                        .keys()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(","))
+                                    .unwrap_or_default()
+                            ),
+                        );
+                    }
+                    // custom 帧二级白名单：语义名在 payload.name，一级白名单
+                    // 恒命中 custom，未知 custom 名单独计数（否则新增证据类
+                    // 事件会被静默丢弃且无告警）。
+                    let custom_event_name = (event.event == "custom")
+                        .then(|| {
+                            value
+                                .pointer("/payload/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
+                        .unwrap_or_default();
+                    if event.event == "custom" && !is_known_custom_event(&custom_event_name) {
+                        frames_unknown_custom += 1;
+                        diagnostics::log(
+                            "WARN",
+                            "sse_custom_unknown",
+                            &format!(
+                                "run={}: custom={} keys={}",
+                                created.run_id,
+                                custom_event_name,
+                                value
+                                    .pointer("/payload/chunk")
+                                    .and_then(Value::as_object)
+                                    .map(|object| object
+                                        .keys()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(","))
+                                    .unwrap_or_default()
+                            ),
+                        );
+                    }
+                    // 执行轨迹帧（SSE event: trace）：协议 ≤1.3 的遗留兼容路径
+                    //（1.4 起服务端已从消息流剔除，改走 /trace 端点轮询）。
+                    // 整帧透传给前端投影，不参与文本累积与终态判定。
                     if event.event == "trace" {
                         if let Some(trace) = extract_run_trace_event(&value, &created.run_id) {
                             send_channel(
@@ -1491,6 +1635,64 @@ async fn send_message_inner(
                             )?;
                         }
                         continue;
+                    }
+                    // 澄清问题中断（ask_user_question_required）：透传问题给
+                    // UI 渲染选项卡片；run 稍后以 end{status:interrupted} 收尾，
+                    // 用户答复经 SendMessageRequest.resume_* 续跑。
+                    if belongs_to_parent_thread
+                        && let Some(questions) = parse_interrupt_questions(&value)
+                    {
+                        send_channel(
+                            on_event,
+                            RunEvent::AskUserQuestion {
+                                run_id: created.run_id.clone(),
+                                questions,
+                            },
+                        )?;
+                    }
+                    // 证据平面（custom 帧分发）：citation/图卡/候选清单/运行提示。
+                    // 仅消费服务端确定性投影，不参与文本累积与终态判定。
+                    if belongs_to_parent_thread && event.event == "custom" {
+                        match custom_event_name.as_str() {
+                            "yuxi.citation_ready" => {
+                                if let Some((citation, figures)) = parse_citation_ready(&value) {
+                                    send_channel(
+                                        on_event,
+                                        RunEvent::CitationsReady {
+                                            run_id: created.run_id.clone(),
+                                            citation: citation.clone(),
+                                            figures: figures.clone(),
+                                        },
+                                    )?;
+                                    run_evidence.citations.push(citation);
+                                    run_evidence.figures.extend(figures);
+                                }
+                            }
+                            "yuxi.locator_candidates" => {
+                                if let Some(candidates) = parse_locator_candidates(&value) {
+                                    send_channel(
+                                        on_event,
+                                        RunEvent::LocatorCandidates {
+                                            run_id: created.run_id.clone(),
+                                            candidates: candidates.clone(),
+                                        },
+                                    )?;
+                                    run_evidence.locator_candidates.extend(candidates);
+                                }
+                            }
+                            "yuxi.warning" => {
+                                if let Some(warning) = parse_custom_warning(&value) {
+                                    send_channel(
+                                        on_event,
+                                        RunEvent::Warning {
+                                            message: warning.clone(),
+                                        },
+                                    )?;
+                                    run_evidence.warnings.push(warning);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     if belongs_to_parent_thread && let Some(message) = run_progress_message(&value)
                     {
@@ -1542,6 +1744,28 @@ async fn send_message_inner(
         }
     }
 
+    // 帧级观测摘要：未知事件/未知 custom 名计数 >0 即说明服务端契约超前于
+    // 桌面端消费面。
+    diagnostics::log(
+        "INFO",
+        "sse_stream_summary",
+        &format!(
+            "run={}: frames={} attempts={} unknown_events={} unknown_custom={} skipped_non_json={} terminal={} error_frame={} evidence=(citations:{} figures:{} candidates:{} warnings:{})",
+            created.run_id,
+            frames_total,
+            attempts_used,
+            frames_unknown_event,
+            frames_unknown_custom,
+            frames_skipped_non_json,
+            terminal_received,
+            error_frame_received,
+            run_evidence.citations.len(),
+            run_evidence.figures.len(),
+            run_evidence.locator_candidates.len(),
+            run_evidence.warnings.len()
+        ),
+    );
+
     if !terminal_received {
         send_channel(
             on_event,
@@ -1589,11 +1813,12 @@ async fn send_message_inner(
             }
             state
                 .database
-                .append_message(
+                .append_message_with_evidence(
                     &format!("assistant-{}", created.run_id),
                     &request.thread_id,
                     "assistant",
                     &final_text,
+                    &run_evidence,
                 )
                 .await?;
             state
@@ -1639,11 +1864,12 @@ async fn send_message_inner(
                 if !persisted_text.trim().is_empty() {
                     state
                         .database
-                        .append_message(
+                        .append_message_with_evidence(
                             &format!("assistant-{}", created.run_id),
                             &request.thread_id,
                             "assistant",
                             &persisted_text,
+                            &run_evidence,
                         )
                         .await?;
                 }
@@ -1699,11 +1925,12 @@ async fn send_message_inner(
             if !persisted_text.trim().is_empty() {
                 state
                     .database
-                    .append_message(
+                    .append_message_with_evidence(
                         &format!("assistant-{}", created.run_id),
                         &request.thread_id,
                         "assistant",
                         persisted_text,
+                        &run_evidence,
                     )
                     .await?;
             }
@@ -1771,6 +1998,78 @@ pub async fn cancel_run(
     Ok(())
 }
 
+/// 当前网关的服务端协议能力快照（渲染分支的能力位真源）。按网关地址缓存，
+/// 未协商过则现场探测一次；旧服务端（无该端点）返回 None，前端按能力缺席
+/// 降级——不渲染图卡等增强面，基础问答不受影响。
+#[tauri::command]
+pub async fn get_protocol_capabilities(
+    state: State<'_, AppState>,
+) -> Result<Option<ProtocolInfo>, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    if let Some(cached) = state.cached_protocol_info(&gateway_url) {
+        return Ok(Some(cached));
+    }
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    let info = state
+        .yuxi
+        .fetch_protocol_info(&gateway_url, &bearer)
+        .await
+        .map_err(CommandError::from)?;
+    if let Some(snapshot) = &info {
+        state.set_protocol_info(&gateway_url, snapshot.clone());
+    }
+    Ok(info)
+}
+
+/// 图卡资产字节（base64 通道）：路径段经校验编码，MIME 走服务端同源白名单，
+/// 前端拼 data URL 渲染；资产字节不落盘，随消息生命周期驻留内存。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FigureAssetPayload {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+#[tauri::command]
+pub async fn get_figure_asset(
+    kb_id: String,
+    file_id: String,
+    revision_id: String,
+    asset_name: String,
+    state: State<'_, AppState>,
+) -> Result<FigureAssetPayload, CommandError> {
+    let gateway_url = state
+        .database
+        .gateway_url()
+        .await
+        .map_err(CommandError::from)?;
+    let bearer = ensure_active_bearer(&state)
+        .await
+        .map_err(CommandError::from)?;
+    let (media_type, bytes) = state
+        .yuxi
+        .fetch_knowledge_asset(
+            &gateway_url,
+            &bearer,
+            &kb_id,
+            &file_id,
+            &revision_id,
+            &asset_name,
+        )
+        .await
+        .map_err(CommandError::from)?;
+    Ok(FigureAssetPayload {
+        media_type,
+        data_base64: BASE64_STANDARD.encode(bytes),
+    })
+}
+
 async fn wait_for_result(
     state: &AppState,
     gateway_url: &str,
@@ -1835,6 +2134,21 @@ fn validate_send_request(request: &SendMessageRequest) -> AppResult<()> {
     }
     if is_resume && !request.attachments.is_empty() {
         return Err(AppError::Protocol("续跑请求不能携带新附件".into()));
+    }
+    if !request.resume_answers.is_empty() {
+        if !is_resume {
+            return Err(AppError::Protocol("澄清问题答复只能用于续跑请求".into()));
+        }
+        if request.resume_questions.is_empty() {
+            return Err(AppError::Protocol("澄清问题答复缺少对应的问题定义".into()));
+        }
+        if request
+            .resume_answers
+            .iter()
+            .any(|answer| answer.question_id.trim().is_empty())
+        {
+            return Err(AppError::Protocol("澄清问题答复缺少问题标识".into()));
+        }
     }
     if is_resume {
         let parent_run_id = request.resume_run_id.as_deref().unwrap_or_default();
@@ -2246,7 +2560,8 @@ pub async fn set_chat_model_preference(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, RunEvent, SendMessageRequest, ensure_active_bearer, extract_run_trace_event,
+        AppState, ClarificationQuestion, QuestionAnswer, QuestionOption, RunEvent,
+        SendMessageRequest, ensure_active_bearer, extract_run_trace_event, is_known_sse_event,
         is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
         remote_principal_for_scope, run_progress_message, validate_send_request,
     };
@@ -2334,6 +2649,127 @@ mod tests {
         .expect("serialize done");
         assert_eq!(done["type"], "done");
         assert_eq!(done["runId"], "run-1");
+
+        let question = serde_json::to_value(RunEvent::AskUserQuestion {
+            run_id: "run-1".into(),
+            questions: vec![ClarificationQuestion {
+                question_id: "q-stage".into(),
+                question: "重点分析哪个发育阶段？".into(),
+                options: vec![QuestionOption {
+                    label: "灌浆期".into(),
+                    value: "灌浆期".into(),
+                }],
+                multi_select: false,
+                allow_other: true,
+            }],
+        })
+        .expect("serialize ask_user_question");
+        assert_eq!(question["type"], "ask_user_question");
+        assert_eq!(question["runId"], "run-1");
+        assert_eq!(question["questions"][0]["questionId"], "q-stage");
+        assert_eq!(question["questions"][0]["multiSelect"], false);
+        assert_eq!(question["questions"][0]["allowOther"], true);
+        assert_eq!(question["questions"][0]["options"][0]["label"], "灌浆期");
+
+        let citations = serde_json::to_value(RunEvent::CitationsReady {
+            run_id: "run-1".into(),
+            citation: CitationRef {
+                kb_id: Some("kb-0001".into()),
+                revision_id: Some("rev-0012".into()),
+                page: Some(3),
+                ..Default::default()
+            },
+            figures: vec![],
+        })
+        .expect("serialize citations_ready");
+        assert_eq!(citations["type"], "citations_ready");
+        assert_eq!(citations["citation"]["kbId"], "kb-0001");
+        assert_eq!(citations["citation"]["revisionId"], "rev-0012");
+        assert_eq!(citations["citation"]["page"], 3);
+
+        let locator = serde_json::to_value(RunEvent::LocatorCandidates {
+            run_id: "run-1".into(),
+            candidates: vec![LocatorCandidate {
+                file_id: "file-0001".into(),
+                kb_id: "kb-0001".into(),
+                filename: "rice.pdf".into(),
+            }],
+        })
+        .expect("serialize locator_candidates");
+        assert_eq!(locator["type"], "locator_candidates");
+        assert_eq!(locator["candidates"][0]["fileId"], "file-0001");
+
+        let warning = serde_json::to_value(RunEvent::Warning {
+            message: "部分检索来源超时".into(),
+        })
+        .expect("serialize warning");
+        assert_eq!(warning["type"], "warning");
+        assert_eq!(warning["message"], "部分检索来源超时");
+    }
+
+    #[test]
+    fn known_sse_event_whitelist_matches_verbose_false_contract() {
+        for event in ["messages", "custom", "interrupt", "error", "end"] {
+            assert!(is_known_sse_event(event), "{event} 必须在白名单内");
+        }
+        // 遗留兼容形态（≤1.3 服务端 / Redis 默认名）不算未知。
+        assert!(is_known_sse_event("trace"));
+        assert!(is_known_sse_event("message"));
+        // 未命名事件（默认 data 帧）不算未知；新增未消费事件必须可被观测到。
+        assert!(is_known_sse_event(""));
+        assert!(!is_known_sse_event("messages_v2"));
+        assert!(!is_known_sse_event("citations"));
+    }
+
+    #[test]
+    fn known_custom_event_names_cover_evidence_plane() {
+        // 1.4 契约的 custom 语义名：证据三件套 + 运行提示 + 刻意不渲染的
+        // agent_state（进度语义由 messages 帧承载）。
+        for name in [
+            "yuxi.agent_state",
+            "yuxi.warning",
+            "yuxi.citation_ready",
+            "yuxi.locator_candidates",
+        ] {
+            assert!(is_known_custom_event(name), "{name} 必须在 custom 白名单内");
+        }
+        // 未声明的 custom 名必须可被观测（sse_custom_unknown 计数）。
+        assert!(!is_known_custom_event("yuxi.new_evidence_kind"));
+        assert!(!is_known_custom_event("citation_ready"));
+    }
+
+    #[test]
+    fn sse_fixture_event_names_are_covered_by_whitelists() {
+        // 契约语料联动：sse_frames.jsonl 中出现过的每一个 SSE 事件名与 custom
+        // 语义名都必须落在桌面端白名单内。服务端新增事件并同步语料后，若
+        // 桌面端未跟进消费面，本测试先红（而不是线上静默丢弃）。
+        let fixture_path = crate::yuxi::contract_fixture_dir().join("sse_frames.jsonl");
+        let corpus = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|error| panic!("读取契约语料失败（先跑同步脚本）：{error}"));
+        let mut unknown_events = Vec::new();
+        let mut unknown_customs = Vec::new();
+        for line in corpus.lines().filter(|line| !line.trim().is_empty()) {
+            let frame: serde_json::Value =
+                serde_json::from_str(line).expect("SSE 语料行必须是合法 JSON");
+            let event = frame["event"].as_str().unwrap_or_default();
+            if !is_known_sse_event(event) {
+                unknown_events.push(event.to_owned());
+            }
+            if event == "custom"
+                && let Some(name) = frame["raw_payload"]["name"].as_str()
+                && !is_known_custom_event(name)
+            {
+                unknown_customs.push(name.to_owned());
+            }
+        }
+        assert!(
+            unknown_events.is_empty(),
+            "语料事件名超出白名单（服务端契约超前，需扩展桌面消费面）：{unknown_events:?}"
+        );
+        assert!(
+            unknown_customs.is_empty(),
+            "语料 custom 名超出白名单（服务端契约超前，需扩展桌面消费面）：{unknown_customs:?}"
+        );
     }
 
     #[test]
@@ -2364,6 +2800,8 @@ mod tests {
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
             attachments: vec![],
             resume_run_id: None,
+            resume_questions: vec![],
+            resume_answers: vec![],
         };
         assert!(validate_send_request(&request).is_ok());
     }
@@ -2376,8 +2814,33 @@ mod tests {
             request_id: "desktop-12345678-1234-1234-1234-123456789012".into(),
             attachments: vec![],
             resume_run_id: Some("run-parent-1".into()),
+            resume_questions: vec![],
+            resume_answers: vec![],
         };
         assert!(validate_send_request(&base).is_ok());
+
+        // 澄清问题答复没有对应问题定义 / 不用于续跑 → 拒绝
+        let orphan_answers = SendMessageRequest {
+            resume_run_id: None,
+            resume_questions: vec![],
+            resume_answers: vec![QuestionAnswer {
+                question_id: "q-1".into(),
+                selected: vec!["A".into()],
+                other_text: None,
+            }],
+            ..base.clone()
+        };
+        assert!(validate_send_request(&orphan_answers).is_err());
+        let answers_without_questions = SendMessageRequest {
+            resume_questions: vec![],
+            resume_answers: vec![QuestionAnswer {
+                question_id: "q-1".into(),
+                selected: vec!["A".into()],
+                other_text: None,
+            }],
+            ..base.clone()
+        };
+        assert!(validate_send_request(&answers_without_questions).is_err());
 
         let with_attachment = SendMessageRequest {
             attachments: vec![PendingChatAttachment {

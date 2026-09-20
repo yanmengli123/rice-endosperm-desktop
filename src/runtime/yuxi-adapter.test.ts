@@ -287,4 +287,183 @@ describe("createYuxiAdapter", () => {
     );
     expect(onBridgeConsumed).toHaveBeenCalledOnce();
   });
+
+  it("把 ask_user_question 事件透传给 UI 渲染澄清卡片", async () => {
+    const questions = [{
+      questionId: "q-stage",
+      question: "重点分析哪个发育阶段？",
+      options: [{ label: "灌浆期", value: "灌浆期" }, { label: "成熟期", value: "成熟期" }],
+      multiSelect: false,
+      allowOther: true,
+    }];
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "status", status: "running", message: "分析中" });
+      channel.onmessage({ type: "ask_user_question", runId: "run-q", questions });
+      return {
+        runId: "run-q",
+        threadId: "server-thread",
+        requestId: "desktop-request-q",
+        status: "interrupted",
+        text: "",
+        context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+      };
+    });
+    const onAskUserQuestion = vi.fn();
+    const stream = createYuxiAdapter("local-thread", { onAskUserQuestion }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "分析胚乳发育" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(onAskUserQuestion).toHaveBeenCalledWith("run-q", questions);
+  });
+
+  it("澄清问题续跑把 resume 三元组（runId/questions/answers）传入请求", async () => {
+    mocks.sendMessage.mockResolvedValueOnce({
+      runId: "run-resume-q",
+      threadId: "server-thread",
+      requestId: "desktop-resume-q",
+      status: "completed",
+      text: "续跑完成",
+      context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+    });
+    const questions = [{
+      questionId: "q-stage",
+      question: "重点分析哪个发育阶段？",
+      options: [{ label: "灌浆期", value: "灌浆期" }],
+      multiSelect: false,
+      allowOther: true,
+    }];
+    const answers = [{ questionId: "q-stage", selected: ["__other__"], otherText: "授粉后 15 天" }];
+    let resumeRunId = "run-q-parent";
+    let resumeQuestions = questions;
+    let resumeAnswers = answers;
+    const stream = createYuxiAdapter("local-thread", {
+      consumeResumeRunId: () => {
+        const pending = resumeRunId;
+        resumeRunId = "";
+        return pending || undefined;
+      },
+      consumeResumeQuestions: () => {
+        const pending = resumeQuestions;
+        resumeQuestions = [];
+        return pending.length > 0 ? pending : undefined;
+      },
+      consumeResumeAnswers: () => {
+        const pending = resumeAnswers;
+        resumeAnswers = [];
+        return pending.length > 0 ? pending : undefined;
+      },
+    }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "灌浆期" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resumeRunId: "run-q-parent",
+        resumeQuestions: questions,
+        resumeAnswers: answers,
+        attachments: [],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("把 citations_ready 事件的引用与图卡透传给 UI", async () => {
+    const citation = {
+      status: "VERIFIED",
+      evidenceId: "ev-1",
+      fileId: "file-0001",
+      filename: "rice.pdf",
+      zone: "figure",
+      page: 3,
+      kbId: "kb-0001",
+      revisionId: "rev-0012",
+    };
+    const figures = [{
+      bindingId: "bind-1",
+      kbId: "kb-0001",
+      fileId: "file-0001",
+      revisionId: "rev-0012",
+      assetName: "fig-3.png",
+      mediaType: "image/png",
+      page: 3,
+      role: "primary",
+      figureLabel: "Figure 3",
+    }];
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "citations_ready", runId: "run-ev", citation, figures });
+      return {
+        runId: "run-ev",
+        threadId: "server-thread",
+        requestId: "desktop-request-ev",
+        status: "completed",
+        text: "回答",
+        context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+      };
+    });
+    const onCitationsReady = vi.fn();
+    const stream = createYuxiAdapter("local-thread", { onCitationsReady }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "Figure 3 展示了什么？" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(onCitationsReady).toHaveBeenCalledWith("run-ev", citation, figures);
+  });
+
+  it("把 locator_candidates 候选清单透传给 UI", async () => {
+    const candidates = [
+      { fileId: "file-a", kbId: "kb-1", filename: "paper-a.pdf" },
+      { fileId: "file-b", kbId: "kb-1", filename: "paper-b.pdf" },
+    ];
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "locator_candidates", runId: "run-loc", candidates });
+      return {
+        runId: "run-loc",
+        threadId: "server-thread",
+        requestId: "desktop-request-loc",
+        status: "completed",
+        text: "回答",
+        context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+      };
+    });
+    const onLocatorCandidates = vi.fn();
+    const stream = createYuxiAdapter("local-thread", { onLocatorCandidates }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "那张图说明了什么？" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(onLocatorCandidates).toHaveBeenCalledWith("run-loc", candidates);
+  });
+
+  it("把 warning 事件作为非阻塞提示透传给 UI", async () => {
+    mocks.sendMessage.mockImplementationOnce(async (_request, channel) => {
+      channel.onmessage({ type: "warning", message: "部分检索来源超时" });
+      return {
+        runId: "run-w",
+        threadId: "server-thread",
+        requestId: "desktop-request-w",
+        status: "completed",
+        text: "回答",
+        context: { knowledgeScope: { allowWeb: false, kbCount: 0, members: [] }, knowledgeRetrievals: [] },
+      };
+    });
+    const onWarning = vi.fn();
+    const stream = createYuxiAdapter("local-thread", { onWarning }).run({
+      messages: [{ role: "user", content: [{ type: "text", text: "分析胚乳发育" }] }],
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+    for await (const _update of stream) {
+      // consume
+    }
+    expect(onWarning).toHaveBeenCalledWith("部分检索来源超时");
+  });
 });

@@ -18,8 +18,16 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { createYuxiAdapter } from "../runtime/yuxi-adapter";
-import { getRunTrace, getRunTraceEvents } from "../services/tauri-client";
-import type { ChatCompletion, LocalMessage, PendingChatAttachment, TraceEvent } from "../types";
+import { getProtocolCapabilities, getRunTrace, getRunTraceEvents } from "../services/tauri-client";
+import type {
+  ChatCompletion,
+  ClarificationQuestion,
+  LocalMessage,
+  MessageEvidence,
+  PendingChatAttachment,
+  QuestionAnswer,
+  TraceEvent,
+} from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { normalizeRichAnswer } from "../utils/rich-answer";
 import {
@@ -29,6 +37,13 @@ import {
   findLatestTraceRunId,
   type TraceState,
 } from "../utils/traceProjection";
+import { ClarificationCard } from "./ClarificationCard";
+import {
+  EvidenceCitations,
+  EvidenceFigures,
+  EvidenceLocatorCandidates,
+  EvidenceWarnings,
+} from "./EvidencePlane";
 import { CodeHeader, HtmlFencedCodeBlock, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
 import { TraceTimeline } from "./TraceTimeline";
 import { YuxiAttachmentAdapter } from "../runtime/yuxi-attachment-adapter";
@@ -64,6 +79,19 @@ function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
         }))
       : undefined,
   }));
+}
+
+/** 汇总历史消息中的证据快照为单一证据平面（恢复渲染用）。 */
+function mergeEvidence(items: Array<MessageEvidence | undefined>): MessageEvidence {
+  const merged: MessageEvidence = { citations: [], figures: [], locatorCandidates: [], warnings: [] };
+  for (const item of items) {
+    if (!item) continue;
+    merged.citations.push(...(item.citations ?? []));
+    merged.figures.push(...(item.figures ?? []));
+    merged.locatorCandidates.push(...(item.locatorCandidates ?? []));
+    merged.warnings.push(...(item.warnings ?? []));
+  }
+  return merged;
 }
 
 function UserMessage() {
@@ -246,6 +274,39 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
   // 载荷续跑该 run；ref 供 adapter 取值并清除，state 仅驱动提示条渲染。
   const pendingResumeRunIdRef = useRef<string | null>(null);
   const [pendingResumeRunId, setPendingResumeRunId] = useState<string | null>(null);
+  // 澄清问题中断（ask_user_question_required）：卡片渲染 state + 续跑时
+  // 供 adapter 消费的问题定义/作答（与 resumeRunId 成对，一次性取走）。
+  const pendingResumeQuestionsRef = useRef<ClarificationQuestion[] | null>(null);
+  const pendingResumeAnswersRef = useRef<QuestionAnswer[] | null>(null);
+  const [askUser, setAskUser] = useState<{ runId: string; questions: ClarificationQuestion[] } | null>(null);
+  // 证据平面：初始为历史真源（本地落库快照），运行中随 SSE 实时累加。
+  // 只消费权威投影，不从消息文本或 SSE 残影推断。
+  const [evidence, setEvidence] = useState<MessageEvidence>(() =>
+    mergeEvidence(messages.map((message) => message.evidence)),
+  );
+  const mergeLiveEvidence = (patch: Partial<MessageEvidence>) =>
+    setEvidence((current) => ({
+      citations: [...current.citations, ...(patch.citations ?? [])],
+      figures: [...current.figures, ...(patch.figures ?? [])],
+      locatorCandidates: [...current.locatorCandidates, ...(patch.locatorCandidates ?? [])],
+      warnings: [...current.warnings, ...(patch.warnings ?? [])],
+    }));
+  // 能力位驱动渲染：连接成功后拉协议能力快照，图卡仅在服务端声明 figures_card
+  // 能力位时尝试取图（fail-closed）。快照与服务器 `figure_card_enabled` 开闸解耦——
+  // 能力位是「服务端是否会发图卡」，开闸是「本次 run 是否真的发了」，二者独立。
+  const [figuresCapabilityEnabled, setFiguresCapabilityEnabled] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getProtocolCapabilities()
+      .then((info) => {
+        if (cancelled || !info) return;
+        setFiguresCapabilityEnabled(info.capabilities.includes("figures_card"));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [threadId]);
   const historicalTraceRunId = useMemo(() => findLatestTraceRunId(messages), [messages]);
   const cloneTrace = useCallback((current: TraceState): TraceState => ({
     ...current,
@@ -343,6 +404,9 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
             traceCursor.current = 0;
             pendingResumeRunIdRef.current = null;
             setPendingResumeRunId(null);
+            pendingResumeQuestionsRef.current = null;
+            pendingResumeAnswersRef.current = null;
+            setAskUser(null);
             setTrace((current) =>
               current.runId === state.runId
                 ? current
@@ -367,6 +431,12 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           if (completion.runId) refreshTraceSnapshot(completion.runId);
         },
         onTraceEvent: handleTraceEvent,
+        onAskUserQuestion: (runId, questions) => setAskUser({ runId, questions }),
+        onCitationsReady: (_runId, citation, figures) =>
+          mergeLiveEvidence({ citations: [citation], figures }),
+        onLocatorCandidates: (_runId, candidates) =>
+          mergeLiveEvidence({ locatorCandidates: candidates }),
+        onWarning: (message) => mergeLiveEvidence({ warnings: [message] }),
         bridgeAttachment,
         onBridgeConsumed,
         consumeResumeRunId: () => {
@@ -374,6 +444,16 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           pendingResumeRunIdRef.current = null;
           setPendingResumeRunId(null);
           return pending;
+        },
+        consumeResumeQuestions: () => {
+          const questions = pendingResumeQuestionsRef.current ?? undefined;
+          pendingResumeQuestionsRef.current = null;
+          return questions;
+        },
+        consumeResumeAnswers: () => {
+          const answers = pendingResumeAnswersRef.current ?? undefined;
+          pendingResumeAnswersRef.current = null;
+          return answers;
         },
       }),
     [threadId, onRunState, onCompleted, bridgeAttachment, onBridgeConsumed, handleTraceEvent, refreshTraceSnapshot],
@@ -383,12 +463,28 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
     adapters: { attachments: attachmentAdapter },
   });
 
+  // 澄清问题提交：作答进 ref（adapter 下一次 run 消费），以用户消息形态
+  // 进入会话流触发发送；resume 三元组（runId/questions/answers）对齐消费。
+  const submitClarification = (answers: QuestionAnswer[], displayText: string) => {
+    if (!askUser) return;
+    pendingResumeQuestionsRef.current = askUser.questions;
+    pendingResumeAnswersRef.current = answers;
+    pendingResumeRunIdRef.current = askUser.runId;
+    setPendingResumeRunId(askUser.runId);
+    setAskUser(null);
+    runtime.thread.append(displayText);
+  };
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadPrimitive.Root className="thread-root">
         <ThreadPrimitive.Viewport className="thread-viewport">
           <Welcome />
           <ThreadPrimitive.Messages components={{ Message: ChatMessage }} />
+          <EvidenceWarnings warnings={evidence.warnings} />
+          <EvidenceCitations citations={evidence.citations} />
+          <EvidenceFigures figures={evidence.figures} capabilityEnabled={figuresCapabilityEnabled} />
+          <EvidenceLocatorCandidates candidates={evidence.locatorCandidates} />
           <TraceTimeline trace={trace} />
           <AuiIf condition={(state) => state.thread.isRunning}>
             <div className="thinking-status" role="status" aria-live="polite">
@@ -400,7 +496,15 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
             <ArrowDown size={18} />
           </ThreadPrimitive.ScrollToBottom>
           <ThreadPrimitive.ViewportFooter className="thread-footer">
-            {pendingResumeRunId && (
+            {askUser && (
+              <ClarificationCard
+                runId={askUser.runId}
+                questions={askUser.questions}
+                onSubmit={submitClarification}
+                onDismiss={() => setAskUser(null)}
+              />
+            )}
+            {pendingResumeRunId && !askUser && (
               <div className="resume-banner" role="status">
                 <FlaskConical size={16} />
                 <span>

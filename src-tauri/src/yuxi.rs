@@ -13,6 +13,7 @@ use crate::{
 };
 
 const DEFAULT_AGENT_PATH: &str = "/api/agent/default";
+const PROTOCOL_INFO_PATH: &str = "/api/agent/protocol";
 const CREATE_THREAD_PATH: &str = "/api/chat/thread";
 const CREATE_RUN_PATH: &str = "/api/agent/runs";
 const LEGACY_RUN_RESULT_PATH: &str = "/api/agent-invocation/agent-call/runs/result";
@@ -26,10 +27,247 @@ const USER_QUOTA_PATH: &str = "/api/user/quota";
 const USER_USAGE_PATH: &str = "/api/user/usage";
 const GATEWAY_TRACE_HEADER: &str = "X-Gateway-Trace-ID";
 
+/// 桌面端构建时面向的 AgentRun 协议版本（与服务端 /api/agent/protocol 对账）。
+/// 同 major 内服务端承诺 N-1 兼容；major 不一致在连接阶段即 fail-fast。
+pub const DESKTOP_PROTOCOL_VERSION: &str = "1.4";
+const PROTOCOL_VERSION_HEADER: &str = "X-Yuxi-Protocol-Version";
+
 #[derive(Clone)]
 pub struct YuxiClient {
     client: Client,
 }
+
+/// GET /api/agent/protocol 能力快照（连接阶段 fail-fast 兼容判断）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolInfo {
+    pub protocol_version: String,
+    #[serde(default)]
+    pub min_supported_protocol_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// 澄清问题选项（wire 形状 {label, value}，yuxi.utils.question_utils 归一化）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub value: String,
+}
+
+/// ask_user_question_required 中断携带的澄清问题（wire snake_case → UI camelCase）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClarificationQuestion {
+    pub question_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default = "default_true")]
+    pub allow_other: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 用户对一组澄清问题的答复（TS 卡片提交，camelCase 进 IPC）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub other_text: Option<String>,
+}
+
+/// 「其他」选项的保留值，与 Web 端 DEFAULT_OTHER_OPTION_VALUE 同源。
+pub const OTHER_OPTION_VALUE: &str = "__other__";
+
+/// citation_ready v2 的九键引用：基线七键（status/evidence_id/file_id/filename/
+/// zone/page/anchor_id）+ 取图三段式硬前置（kb_id/revision_id）。所有键均可缺席——
+/// 渲染层按实值展示，缺席不猜测补全。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CitationRef {
+    pub status: Option<String>,
+    pub evidence_id: Option<String>,
+    pub file_id: Option<String>,
+    pub filename: Option<String>,
+    pub zone: Option<String>,
+    pub page: Option<i64>,
+    pub anchor_id: Option<String>,
+    pub kb_id: Option<String>,
+    pub revision_id: Option<String>,
+}
+
+/// 图卡选择元数据（PublishableFigure.selection，服务端确定性投影）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FigureSelection {
+    pub asset_count: Option<i64>,
+    pub rule: Option<String>,
+}
+
+/// 服务端 PublishableFigure 完整投影（extra="forbid" 的权威形态）。字段全部
+/// 可缺席：硬前置四键（kb_id/file_id/revision_id/asset_name）齐备才可取图，
+/// 缺键 fail-closed 不渲染图卡——契约语料中的 figures 是简化展示样例，生产
+/// 投影以本类型为准，禁止按样例的三字段写死。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FigureCardAsset {
+    pub binding_id: Option<String>,
+    pub kb_id: Option<String>,
+    pub file_id: Option<String>,
+    pub revision_id: Option<String>,
+    pub asset_name: Option<String>,
+    pub asset_sha256: Option<String>,
+    pub media_type: Option<String>,
+    pub page: Option<i64>,
+    pub panel_match: Option<String>,
+    pub evidence_id: Option<String>,
+    pub figure_label: Option<String>,
+    pub caption: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub role: Option<String>,
+    pub group_index: Option<i64>,
+    pub panel_label: Option<String>,
+    pub asset_page: Option<i64>,
+    pub selection: FigureSelection,
+}
+
+impl FigureCardAsset {
+    /// 取图硬前置：四键齐备且非空才允许构造资产 URL（fail-closed）。
+    pub fn is_fetchable(&self) -> bool {
+        [&self.kb_id, &self.file_id, &self.revision_id, &self.asset_name]
+            .into_iter()
+            .all(|key| key.as_deref().is_some_and(|value| !value.trim().is_empty()))
+    }
+}
+
+/// locator_candidates 候选文献（跨文献歧义清单，只含文档身份三键）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocatorCandidate {
+    pub file_id: String,
+    pub kb_id: String,
+    pub filename: String,
+}
+
+/// 解析 `custom` 帧（payload.name == "yuxi.citation_ready"）：
+/// chunk.citation 九键 + 可选 chunk.figures（字段缺席 ⟺ 本 run 未发布图卡）。
+/// 形状不符返回 None（不猜测）。
+pub fn parse_citation_ready(value: &Value) -> Option<(CitationRef, Vec<FigureCardAsset>)> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("citation_ready") {
+        return None;
+    }
+    let citation: CitationRef = serde_json::from_value(chunk.get("citation")?.clone()).ok()?;
+    let figures = chunk
+        .get("figures")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<FigureCardAsset>(item.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some((citation, figures))
+}
+
+/// 解析 `custom` 帧（payload.name == "yuxi.locator_candidates"）：候选文献清单。
+pub fn parse_locator_candidates(value: &Value) -> Option<Vec<LocatorCandidate>> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("locator_candidates") {
+        return None;
+    }
+    let candidates = chunk
+        .get("candidates")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let candidate = serde_json::from_value::<LocatorCandidate>(item.clone()).ok()?;
+            (!candidate.file_id.trim().is_empty()).then_some(candidate)
+        })
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+/// 解析 `custom` 帧（payload.name == "yuxi.warning"）：非阻塞运行提示。
+pub fn parse_custom_warning(value: &Value) -> Option<String> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("warning") {
+        return None;
+    }
+    chunk
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+}
+
+/// 取图资产 URL 的路径段校验：拒绝空段、分隔符、目录穿越与控制字符。
+fn sanitize_asset_segment(segment: &str) -> AppResult<&str> {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 {
+        return Err(AppError::Protocol("知识库资产地址段无效".into()));
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed
+            .chars()
+            .any(|character| character.is_control())
+    {
+        return Err(AppError::Protocol("知识库资产地址段包含非法字符".into()));
+    }
+    Ok(trimmed)
+}
+
+/// 构造图卡资产 URL（路径段先校验再交给 Url 做百分号编码）。
+pub fn knowledge_asset_url(
+    base: &str,
+    kb_id: &str,
+    file_id: &str,
+    revision_id: &str,
+    asset_name: &str,
+) -> AppResult<String> {
+    let kb_id = sanitize_asset_segment(kb_id)?;
+    let file_id = sanitize_asset_segment(file_id)?;
+    let revision_id = sanitize_asset_segment(revision_id)?;
+    let asset_name = sanitize_asset_segment(asset_name)?;
+    let mut url = Url::parse(base).map_err(|error| AppError::InvalidGateway(error.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| AppError::Protocol("网关地址不能作为资产 URL 基底".into()))?
+        .extend(&[
+            "api",
+            "knowledge",
+            "databases",
+            kb_id,
+            "documents",
+            file_id,
+            "revisions",
+            revision_id,
+            "assets",
+            asset_name,
+        ]);
+    Ok(url.into())
+}
+
+/// 图卡资产 MIME 白名单，与服务端 _MEDIA_TYPE_BY_SUFFIX、Web 端
+/// ALLOWED_IMAGE_TYPES 同源——白名单外的 content-type 一律拒绝渲染。
+const ALLOWED_ASSET_MEDIA_TYPES: [&str; 4] =
+    ["image/jpeg", "image/png", "image/webp", "image/gif"];
+
+/// 单张图卡资产的字节上限：超限视为异常载荷，拒绝进入 IPC。
+const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreatedRun {
@@ -249,6 +487,13 @@ impl YuxiClient {
             header::HeaderValue::from_str(app_version)
                 .map_err(|error| AppError::Internal(error.to_string()))?,
         );
+        // 协议版本声明：服务端 major 不一致时创建 run 直接 426，把破坏性
+        // 变更的失败从「运行中段」提前到「创建请求」（未声明则视为旧客户端放行）。
+        default_headers.insert(
+            PROTOCOL_VERSION_HEADER,
+            header::HeaderValue::from_str(DESKTOP_PROTOCOL_VERSION)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        );
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -299,6 +544,9 @@ impl YuxiClient {
                 .json::<Value>()
                 .await
                 .map_err(|error| AppError::Protocol(error.to_string()))?;
+            // 凭证有效后立即做协议兼容探测（fail-fast）：major 不一致在连接
+            // 阶段报「升级」而不是让问答运行到一半失败。旧服务端无此端点则跳过。
+            self.ensure_protocol_compatible(base, api_key).await?;
             return Ok(value
                 .get("account_scope_id")
                 .and_then(Value::as_str)
@@ -324,6 +572,61 @@ impl YuxiClient {
             200 | 404 => Ok(None),
             _ => Err(response_error(probe).await),
         }
+    }
+
+    /// GET /api/agent/protocol 的能力快照（旧服务端 404 时为 None）。
+    pub async fn fetch_protocol_info(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+    ) -> AppResult<Option<ProtocolInfo>> {
+        let base = validate_gateway_url(gateway_url)?;
+        let response = self
+            .authorized_get(&format!("{base}{PROTOCOL_INFO_PATH}"), api_key)
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| AppError::Protocol(error.to_string()))?;
+        Ok(parse_protocol_info(&value))
+    }
+
+    async fn ensure_protocol_compatible(
+        &self,
+        base: &str,
+        api_key: &SecretString,
+    ) -> AppResult<()> {
+        let info = match self.fetch_protocol_info(base, api_key).await? {
+            Some(info) => info,
+            None => return Ok(()),
+        };
+        let desktop_major = protocol_major(DESKTOP_PROTOCOL_VERSION);
+        let server_major = protocol_major(&info.protocol_version);
+        if desktop_major == server_major {
+            return Ok(());
+        }
+        // 版本区间校验：major 一致才放行；高于桌面（服务端超前）与低于桌面
+        // （服务端过旧）分别给出可操作的升级方向文案，而不是笼统拒绝。
+        let message = if desktop_major > server_major {
+            format!(
+                "服务端 AgentRun 协议版本（{}）低于桌面端所需（{}），请升级服务端 rice-endosperm-agent 后重试",
+                info.protocol_version, DESKTOP_PROTOCOL_VERSION
+            )
+        } else {
+            format!(
+                "服务端 AgentRun 协议版本（{}）高于桌面端支持的版本（{}），请升级稻芯智析桌面端后重试",
+                info.protocol_version, DESKTOP_PROTOCOL_VERSION
+            )
+        };
+        Err(AppError::ProtocolIncompatible(message))
     }
 
     /// 中断恢复变体：`resume` 为 LangGraph 输入载荷（人工审批答复），`created_by_run_id`
@@ -697,6 +1000,57 @@ impl YuxiClient {
             200 | 202 | 204 | 409 => Ok(()),
             _ => Err(response_error(response).await),
         }
+    }
+
+    /// 拉取知识库图卡资产（Bearer + MIME 白名单 + 大小上限）。返回
+    /// (media_type, bytes)；路径段经 knowledge_asset_url 校验与编码，
+    /// 白名单外的类型按协议错误拒绝——渲染层绝不消费未过白名单的字节。
+    pub async fn fetch_knowledge_asset(
+        &self,
+        gateway_url: &str,
+        api_key: &SecretString,
+        kb_id: &str,
+        file_id: &str,
+        revision_id: &str,
+        asset_name: &str,
+    ) -> AppResult<(String, Vec<u8>)> {
+        let base = validate_gateway_url(gateway_url)?;
+        let url = knowledge_asset_url(&base, kb_id, file_id, revision_id, asset_name)?;
+        let response = self
+            .authorized_get(url.as_str(), api_key)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        let response = ensure_success(response).await?;
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !ALLOWED_ASSET_MEDIA_TYPES.contains(&media_type.as_str()) {
+            return Err(AppError::Protocol(format!(
+                "知识库资产类型不在白名单内：{media_type}"
+            )));
+        }
+        if let Some(length) = response.content_length()
+            && length as usize > MAX_ASSET_BYTES
+        {
+            return Err(AppError::Protocol("知识库资产超过 8 MB 上限".into()));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(AppError::from)?
+            .to_vec();
+        if bytes.is_empty() || bytes.len() > MAX_ASSET_BYTES {
+            return Err(AppError::Protocol("知识库资产为空或超过 8 MB 上限".into()));
+        }
+        Ok((media_type, bytes))
     }
 
     fn authorized_get(&self, url: &str, key: &SecretString) -> reqwest::RequestBuilder {
@@ -1885,6 +2239,133 @@ fn parse_default_agent_slug(value: &Value) -> AppResult<String> {
         .ok_or_else(|| AppError::Protocol("默认智能体响应缺少 slug".into()))
 }
 
+/// 协议版本字符串的 major 段；无法解析返回 None（视为未声明）。
+pub fn protocol_major(version: &str) -> Option<u32> {
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .filter(|major| *major > 0)
+}
+
+/// 解析 GET /api/agent/protocol 响应；形状不符返回 None（按旧服务端处理）。
+pub fn parse_protocol_info(value: &Value) -> Option<ProtocolInfo> {
+    let protocol_version = value
+        .get("protocol_version")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_owned();
+    if protocol_major(&protocol_version).is_none() {
+        return None;
+    }
+    Some(ProtocolInfo {
+        min_supported_protocol_version: value
+            .get("min_supported_protocol_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        capabilities: value
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        protocol_version,
+    })
+}
+
+/// ask_user_question_required 中断的 wire 问题（snake_case，与服务端
+/// yuxi.utils.question_utils.normalize_questions 同构）。
+#[derive(Debug, Deserialize)]
+struct WireClarificationQuestion {
+    question_id: String,
+    question: String,
+    #[serde(default)]
+    options: Vec<QuestionOption>,
+    #[serde(default)]
+    multi_select: bool,
+    #[serde(default = "default_true")]
+    allow_other: bool,
+}
+
+/// 从 SSE interrupt/messages 帧提取澄清问题（payload.chunk.questions，
+/// 兼容 interrupt_info.questions 形态）。空/形状不符返回 None。
+pub fn parse_interrupt_questions(value: &Value) -> Option<Vec<ClarificationQuestion>> {
+    let chunk = value.pointer("/payload/chunk")?;
+    let raw = chunk
+        .get("questions")
+        .or_else(|| chunk.pointer("/interrupt_info/questions"))?;
+    let items = raw.as_array()?;
+    let questions: Vec<ClarificationQuestion> = items
+        .iter()
+        .filter_map(|item| {
+            let wire = serde_json::from_value::<WireClarificationQuestion>(item.clone()).ok()?;
+            (!wire.question.trim().is_empty()).then(|| ClarificationQuestion {
+                question_id: wire.question_id,
+                question: wire.question,
+                options: wire.options,
+                multi_select: wire.multi_select,
+                allow_other: wire.allow_other,
+            })
+        })
+        .collect();
+    (!questions.is_empty()).then_some(questions)
+}
+
+/// 把用户的澄清问题答复组装为 resume 载荷：{question_id: 答案}，
+/// 答案形态与 Web 端 HumanApprovalModal.buildAnswer 同构——
+/// 单选 → 选项值字符串；多选 → 选项值数组；选「其他」→
+/// {type:"other", text, selected:[不含其他]}。所有问题必须已作答。
+pub fn build_resume_payload(
+    questions: &[ClarificationQuestion],
+    answers: &[QuestionAnswer],
+) -> AppResult<Value> {
+    let mut payload = serde_json::Map::with_capacity(questions.len());
+    for question in questions {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.question_id == question.question_id)
+            .ok_or_else(|| {
+                AppError::Protocol(format!("澄清问题 {} 尚未作答", question.question_id))
+            })?;
+        let selected: Vec<&str> = answer
+            .selected
+            .iter()
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty() && *value != OTHER_OPTION_VALUE)
+            .collect();
+        let other_text = answer
+            .other_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let value = if let Some(text) = other_text {
+            json!({"type": "other", "text": text, "selected": selected})
+        } else if question.multi_select {
+            if selected.is_empty() {
+                return Err(AppError::Protocol(format!(
+                    "澄清问题 {} 至少选择一项",
+                    question.question_id
+                )));
+            }
+            json!(selected)
+        } else {
+            selected.first().map(|value| json!(value)).ok_or_else(|| {
+                AppError::Protocol(format!("澄清问题 {} 至少选择一项", question.question_id))
+            })?
+        };
+        payload.insert(question.question_id.clone(), value);
+    }
+    Ok(Value::Object(payload))
+}
+
 pub fn validate_authoritative_run_context(
     context: &ServerRunContext,
     expected_agent_slug: &str,
@@ -2520,5 +3001,586 @@ mod tests {
             connection_error_for_gateway("https://api.example.cn", AppError::ServiceUnavailable),
             AppError::ServiceUnavailable
         ));
+    }
+
+    #[test]
+    fn protocol_major_parses_only_positive_majors() {
+        assert_eq!(protocol_major("1.4"), Some(1));
+        assert_eq!(protocol_major("2.0"), Some(2));
+        assert_eq!(protocol_major("0.9"), None);
+        assert_eq!(protocol_major("garbage"), None);
+        assert_eq!(protocol_major(""), None);
+    }
+
+    #[test]
+    fn protocol_info_parses_capability_snapshot() {
+        let info = parse_protocol_info(&json!({
+            "service": "yuxi",
+            "protocol_version": "1.4",
+            "min_supported_protocol_version": "1.2",
+            "capabilities": ["ask_user_question", "citation_v2"]
+        }))
+        .expect("能力快照应可解析");
+        assert_eq!(info.protocol_version, "1.4");
+        assert_eq!(info.min_supported_protocol_version, "1.2");
+        assert_eq!(info.capabilities.len(), 2);
+        assert!(parse_protocol_info(&json!({"protocol_version": "oops"})).is_none());
+        assert!(parse_protocol_info(&json!({})).is_none());
+    }
+
+    #[test]
+    fn interrupt_questions_parse_from_chunk_and_interrupt_info() {
+        let questions = vec![ClarificationQuestion {
+            question_id: "q-stage".into(),
+            question: "重点分析哪个发育阶段？".into(),
+            options: vec![
+                QuestionOption {
+                    label: "灌浆期".into(),
+                    value: "灌浆期".into(),
+                },
+                QuestionOption {
+                    label: "成熟期".into(),
+                    value: "成熟期".into(),
+                },
+            ],
+            multi_select: false,
+            allow_other: true,
+        }];
+        let chunk_form = json!({
+            "payload": {"chunk": {"status": "ask_user_question_required", "questions": [
+                {"question_id": "q-stage", "question": "重点分析哪个发育阶段？",
+                 "options": [{"label": "灌浆期", "value": "灌浆期"}, {"label": "成熟期", "value": "成熟期"}],
+                 "multi_select": false, "allow_other": true}
+            ]}}
+        });
+        assert_eq!(
+            parse_interrupt_questions(&chunk_form),
+            Some(questions.clone())
+        );
+        let interrupt_info_form = json!({
+            "payload": {"chunk": {"interrupt_info": {"questions": [
+                {"question_id": "q-stage", "question": "重点分析哪个发育阶段？",
+                 "options": [{"label": "灌浆期", "value": "灌浆期"}, {"label": "成熟期", "value": "成熟期"}]}
+            ]}}}
+        });
+        // interrupt_info 形态：multi_select 缺省 false，allow_other 缺省 true（服务端默认）。
+        let mut relaxed = questions.clone();
+        relaxed[0].multi_select = false;
+        relaxed[0].allow_other = true;
+        assert_eq!(
+            parse_interrupt_questions(&interrupt_info_form),
+            Some(relaxed)
+        );
+        assert!(parse_interrupt_questions(&json!({"payload": {"chunk": {}}})).is_none());
+        assert!(parse_interrupt_questions(&json!({"payload": {}})).is_none());
+    }
+
+    #[test]
+    fn resume_payload_matches_web_build_answer_semantics() {
+        let questions = vec![
+            ClarificationQuestion {
+                question_id: "q-single".into(),
+                question: "单选？".into(),
+                options: vec![QuestionOption {
+                    label: "A".into(),
+                    value: "A".into(),
+                }],
+                multi_select: false,
+                allow_other: false,
+            },
+            ClarificationQuestion {
+                question_id: "q-multi".into(),
+                question: "多选？".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        value: "A".into(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        value: "B".into(),
+                    },
+                ],
+                multi_select: true,
+                allow_other: false,
+            },
+            ClarificationQuestion {
+                question_id: "q-other".into(),
+                question: "其他？".into(),
+                options: vec![],
+                multi_select: false,
+                allow_other: true,
+            },
+        ];
+        let answers = vec![
+            QuestionAnswer {
+                question_id: "q-single".into(),
+                selected: vec!["A".into()],
+                other_text: None,
+            },
+            QuestionAnswer {
+                question_id: "q-multi".into(),
+                selected: vec!["A".into(), "B".into()],
+                other_text: None,
+            },
+            QuestionAnswer {
+                question_id: "q-other".into(),
+                selected: vec![OTHER_OPTION_VALUE.into()],
+                other_text: Some("  授粉后 15 天  ".into()),
+            },
+        ];
+        let payload = build_resume_payload(&questions, &answers).expect("应组装成功");
+        assert_eq!(payload["q-single"], json!("A"));
+        assert_eq!(payload["q-multi"], json!(["A", "B"]));
+        assert_eq!(
+            payload["q-other"],
+            json!({"type": "other", "text": "授粉后 15 天", "selected": []})
+        );
+
+        // 缺答与空选都必须拒绝，不允许发明空答案。
+        let missing = build_resume_payload(&questions, &answers[..2]);
+        assert!(missing.is_err());
+        let empty = build_resume_payload(
+            &questions[..1],
+            &[QuestionAnswer {
+                question_id: "q-single".into(),
+                selected: vec![],
+                other_text: None,
+            }],
+        );
+        assert!(empty.is_err());
+    }
+}
+
+/// 桌面端契约回放：消费与服务端 pytest 同一批 fixtures。
+/// 契约语料目录：contract_fixtures 回放测试与 commands 白名单联动测试共用。
+#[cfg(test)]
+pub(crate) fn contract_fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_run_contract")
+}
+
+/// 语料真源在 Yuxi 仓库（backend/test/fixtures/agent_run_contract），
+/// 本目录副本由 scripts/sync-contract-fixtures.ps1 同步，manifest 哈希
+/// 双端一致——服务端改契约而桌面端未同步时，这里先红。
+#[cfg(test)]
+mod contract_fixtures {
+    use super::terminal_status;
+    use super::{
+        ClarificationQuestion, FigureCardAsset, ProgressText, QuestionAnswer, QuestionOption,
+        ServerRunContext, build_resume_payload, knowledge_asset_url, parse_citation_ready,
+        parse_custom_warning, parse_error_body, parse_interrupt_questions, parse_locator_candidates,
+        parse_protocol_info, parse_run_result, validate_authoritative_run_context,
+    };
+    use crate::error::AppError;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn fixture_dir() -> PathBuf {
+        super::contract_fixture_dir()
+    }
+
+    fn read_fixture(name: &str) -> String {
+        fs::read_to_string(fixture_dir().join(name)).unwrap_or_else(|error| {
+            panic!("读取契约语料 {name} 失败（先运行 scripts/sync-contract-fixtures.ps1）：{error}")
+        })
+    }
+
+    fn load_json(name: &str) -> Value {
+        serde_json::from_str(&read_fixture(name)).expect("契约语料必须是合法 JSON")
+    }
+
+    fn load_frames() -> Vec<(String, Value)> {
+        read_fixture("sse_frames.jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let frame: Value = serde_json::from_str(line).expect("SSE 语料行必须是合法 JSON");
+                let event = frame["event"].as_str().unwrap_or_default().to_owned();
+                (event, frame["data"].clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn manifest_hashes_match_files() {
+        let manifest = load_json("manifest.json");
+        let files = manifest["files"]
+            .as_object()
+            .expect("manifest.files 必须是对象");
+        assert!(!files.is_empty(), "manifest 不能为空");
+        for (name, expected) in files {
+            let bytes = fs::read(fixture_dir().join(name))
+                .unwrap_or_else(|error| panic!("manifest 声明了不存在的文件 {name}：{error}"));
+            let digest = Sha256::digest(&bytes);
+            assert_eq!(
+                format!("{:x}", digest),
+                expected.as_str().unwrap_or_default(),
+                "{name} 与 manifest 哈希不符——桌面端副本与服务端语料漂移，请运行 scripts/sync-contract-fixtures.ps1"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_fixture_parses_as_protocol_info() {
+        let info =
+            parse_protocol_info(&load_json("capabilities.json")).expect("能力快照语料必须可解析");
+        assert_eq!(info.protocol_version, "1.4");
+        assert!(
+            info.capabilities
+                .iter()
+                .any(|item| item == "ask_user_question")
+        );
+    }
+
+    #[test]
+    fn evidence_frames_replay_through_parsers() {
+        // citation_ready（v2 九键）：kb_id/revision_id 必须贯通到桌面类型——
+        // 它们是取图三段式的硬前置。
+        let citation_frame = json!({
+            "payload": {
+                "name": "yuxi.citation_ready",
+                "chunk": {
+                    "status": "citation_ready",
+                    "citation": {
+                        "status": "VERIFIED",
+                        "evidence_id": "ev-0001",
+                        "file_id": "file-0001",
+                        "filename": "rice-endosperm-2026.pdf",
+                        "zone": "body",
+                        "page": 3,
+                        "anchor_id": "anch-0001",
+                        "kb_id": "kb-0001",
+                        "revision_id": "rev-0012"
+                    },
+                    "figures": [
+                        {"figure_id": "fig-0001", "page": 3, "caption": "图1 淀粉颗粒电镜图"}
+                    ]
+                }
+            }
+        });
+        let (citation, figures) =
+            parse_citation_ready(&citation_frame).expect("citation_ready 帧必须可解析");
+        assert_eq!(citation.kb_id.as_deref(), Some("kb-0001"));
+        assert_eq!(citation.revision_id.as_deref(), Some("rev-0012"));
+        assert_eq!(citation.evidence_id.as_deref(), Some("ev-0001"));
+        // 语料 figures 是简化展示样例（无 asset_name）：按完整投影解析成功，
+        // 但缺取图硬前置 → 不可取图（fail-closed），不得猜测补全。
+        assert_eq!(figures.len(), 1);
+        assert!(!figures[0].is_fetchable(), "缺 asset_name 的样例图不可取图");
+        // 完整 PublishableFigure 投影：四键齐备才可取图。
+        let full = serde_json::from_value::<FigureCardAsset>(json!({
+            "binding_id": "bd-1", "kb_id": "kb-0001", "file_id": "file-0001",
+            "revision_id": "rev-0012", "asset_name": "fig_001.png",
+            "media_type": "image/png", "role": "primary", "caption": "图1"
+        }))
+        .expect("完整投影必须可反序列化");
+        assert!(full.is_fetchable());
+
+        // locator_candidates：候选文献三键。
+        let locator_frame = json!({
+            "payload": {
+                "name": "yuxi.locator_candidates",
+                "chunk": {
+                    "status": "locator_candidates",
+                    "candidates": [
+                        {"file_id": "file-0001", "kb_id": "kb-0001", "filename": "rice-endosperm-2026.pdf"},
+                        {"file_id": "file-0009", "kb_id": "kb-0002", "filename": "grain-filling-2025.pdf"}
+                    ]
+                }
+            }
+        });
+        let candidates = parse_locator_candidates(&locator_frame).expect("候选清单必须可解析");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1].filename, "grain-filling-2025.pdf");
+
+        // yuxi.warning：非阻塞提示文案。
+        let warning_frame = json!({
+            "payload": {
+                "name": "yuxi.warning",
+                "chunk": {"status": "warning", "message": "部分检索来源超时，结果可能不完整"}
+            }
+        });
+        assert_eq!(
+            parse_custom_warning(&warning_frame).as_deref(),
+            Some("部分检索来源超时，结果可能不完整")
+        );
+
+        // 语料 compact 视图（data 帧）与 verbose 视图驱动同一批解析器。
+        for (event, data) in load_frames() {
+            if event != "custom" {
+                continue;
+            }
+            let name = data.pointer("/payload/name").and_then(Value::as_str);
+            match name {
+                Some("yuxi.citation_ready") => {
+                    assert!(parse_citation_ready(&data).is_some(), "compact citation 帧必须可解析");
+                }
+                Some("yuxi.locator_candidates") => {
+                    assert!(
+                        parse_locator_candidates(&data).is_some(),
+                        "compact locator 帧必须可解析"
+                    );
+                }
+                Some("yuxi.warning") => {
+                    assert!(parse_custom_warning(&data).is_some(), "compact warning 帧必须可解析");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_cases_preserve_client_consumption_semantics() {
+        // 服务端 verbose→compact 压缩规则（compaction_cases.json）不得改变
+        // 桌面端消费语义：对每一对 input/expected，两种形态经 ProgressText
+        // （文本累积）与 parse_interrupt_questions（澄清问题）必须产出等价结果。
+        let cases = load_json("compaction_cases.json");
+        let items = cases.as_array().expect("compaction_cases 必须是数组");
+        assert!(!items.is_empty());
+        for case in items {
+            let name = case["name"].as_str().unwrap_or_default();
+            let input = case["input"];
+            let expected = case["expected"];
+            let mut verbose_progress = ProgressText::default();
+            let mut compact_progress = ProgressText::default();
+            let verbose_frame = json!({"payload": {"chunk": input.clone()}});
+            let compact_frame = json!({"payload": {"chunk": expected.clone()}});
+            let verbose_text = verbose_progress.apply(&verbose_frame);
+            let compact_text = compact_progress.apply(&compact_frame);
+            assert_eq!(
+                verbose_progress.text, compact_progress.text,
+                "{name}: 压缩前后文本累积必须等价"
+            );
+            assert_eq!(verbose_text.is_some(), compact_text.is_some(), "{name}");
+            let verbose_questions = parse_interrupt_questions(&verbose_frame);
+            let compact_questions = parse_interrupt_questions(&compact_frame);
+            assert_eq!(
+                verbose_questions, compact_questions,
+                "{name}: 压缩前后澄清问题必须等价（questions/interrupt_info 是白名单字段）"
+            );
+        }
+    }
+
+    #[test]
+    fn error_retryable_semantics_match_registry() {
+        // 桌面端 retryable 判断与服务端 error_registry 语义对齐（与 HTTP 状态
+        // 解耦）：429 配额耗尽不可重试、429 预约占用中可重试、409/422/403/
+        // 426 一律不可重试。语义漂移时本测试先红。
+        let errors = load_json("error_bodies.json");
+        let expected_retryable = [
+            ("daily_run_quota_exceeded", false),
+            ("platform_token_quota_exceeded", false),
+            ("platform_token_quota_reservation_busy", true),
+            ("run_busy", false),
+            ("protocol_version_unsupported", false),
+            ("byok_not_allowed", false),
+            ("byok_required", false),
+            ("custom_model_credential_unavailable", false),
+        ];
+        for sample in errors["structured"].as_array().expect("structured 数组") {
+            let detail = &sample["body"]["detail"];
+            let code = detail["code"].as_str().unwrap();
+            let status = sample["status"].as_u64().unwrap() as u16;
+            let message = detail["message"].as_str().unwrap_or_default().to_owned();
+            let action = detail["action"].as_str().map(str::to_owned);
+            let error = AppError::from_server_parts(status, message, Some(code.into()), action, None);
+            let command = crate::error::CommandError::from(error);
+            let (_, want_retryable) = expected_retryable
+                .iter()
+                .find(|(expected, _)| *expected == code)
+                .unwrap_or_else(|| panic!("{code} 未在本测试登记期望值"));
+            assert_eq!(
+                command.retryable, *want_retryable,
+                "{code} 的 retryable 语义与服务端注册表不一致"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_frames_replay_progress_text_and_terminals() {
+        let frames = load_frames();
+        assert!(frames.len() >= 10, "SSE 语料至少覆盖 10 种形态");
+        let mut progress = ProgressText::default();
+        let mut terminals = Vec::new();
+        let mut questions_total = 0;
+        for (event, data) in &frames {
+            if let Some(questions) = parse_interrupt_questions(data) {
+                questions_total += questions.len();
+            }
+            if progress.apply(data).is_some() {
+                assert!(!progress.text.is_empty(), "文本增量后累积不能为空");
+            }
+            if event == "end" || terminal_status(data).is_some() {
+                terminals.push(
+                    data.pointer("/payload/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(questions_total, 1, "interrupt 帧必须产出 1 个澄清问题");
+        assert!(terminals.contains(&"completed".to_owned()));
+        assert!(terminals.contains(&"interrupted".to_owned()));
+        assert!(
+            progress.text.contains("水稻胚乳发育"),
+            "文本累积应包含首段增量"
+        );
+        assert!(
+            progress.text.contains("第二段内容"),
+            "items[] 形态的增量也必须累积"
+        );
+    }
+
+    #[test]
+    fn run_results_replay_through_parser() {
+        let results = load_json("run_results.json");
+        let completed = parse_run_result(&results["completed"]);
+        assert_eq!(completed.status, "completed");
+        assert!(completed.output.contains("最终权威回答"));
+        let failed = parse_run_result(&results["failed"]);
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error.as_deref(), Some("模型调用失败"));
+        assert_eq!(failed.error_code.as_deref(), Some("model_error"));
+        for status in ["interrupted", "cancelled"] {
+            assert_eq!(parse_run_result(&results[status]).status, status);
+        }
+    }
+
+    #[test]
+    fn run_context_fixture_validates_as_authoritative() {
+        let context: ServerRunContext = serde_json::from_value(load_json("run_context.json"))
+            .expect("run_context 语料必须可反序列化");
+        validate_authoritative_run_context(
+            &context,
+            "default-chatbot",
+            "th-demo-01",
+            "desktop-7c9e16af2d3b4f5e",
+        )
+        .expect("1.4 契约语料必须通过权威校验");
+    }
+
+    #[test]
+    fn error_body_dialects_replay_through_parser() {
+        let errors = load_json("error_bodies.json");
+        for sample in errors["structured"]
+            .as_array()
+            .expect("structured 必须是数组")
+        {
+            let body = serde_json::to_string(&sample["body"]).unwrap();
+            let parsed = parse_error_body(&body);
+            let code = sample["body"]["detail"]["code"].as_str().unwrap();
+            assert_eq!(
+                parsed.code.as_deref(),
+                Some(code),
+                "{code} 的错误码必须保留"
+            );
+            assert!(
+                parsed
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| !m.trim().is_empty()),
+                "{code} 必须有可展示文案"
+            );
+            if let Some(action) = sample["body"]["detail"]["action"].as_str() {
+                assert_eq!(
+                    parsed.action.as_deref(),
+                    Some(action),
+                    "{code} 的 action 必须保留"
+                );
+            }
+        }
+        let dialect =
+            parse_error_body(&serde_json::to_string(&errors["detail_error_key"]["body"]).unwrap());
+        assert_eq!(dialect.code.as_deref(), Some("invalid_input"));
+        let detail_string =
+            parse_error_body(&serde_json::to_string(&errors["detail_string"]["body"]).unwrap());
+        assert_eq!(detail_string.message.as_deref(), Some("运行任务不存在"));
+        let gateway =
+            parse_error_body(&serde_json::to_string(&errors["gateway_error_msg"]["body"]).unwrap());
+        assert!(
+            gateway
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("upstream timeout"))
+        );
+        let plain = parse_error_body(errors["plain_text"]["body"].as_str().unwrap());
+        assert_eq!(plain.message.as_deref(), Some("invalid request"));
+    }
+
+    #[test]
+    fn resume_fixture_round_trips_into_web_compatible_payload() {
+        let questions = vec![ClarificationQuestion {
+            question_id: "q-stage".into(),
+            question: "重点分析哪个发育阶段？".into(),
+            options: vec![
+                QuestionOption {
+                    label: "灌浆期".into(),
+                    value: "灌浆期".into(),
+                },
+                QuestionOption {
+                    label: "成熟期".into(),
+                    value: "成熟期".into(),
+                },
+            ],
+            multi_select: false,
+            allow_other: true,
+        }];
+        let answers = vec![QuestionAnswer {
+            question_id: "q-stage".into(),
+            selected: vec!["__other__".into()],
+            other_text: Some("授粉后 15 天的中期灌浆".into()),
+        }];
+        let payload = build_resume_payload(&questions, &answers).expect("答复组装必须成功");
+        let resume_fixture = load_json("resume_run_request_desktop.json");
+        assert_eq!(
+            payload, resume_fixture["resume"],
+            "resume 载荷必须与服务端语料同构"
+        );
+        // 桌面端请求闭集：不得携带 messages/async_mode（网关 additionalProperties:false）。
+        let create_fixture = load_json("create_run_request_desktop.json");
+        for forbidden in ["messages", "async_mode"] {
+            assert!(
+                create_fixture.get(forbidden).is_none(),
+                "请求语料不得含 {forbidden}"
+            );
+        }
+        assert!(
+            create_fixture["query"]
+                .as_str()
+                .is_some_and(|q| !q.is_empty())
+        );
+    }
+
+    #[test]
+    fn asset_url_builds_and_sanitizes_segments() {
+        let url = knowledge_asset_url(
+            "https://gw.example.cn/",
+            "kb-0001",
+            "file-0001",
+            "rev-0012",
+            "fig_001 final.png",
+        )
+        .expect("合法路径段必须可构造 URL");
+        assert_eq!(
+            url,
+            "https://gw.example.cn/api/knowledge/databases/kb-0001/documents/file-0001/revisions/rev-0012/assets/fig_001%20final.png"
+        );
+        // 目录穿越、分隔符、空段与超长段一律拒绝（fail-closed，不猜测清洗）。
+        for (kb, file, revision, asset) in [
+            ("..", "f", "r", "a.png"),
+            ("kb/1", "f", "r", "a.png"),
+            ("kb", "f\\x", "r", "a.png"),
+            ("kb", "f", "r", "../etc/passwd"),
+            ("", "f", "r", "a.png"),
+            ("kb", "f", "r", "  "),
+        ] {
+            assert!(
+                knowledge_asset_url("https://gw.example.cn", kb, file, revision, asset).is_err(),
+                "非法段必须被拒绝：{asset:?}"
+            );
+        }
     }
 }

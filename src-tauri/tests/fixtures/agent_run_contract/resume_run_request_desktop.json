@@ -1,0 +1,12 @@
+{
+  "agent_slug": "default-chatbot",
+  "thread_id": "th-demo-01",
+  "meta": {
+    "request_id": "desktop-9f2b7c1d4e5a6f70",
+    "client": "rice-endosperm-desktop"
+  },
+  "resume": {
+    "q-stage": {"type": "other", "text": "授粉后 15 天的中期灌浆", "selected": []}
+  },
+  "created_by_run_id": "run-0001"
+}

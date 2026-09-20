@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "files": {
+    "capabilities.json": "f7a2b2418c1d3b15d0926e1003df7b9ee8a60dcf5c16279cfbf94dd1ec61ff2a",
+    "compaction_cases.json": "c093fd91ab2518798f8bfd4cf5deacace9202e60c8ba76e554f707f922ebce15",
+    "create_run_request_desktop.json": "500647a6aca3bff78e5ebd3e46592f823eef82cd988a3e08795163ff1d6f0301",
+    "error_bodies.json": "3819d3138b4394dd83bdf384a3c311a26fa528046403169f5db9cdac9192cf60",
+    "resume_run_request_desktop.json": "f926b4e8cd3b74ed14d443581c2ddf6272ccd2c14d41062cc3f0c493567bcdfc",
+    "run_context.json": "066d8f116a37fd1f7a11f88944c768909564f9e33c4bb56e8080b9a29b9663eb",
+    "run_results.json": "3e378ba8f0fe641149ed199677cb4aa367d562bc7ba758f271b25699aac79a4b",
+    "sse_frames.jsonl": "80dc5db1514e1eeeb011347dbdbd7791438433e2938d9c5a7318002bd43256fe"
+  }
+}

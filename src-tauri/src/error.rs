@@ -41,6 +41,10 @@ pub enum AppError {
         "Yuxi 服务端版本过旧，无法正确处理思考模型的多轮工具调用。请将 rice-endosperm-agent 更新到最新版并重启服务后重试；无需更换 API Key。"
     )]
     ServerUpgradeRequired,
+    /// 协议版本不兼容（服务端 426 / 能力探测 major 不匹配）：
+    /// 升级桌面端或服务端后重试，重试无意义。
+    #[error("{0}")]
+    ProtocolIncompatible(String),
     #[error("请求已取消")]
     Cancelled,
     #[error("登录会话已失效，请在连接设置中重新登录")]
@@ -108,6 +112,15 @@ impl AppError {
         if status == 401 && server_code.is_none() {
             return Self::Unauthorized;
         }
+        if status == 426 || server_code.as_deref() == Some("protocol_version_unsupported") {
+            return Self::ProtocolIncompatible(
+                message
+                    .trim()
+                    .is_empty()
+                    .then(|| "客户端与服务端协议版本不兼容，请升级后重试".to_string())
+                    .unwrap_or(message),
+            );
+        }
         if (500..=599).contains(&status) && server_code.is_none() {
             return Self::ServiceUnavailable;
         }
@@ -163,6 +176,7 @@ impl AppError {
             Self::ServiceUnavailable => "service_unavailable",
             Self::LocalServiceUnavailable => "local_service_unavailable",
             Self::ServerUpgradeRequired => "server_upgrade_required",
+            Self::ProtocolIncompatible(_) => "protocol_incompatible",
             Self::Cancelled => "cancelled",
             Self::SessionRequiresRelogin => "session_requires_relogin",
             Self::ThreadNotFound => "thread_not_found",
@@ -218,6 +232,7 @@ impl From<AppError> for CommandError {
             AppError::Forbidden(_) => Some(403),
             AppError::RateLimited(_) => Some(429),
             AppError::ServiceUnavailable | AppError::LocalServiceUnavailable => Some(503),
+            AppError::ProtocolIncompatible(_) => Some(426),
             AppError::Server { status, .. } => Some(*status),
             _ => None,
         };
@@ -363,5 +378,25 @@ mod tests {
     fn plain_unauthorized_without_code_keeps_legacy_mapping() {
         let error = AppError::from_server_parts(401, "Not authenticated".into(), None, None, None);
         assert!(matches!(error, AppError::Unauthorized));
+    }
+
+    #[test]
+    fn protocol_426_maps_to_incompatible_and_is_not_retryable() {
+        let structured = AppError::from_server_parts(
+            426,
+            "客户端协议版本（0.9）与服务端（1.4）不兼容，请升级桌面端后重试".into(),
+            Some("protocol_version_unsupported".into()),
+            Some("upgrade_client".into()),
+            None,
+        );
+        assert!(matches!(structured, AppError::ProtocolIncompatible(_)));
+        let command = super::CommandError::from(structured);
+        assert_eq!(command.code, "protocol_incompatible");
+        assert_eq!(command.status, Some(426));
+        assert!(!command.retryable);
+
+        let bare = AppError::from_server_parts(426, String::new(), None, None, None);
+        assert!(matches!(bare, AppError::ProtocolIncompatible(_)));
+        assert!(bare.to_string().contains("不兼容"));
     }
 }

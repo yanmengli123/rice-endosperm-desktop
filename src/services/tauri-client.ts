@@ -5,10 +5,12 @@ import type {
   DeviceCodeStart,
   DeviceLoginPoll,
   DeviceSessionView,
+  FigureAssetPayload,
   LegacyClaimResult,
   LocalMessage,
   ModelOption,
   ModelConfigurationResult,
+  ProtocolInfo,
   PublicSettings,
   PendingRunSync,
   PendingChatAttachment,
@@ -93,6 +95,19 @@ export const getRunTrace = (runId: string) =>
 
 export const getRunTraceEvents = (runId: string, afterSequence: number) =>
   invoke<TraceEventPage>("get_run_trace_events", { runId, afterSequence });
+
+/** 服务端协议能力快照（渲染分支的能力位真源）；旧服务端返回 null。 */
+export const getProtocolCapabilities = () =>
+  invoke<ProtocolInfo | null>("get_protocol_capabilities");
+
+/** 图卡资产字节（base64 通道）：路径段在 Rust 侧校验编码，MIME 走服务端同源白名单。 */
+export const getFigureAsset = (
+  kbId: string,
+  fileId: string,
+  revisionId: string,
+  assetName: string,
+) =>
+  invoke<FigureAssetPayload>("get_figure_asset", { kbId, fileId, revisionId, assetName });
 
 export const syncPendingRuns = () =>
   invoke<PendingRunSync>("sync_pending_runs");
