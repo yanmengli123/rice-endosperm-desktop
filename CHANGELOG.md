@@ -1,5 +1,16 @@
 # 更新日志
 
+## 0.6.0（2026-09-20）
+
+- 接入 AgentRun 证据平面（协议 1.4 能力位 `citation_v2` / `figures_card` / `locator_candidates`，服务端 additive 演进）：回答末尾现在展示结构化引用芯片（文件名 + 区块 + 页码）、证据图卡与跨文献歧义候选清单，运行内非阻塞提示以可关闭提示条呈现——全部来自服务端确定性投影，不从消息文本或 UI 状态推断。
+- 图卡取图走鉴权代理：四键（kbId/fileId/revisionId/assetName）齐备才构造资产 URL，经 `get_figure_asset` 拉取 base64 拼 data URL 渲染（字节不落盘）；缺键 fail-closed 只渲染题注不取图；取图额外受 `figures_card` 能力位门控——服务端未声明该能力位时绝不发起请求（与 `figure_card_enabled` 开闸解耦：能力位是「服务端是否会发图卡」，开闸是「本次 run 是否真的发了」）。
+- 协议底座：连接成功后将 `GET /api/agent/protocol` 能力快照按网关地址缓存进 AppState，渲染分支以能力位为准替代「字段缺席当开关」；major 与桌面端不一致时 fail-fast 报 `protocol_incompatible`（服务端 426 同码），并区分「服务端过旧」与「服务端超前」给出对应升级方向文案。
+- SSE 观测闭环：`event: custom` 帧的语义名在 `payload.name`，一级白名单对 custom 恒命中——新增二级白名单（`KNOWN_CUSTOM_EVENT_NAMES`），未知 custom 名记 WARN `sse_custom_unknown` 并计入会话摘要，避免服务端新增证据类事件被静默丢弃。
+- 澄清问题全栈（ask_user_question_required）：SSE `interrupt` 帧携带的问题渲染为选项卡片（单选/多选/「其他」自由文本），作答经 `{questionId: 答案}` resume 载荷续跑（与 Web 端 buildAnswer 同构，「其他」保留值三端同源 `__other__`）。
+- 历史恢复：证据元数据随助手消息落库 `messages.evidence_json`（SQLite 迁移 0008），重开历史会话从本地真源恢复引用/图卡/候选/提示，不重放 SSE 推断。
+- 跨端契约语料：`src-tauri/tests/fixtures/agent_run_contract/` 同步副本（`scripts/sync-contract-fixtures.ps1`）经 cargo 回放测试消费并做 manifest sha256 校验；白名单↔语料联动断言让服务端新增事件而桌面端未跟进时测试先红。
+- 测试：前端 80/80 通过（新增 adapter 证据透传 3 + EvidencePlane 组件 7）；TypeScript + Vite 生产构建通过；Rust clippy/cargo test 由 Windows CI 执行（本机 MSVC 工具链不可用）。
+
 ## 0.4.8（2026-09-09）
 
 - 接入 AgentRun 事实型执行轨迹（`yuxi.run-trace.v1`，协议 1.4）：问答过程在本轮时间线中如实展示模型生成、工具/子智能体与知识检索——真实发生什么显示什么，纯问候不再出现未发生的检索或工具步骤。
