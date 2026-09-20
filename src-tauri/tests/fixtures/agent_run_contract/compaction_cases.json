@@ -1,0 +1,72 @@
+[
+  {
+    "name": "strips_make_chunk_base_fields",
+    "input": {
+      "request_id": "desktop-7c9e16af2d3b4f5e",
+      "response": "",
+      "thread_id": "th-demo-01",
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "文本"}
+    },
+    "expected": {
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "文本"}
+    }
+  },
+  {
+    "name": "reasoning_content_becomes_state",
+    "input": {
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "答案", "reasoning_content": "思考原文不得外泄"}
+    },
+    "expected": {
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "答案", "reasoning_state": "thinking"}
+    }
+  },
+  {
+    "name": "empty_content_dropped",
+    "input": {
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": ""}
+    },
+    "expected": {
+      "status": "loading",
+      "stream_event": {"type": "message_delta", "message_id": "msg-01"}
+    }
+  },
+  {
+    "name": "questions_and_interrupt_info_kept",
+    "input": {
+      "status": "ask_user_question_required",
+      "questions": [
+        {
+          "question_id": "q-stage",
+          "question": "重点分析哪个发育阶段？",
+          "options": [{"label": "灌浆期", "value": "灌浆期"}],
+          "multi_select": false,
+          "allow_other": true
+        }
+      ],
+      "interrupt_info": {"reason": "ask_user_question_required"}
+    },
+    "expected": {
+      "status": "ask_user_question_required",
+      "questions": [
+        {
+          "question_id": "q-stage",
+          "question": "重点分析哪个发育阶段？",
+          "options": [{"label": "灌浆期", "value": "灌浆期"}],
+          "multi_select": false,
+          "allow_other": true
+        }
+      ],
+      "interrupt_info": {"reason": "ask_user_question_required"}
+    }
+  },
+  {
+    "name": "unlisted_field_stripped",
+    "input": {"status": "loading", "secret_field": "x", "message": "进度"},
+    "expected": {"status": "loading", "message": "进度"}
+  }
+]

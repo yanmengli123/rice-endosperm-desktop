@@ -55,6 +55,10 @@ pub struct LocalMessage {
     pub content: String,
     pub created_at: String,
     pub attachments: Vec<LocalMessageAttachment>,
+    /// 证据平面元数据（citation 芯片/图卡/候选文献/运行提示）：仅在 SSE 流上
+    /// 实际观测到时非空，随助手消息一并落库，重开历史会话时从本地真源恢复。
+    #[serde(default)]
+    pub evidence: MessageEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -66,6 +70,20 @@ pub struct LocalMessageAttachment {
     pub file_size: usize,
 }
 
+/// 一次 run 观测到的证据平面快照（权威投影原样存档，恢复时不做二次推断）。
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageEvidence {
+    #[serde(default)]
+    pub citations: Vec<crate::yuxi::CitationRef>,
+    #[serde(default)]
+    pub figures: Vec<crate::yuxi::FigureCardAsset>,
+    #[serde(default)]
+    pub locator_candidates: Vec<crate::yuxi::LocatorCandidate>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct LocalMessageRow {
     id: String,
@@ -73,6 +91,7 @@ struct LocalMessageRow {
     content: String,
     created_at: String,
     attachments_json: String,
+    evidence_json: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,7 +442,7 @@ impl Database {
     pub async fn load_messages(&self, thread_id: &str) -> AppResult<Vec<LocalMessage>> {
         let account_scope = self.current_account_scope().await?;
         let rows = sqlx::query_as::<_, LocalMessageRow>(
-            "SELECT id, role, content, created_at, attachments_json FROM messages \
+            "SELECT id, role, content, created_at, attachments_json, evidence_json FROM messages \
              WHERE thread_id = ? AND account_scope = ? ORDER BY position",
         )
         .bind(thread_id)
@@ -434,12 +453,16 @@ impl Database {
             .map(|row| {
                 let attachments = serde_json::from_str(&row.attachments_json)
                     .map_err(|error| AppError::Database(format!("本地附件元数据损坏: {error}")))?;
+                // 证据元数据损坏不阻断历史加载：降级为空证据（fail-closed 的
+                // 反向——历史渲染可以没有证据，不能没有消息）。
+                let evidence = serde_json::from_str(&row.evidence_json).unwrap_or_default();
                 Ok(LocalMessage {
                     id: row.id,
                     role: row.role,
                     content: row.content,
                     created_at: row.created_at,
                     attachments,
+                    evidence,
                 })
             })
             .collect()
@@ -464,6 +487,49 @@ impl Database {
         content: &str,
         attachments_json: &str,
     ) -> AppResult<()> {
+        self.append_message_with_attachments_and_evidence(
+            id,
+            thread_id,
+            role,
+            content,
+            attachments_json,
+            "[]",
+        )
+        .await
+    }
+
+    /// 带证据平面元数据的助手消息落库（evidence 为空时等价 append_message）。
+    pub async fn append_message_with_evidence(
+        &self,
+        id: &str,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        evidence: &MessageEvidence,
+    ) -> AppResult<()> {
+        let evidence_json = serde_json::to_string(evidence)
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        self.append_message_with_attachments_and_evidence(
+            id,
+            thread_id,
+            role,
+            content,
+            "[]",
+            &evidence_json,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_message_with_attachments_and_evidence(
+        &self,
+        id: &str,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        attachments_json: &str,
+        evidence_json: &str,
+    ) -> AppResult<()> {
         let account_scope = self.current_account_scope().await?;
         self.ensure_thread_in_scope(thread_id, &account_scope)
             .await?;
@@ -477,9 +543,9 @@ impl Database {
         // 已生成内容抢救落库；send_message 路径会再写一次，append-only 在这
         // 种边缘场景不应让抢救失败。
         sqlx::query(
-            "INSERT INTO messages(id, thread_id, role, content, attachments_json, position, account_scope, created_at) \
-             VALUES(?, ?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ? AND account_scope = ?), 0) + 1, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET content = excluded.content, attachments_json = excluded.attachments_json \
+            "INSERT INTO messages(id, thread_id, role, content, attachments_json, evidence_json, position, account_scope, created_at) \
+             VALUES(?, ?, ?, ?, ?, ?, COALESCE((SELECT MAX(position) FROM messages WHERE thread_id = ? AND account_scope = ?), 0) + 1, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET content = excluded.content, attachments_json = excluded.attachments_json, evidence_json = excluded.evidence_json \
              WHERE messages.thread_id = excluded.thread_id \
              AND messages.account_scope = excluded.account_scope \
              AND messages.role = excluded.role \
@@ -490,6 +556,7 @@ impl Database {
         .bind(role)
         .bind(content)
         .bind(attachments_json)
+        .bind(evidence_json)
         .bind(thread_id)
         .bind(&account_scope)
         .bind(&account_scope)

@@ -1,0 +1,57 @@
+{
+  "completed": {
+    "status": "completed",
+    "output": "水稻胚乳灌浆期的关键调控基因包括…（最终权威回答）",
+    "agent_slug": "default-chatbot",
+    "thread_id": "th-demo-01",
+    "conversation_id": 101,
+    "agent_run_id": "run-0001",
+    "request_id": "desktop-7c9e16af2d3b4f5e",
+    "final_message_id": "msg-final-01",
+    "langfuse_trace_id": "trace-0001",
+    "run_context": {
+      "protocol_version": "1.4",
+      "agent_slug": "default-chatbot",
+      "thread_id": "th-demo-01",
+      "request_id": "desktop-7c9e16af2d3b4f5e",
+      "result_authority": "yuxi_server",
+      "model_spec": null,
+      "knowledge_scope": {
+        "scope_id": null,
+        "scope_version": null,
+        "scope_mode": null,
+        "knowledge_strategy": null,
+        "retrieval_mode": null,
+        "allow_web": false,
+        "kb_count": 0,
+        "members": []
+      },
+      "knowledge_retrievals": []
+    }
+  },
+  "failed": {
+    "status": "failed",
+    "output": null,
+    "error": {"type": "model_error", "message": "模型调用失败"},
+    "run_context": {
+      "protocol_version": "1.4",
+      "result_authority": "yuxi_server"
+    }
+  },
+  "interrupted": {
+    "status": "interrupted",
+    "output": "",
+    "run_context": {
+      "protocol_version": "1.4",
+      "result_authority": "yuxi_server"
+    }
+  },
+  "cancelled": {
+    "status": "cancelled",
+    "output": null,
+    "run_context": {
+      "protocol_version": "1.4",
+      "result_authority": "yuxi_server"
+    }
+  }
+}

@@ -1256,6 +1256,130 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   gap: 4px;
 }
 
+/* 澄清问题卡片（ask_user_question_required 中断） */
+.clarification-card {
+  margin: 0 auto 10px;
+  max-width: 760px;
+  border-radius: 12px;
+  border: 1px solid rgba(217, 119, 6, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+  overflow: hidden;
+}
+
+.clarification-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #92400e;
+  border-bottom: 1px solid rgba(217, 119, 6, 0.2);
+}
+
+.clarification-dismiss {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  padding: 2px;
+}
+
+.clarification-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.clarification-question {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clarification-question legend {
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.clarification-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.clarification-option {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.clarification-option:hover {
+  border-color: var(--green-600);
+}
+
+.clarification-option.active {
+  border-color: var(--green-700);
+  background: var(--green-100);
+  color: var(--green-900);
+  font-weight: 600;
+}
+
+.clarification-other {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  min-width: 100%;
+  box-sizing: border-box;
+}
+
+.clarification-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid rgba(217, 119, 6, 0.2);
+}
+
+.clarification-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.clarification-submit {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--green-700);
+  color: #fff;
+  padding: 7px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.clarification-submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .usage-day-row {
   display: flex;
   align-items: center;
@@ -1281,3 +1405,133 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   color: var(--gray-600, #555);
   font-variant-numeric: tabular-nums;
 }
+
+/* 证据平面（citation 芯片 / 图卡 / 候选文献 / 运行提示） */
+.evidence-citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 6px 52px;
+  max-width: 760px;
+}
+
+.evidence-citation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(22, 101, 52, 0.25);
+  background: rgba(22, 101, 52, 0.07);
+  color: #14532d;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.evidence-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0 8px 52px;
+  max-width: 760px;
+}
+
+.evidence-figure {
+  margin: 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+  max-width: 320px;
+}
+
+.evidence-figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.evidence-figure-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 90px;
+  padding: 12px;
+  color: var(--gray-500, #777);
+  font-size: 12px;
+}
+
+.evidence-figure-caption {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--gray-600, #555);
+  border-top: 1px solid #f3f4f6;
+}
+
+.evidence-figure-meta {
+  color: var(--gray-400, #999);
+}
+
+.evidence-locator {
+  margin: 6px 0 6px 52px;
+  max-width: 760px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  background: rgba(59, 130, 246, 0.07);
+  color: #1e3a8a;
+  font-size: 12.5px;
+}
+
+.evidence-locator-title {
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+
+.evidence-locator-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.evidence-locator-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.evidence-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 6px 52px;
+  max-width: 760px;
+}
+
+.evidence-warning {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  background: rgba(251, 191, 36, 0.1);
+  color: #92400e;
+  font-size: 12.5px;
+}
+
+.evidence-warning-dismiss {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+}
+

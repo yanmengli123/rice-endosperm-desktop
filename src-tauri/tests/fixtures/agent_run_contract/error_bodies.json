@@ -1,0 +1,103 @@
+{
+  "structured": [
+    {
+      "status": 429,
+      "body": {
+        "detail": {
+          "code": "daily_run_quota_exceeded",
+          "message": "今日运行次数已达配额（50 次），请联系管理员调整",
+          "action": "contact_admin"
+        }
+      }
+    },
+    {
+      "status": 429,
+      "body": {
+        "detail": {
+          "code": "platform_token_quota_exceeded",
+          "message": "本月平台模型 token 用量已达配额（1000000）。请在设置中配置并选择自己的模型继续使用，或联系管理员调整平台额度",
+          "action": "configure_byok"
+        }
+      }
+    },
+    {
+      "status": 429,
+      "body": {
+        "detail": {
+          "code": "platform_token_quota_reservation_busy",
+          "message": "当前已有平台模型运行正在计量；请等待该运行结束后重试",
+          "action": "wait_for_active_run"
+        }
+      }
+    },
+    {
+      "status": 409,
+      "body": {
+        "detail": {
+          "code": "run_busy",
+          "message": "该智能体线程正在运行，请等待、查询或取消当前运行后再继续",
+          "active_run_id": "run-0002",
+          "active_run_status": "running",
+          "agent_slug": "default-chatbot",
+          "thread_id": "th-demo-01"
+        }
+      }
+    },
+    {
+      "status": 426,
+      "body": {
+        "detail": {
+          "code": "protocol_version_unsupported",
+          "message": "客户端协议版本（0.9）与服务端（1.4）不兼容，请升级桌面端后重试",
+          "action": "upgrade_client"
+        }
+      }
+    },
+    {
+      "status": 403,
+      "body": {
+        "detail": {
+          "code": "byok_not_allowed",
+          "message": "当前账号未启用自有模型，请联系管理员将模型策略设为 BYOK 可选",
+          "action": "contact_admin"
+        }
+      }
+    },
+    {
+      "status": 422,
+      "body": {
+        "detail": {
+          "code": "byok_required",
+          "message": "该智能体要求使用您自己的模型密钥，请先在设置中配置后再发起对话",
+          "action": "configure_byok"
+        }
+      }
+    },
+    {
+      "status": 422,
+      "body": {
+        "detail": {
+          "code": "custom_model_credential_unavailable",
+          "message": "该会话使用的自有模型凭据已撤销或被替换，请重新配置后再继续",
+          "action": "configure_byok"
+        }
+      }
+    }
+  ],
+  "detail_error_key": {
+    "status": 400,
+    "body": {"detail": {"error": "invalid_input", "message": "字段无效"}}
+  },
+  "detail_string": {
+    "status": 404,
+    "body": {"detail": "运行任务不存在"}
+  },
+  "gateway_error_msg": {
+    "status": 502,
+    "body": {"error_msg": "upstream timeout"}
+  },
+  "plain_text": {
+    "status": 400,
+    "body": "invalid request"
+  }
+}

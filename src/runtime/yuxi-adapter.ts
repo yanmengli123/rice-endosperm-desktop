@@ -1,7 +1,16 @@
 import { Channel } from "@tauri-apps/api/core";
 import type { ChatModelAdapter, ThreadMessage } from "@assistant-ui/react";
 import { cancelRun, normalizeCommandError, sendMessage } from "../services/tauri-client";
-import type { ChatCompletion, RunEvent, TraceEvent } from "../types";
+import type {
+  ChatCompletion,
+  CitationRef,
+  ClarificationQuestion,
+  FigureCardAsset,
+  LocatorCandidate,
+  QuestionAnswer,
+  RunEvent,
+  TraceEvent,
+} from "../types";
 import { sanitizeVisibleModelText } from "../utils/reasoning-visibility";
 import { YUXI_ATTACHMENT_PART_NAME } from "./yuxi-attachment-adapter";
 import type { PendingChatAttachment } from "../types";
@@ -11,10 +20,21 @@ type AdapterCallbacks = {
   onCompleted?: (completion: ChatCompletion) => void;
   /** 执行轨迹事件（yuxi.run-trace.v1 wire 原样透传），由 UI 层投影渲染。 */
   onTraceEvent?: (event: TraceEvent) => void;
+  /** 澄清问题中断（ask_user_question_required）：UI 渲染选项卡片。 */
+  onAskUserQuestion?: (runId: string, questions: ClarificationQuestion[]) => void;
+  /** 证据平面：结构化引用（citation_ready v2 九键）与可选图卡投影。 */
+  onCitationsReady?: (runId: string, citation: CitationRef, figures: FigureCardAsset[]) => void;
+  /** 跨文献歧义候选清单（locator_candidates）：展示用。 */
+  onLocatorCandidates?: (runId: string, candidates: LocatorCandidate[]) => void;
+  /** 运行内非阻塞提示（yuxi.warning）。 */
+  onWarning?: (message: string) => void;
   bridgeAttachment?: PendingChatAttachment;
   onBridgeConsumed?: () => void;
-  /** 取走待续跑的父 run ID（人工审批续跑）：返回后即清除，下一次发送是普通提问。 */
+  /** 取走待续跑的父 run ID（人工审批/澄清问题续跑）：返回后即清除，下一次发送是普通提问。 */
   consumeResumeRunId?: () => string | undefined;
+  /** 取走待续跑的澄清问题定义与用户作答（与 resumeRunId 成对消费）。 */
+  consumeResumeQuestions?: () => ClarificationQuestion[] | undefined;
+  consumeResumeAnswers?: () => QuestionAnswer[] | undefined;
 };
 
 class AsyncQueue<T> {
@@ -109,10 +129,12 @@ export function createYuxiAdapter(
       ) {
         attachments.push(callbacks.bridgeAttachment);
       }
-      // 人工审批续跑：本轮发送是对 interrupted run 的答复——以 resume 载荷
-      // 发送，不携带新附件；附件此时应留给下一轮普通提问。
+      // 人工审批/澄清问题续跑：本轮发送是对 interrupted run 的答复——以 resume
+      // 载荷发送，不携带新附件；附件此时应留给下一轮普通提问。
       const resumeRunId = callbacks.consumeResumeRunId?.();
       const effectiveAttachments = resumeRunId ? [] : attachments;
+      const resumeQuestions = resumeRunId ? callbacks.consumeResumeQuestions?.() ?? [] : [];
+      const resumeAnswers = resumeRunId ? callbacks.consumeResumeAnswers?.() ?? [] : [];
       if (!question) throw new Error("请输入问题或批复后再发送");
       const resolvedQuestion = question || "请分析随附文件。";
 
@@ -122,6 +144,8 @@ export function createYuxiAdapter(
         requestId: requestId(),
         attachments: effectiveAttachments,
         resumeRunId,
+        resumeQuestions,
+        resumeAnswers,
       };
       const queue = new AsyncQueue<RunEvent>();
       const channel = new Channel<RunEvent>();
@@ -158,6 +182,14 @@ export function createYuxiAdapter(
             yield { content: [{ type: "text", text: accumulatedText }] };
           } else if (event.type === "trace") {
             callbacks.onTraceEvent?.(event.trace);
+          } else if (event.type === "ask_user_question") {
+            callbacks.onAskUserQuestion?.(event.runId, event.questions);
+          } else if (event.type === "citations_ready") {
+            callbacks.onCitationsReady?.(event.runId, event.citation, event.figures);
+          } else if (event.type === "locator_candidates") {
+            callbacks.onLocatorCandidates?.(event.runId, event.candidates);
+          } else if (event.type === "warning") {
+            callbacks.onWarning?.(event.message);
           } else if (event.type === "done") {
             sawDone = true;
             doneStatus = event.status;
