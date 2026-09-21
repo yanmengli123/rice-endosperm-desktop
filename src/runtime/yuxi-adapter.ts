@@ -16,7 +16,7 @@ import { YUXI_ATTACHMENT_PART_NAME } from "./yuxi-attachment-adapter";
 import type { PendingChatAttachment } from "../types";
 
 type AdapterCallbacks = {
-  onRunState?: (state: { runId?: string; status: string; message?: string }) => void;
+  onRunState?: (state: { runId?: string; status: string; message?: string; action?: string }) => void;
   onCompleted?: (completion: ChatCompletion) => void;
   /** 执行轨迹事件（yuxi.run-trace.v1 wire 原样透传），由 UI 层投影渲染。 */
   onTraceEvent?: (event: TraceEvent) => void;
@@ -234,10 +234,15 @@ export function createYuxiAdapter(
           });
           return;
         }
+        // 服务端结构化错误码携带的引导动作（configure_byok/contact_admin/
+        // wait_for_active_run/upgrade_client）随失败态贯通到 UI，由 App 层
+        // 渲染可执行动作（如深链模型设置）。
+        const commandError = normalizeCommandError(error);
         callbacks.onRunState?.({
           runId: activeRunId,
           status: "failed",
-          message: normalizeCommandError(error).message,
+          message: commandError.message,
+          action: commandError.action,
         });
         throw error;
       } finally {

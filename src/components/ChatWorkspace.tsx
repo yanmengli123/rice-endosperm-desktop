@@ -51,7 +51,7 @@ import { YuxiAttachmentAdapter } from "../runtime/yuxi-attachment-adapter";
 type Props = {
   threadId: string;
   messages: LocalMessage[];
-  onRunState: (state: { runId?: string; status: string; message?: string }, threadId: string) => void;
+  onRunState: (state: { runId?: string; status: string; message?: string; action?: string }, threadId: string) => void;
   onCompleted: (completion: ChatCompletion, threadId: string) => void;
   bridgeAttachment?: PendingChatAttachment;
   onBridgeConsumed?: () => void;

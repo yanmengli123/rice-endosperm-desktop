@@ -1535,3 +1535,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   padding: 0 2px;
 }
 
+/* 服务端结构化错误的引导动作横幅（error_registry.action）：文案 + 可执行入口 */
+.error-action-banner {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 18px;
+  background: #fdf6e7;
+  color: #7a5a12;
+  border-bottom: 1px solid #ecd9a8;
+  font-size: 13px;
+}
+
+.error-action-banner button {
+  border: 0;
+  background: transparent;
+  text-decoration: underline;
+  cursor: pointer;
+  color: inherit;
+}
+
+.error-action-banner button:first-of-type {
+  margin-left: auto;
+  font-weight: 650;
+}
+
+.error-action-banner .error-action-dismiss {
+  margin-left: 8px;
+  font-weight: 400;
+}
+
+

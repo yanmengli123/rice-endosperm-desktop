@@ -23,6 +23,41 @@ import "./styles.css";
 
 const FALLBACK_GATEWAY = "http://127.0.0.1:9088";
 
+/** 服务端结构化错误码的引导动作（error_registry.action）：与错误文案并列给出
+ * 可执行入口，而不是让用户对着拒绝原因猜下一步。configure_byok 深链模型
+ * 设置；其余动作为确定性引导文案。动作清单以服务端注册表为准。 */
+function ErrorActionBanner({
+  action,
+  onOpenSettings,
+  onDismiss,
+}: {
+  action: string;
+  onOpenSettings: () => void;
+  onDismiss: () => void;
+}) {
+  let guidance: { text: string; buttonLabel?: string; onButtonClick?: () => void } | null = null;
+  if (action === "configure_byok") {
+    guidance = { text: "当前策略要求使用自有模型凭据，请先在设置中配置。", buttonLabel: "打开模型设置", onButtonClick: onOpenSettings };
+  } else if (action === "contact_admin") {
+    guidance = { text: "该操作需要管理员协助（配额/策略调整），请联系服务管理员处理。" };
+  } else if (action === "wait_for_active_run") {
+    guidance = { text: "已有平台模型运行正在计量，请等待该运行结束后再重试。" };
+  } else if (action === "upgrade_client") {
+    guidance = { text: "桌面端协议版本与服务端不兼容，请升级稻芯智析后重试。" };
+  }
+  if (!guidance) return null;
+  return (
+    <div className="error-action-banner" role="alert">
+      <CircleAlert size={16} aria-hidden />
+      <span>{guidance.text}</span>
+      {guidance.buttonLabel && (
+        <button type="button" onClick={guidance.onButtonClick}>{guidance.buttonLabel}</button>
+      )}
+      <button type="button" className="error-action-dismiss" onClick={onDismiss} aria-label="关闭引导">关闭</button>
+    </div>
+  );
+}
+
 export default function App() {
   const [settings, setSettings] = useState<PublicSettings>();
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
@@ -34,7 +69,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [runState, setRunState] = useState<{ status: string; message?: string }>({ status: "idle" });
+  const [runState, setRunState] = useState<{ status: string; message?: string; action?: string }>({ status: "idle" });
   const [productMode, setProductMode] = useState<"qa" | "workflow">("qa");
   const [bridgeAttachment, setBridgeAttachment] = useState<PendingChatAttachment>();
   const initialized = useRef(false);
@@ -290,6 +325,13 @@ export default function App() {
         </header>
         <RunContextBar context={runContext} />
         {error && <div className="global-error"><CircleAlert size={17} />{error}<button onClick={() => setError("")}>关闭</button></div>}
+        {runState.status === "failed" && runState.action && (
+          <ErrorActionBanner
+            action={runState.action}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onDismiss={() => setRunState((current) => ({ ...current, action: undefined }))}
+          />
+        )}
         {activeThreadId ? (
           <ChatWorkspace
             key={`${activeThreadId}-${messages.length}`}

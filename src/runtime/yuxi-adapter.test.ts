@@ -18,8 +18,21 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../services/tauri-client", () => ({
   cancelRun: mocks.cancelRun,
   sendMessage: mocks.sendMessage,
-  normalizeCommandError: (error: unknown) =>
-    error instanceof Error ? error : new Error("命令失败"),
+  // 忠实镜像真实 normalizeCommandError：保留结构化错误的 message/code/action，
+  // 非对象输入回退默认文案。
+  normalizeCommandError: (error: unknown) => {
+    const normalized = new Error(
+      typeof error === "object" && error !== null && "message" in error
+        ? String((error as { message: unknown }).message)
+        : "命令失败",
+    ) as Error & { code?: string; action?: string };
+    if (typeof error === "object" && error !== null) {
+      const source = error as { code?: unknown; action?: unknown };
+      if (typeof source.code === "string") normalized.code = source.code;
+      if (typeof source.action === "string") normalized.action = source.action;
+    }
+    return normalized;
+  },
 }));
 
 describe("createYuxiAdapter", () => {
@@ -170,6 +183,35 @@ describe("createYuxiAdapter", () => {
     }).rejects.toThrow("无法识别的数据");
     const finalState = onRunState.mock.calls[onRunState.mock.calls.length - 1]?.[0];
     expect(finalState.status).toBe("failed");
+  });
+
+  it("失败态把服务端引导动作（action）贯通给 UI 渲染可执行入口", async () => {
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      throw {
+        message: "当前策略要求使用自有模型凭据，请先在设置中配置后再发起对话",
+        code: "byok_required",
+        action: "configure_byok",
+        retryable: false,
+      } as unknown as Error;
+    });
+    const onRunState = vi.fn();
+    const adapter = createYuxiAdapter("local-thread-action", { onRunState });
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ] as unknown as ThreadMessage[];
+    const stream = adapter.run({
+      messages,
+      abortSignal: new AbortController().signal,
+    } as never) as AsyncGenerator<ChatModelRunResult>;
+
+    await expect(async () => {
+      for await (const _update of stream) {
+        // 消费即抛
+      }
+    }).rejects.toThrow("自有模型凭据");
+    const finalState = onRunState.mock.calls[onRunState.mock.calls.length - 1]?.[0];
+    expect(finalState.status).toBe("failed");
+    expect(finalState.action).toBe("configure_byok");
   });
 
   it("failed 终态带已落库回答时保留内容并如实显示失败", async () => {
