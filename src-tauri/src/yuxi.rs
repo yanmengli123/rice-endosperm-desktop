@@ -29,7 +29,7 @@ const GATEWAY_TRACE_HEADER: &str = "X-Gateway-Trace-ID";
 
 /// 桌面端构建时面向的 AgentRun 协议版本（与服务端 /api/agent/protocol 对账）。
 /// 同 major 内服务端承诺 N-1 兼容；major 不一致在连接阶段即 fail-fast。
-pub const DESKTOP_PROTOCOL_VERSION: &str = "1.4";
+pub const DESKTOP_PROTOCOL_VERSION: &str = "1.5";
 const PROTOCOL_VERSION_HEADER: &str = "X-Yuxi-Protocol-Version";
 
 #[derive(Clone)]
@@ -201,6 +201,23 @@ pub fn parse_locator_candidates(value: &Value) -> Option<Vec<LocatorCandidate>> 
         })
         .collect::<Vec<_>>();
     (!candidates.is_empty()).then_some(candidates)
+}
+
+/// 解析确定性关系子图附件。只接受版本化 schema，结构保持服务端原样，
+/// 由前端按稳定 entity_id/triple_id 投影；不从模型文本推断图结构。
+pub fn parse_graph_snapshot(value: &Value) -> Option<Value> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("graph_snapshot_ready") {
+        return None;
+    }
+    let snapshot = chunk.get("graph_snapshot")?;
+    if snapshot.get("schema").and_then(Value::as_str) != Some("graph_snapshot_v1")
+        || !snapshot.get("nodes").is_some_and(Value::is_array)
+        || !snapshot.get("edges").is_some_and(Value::is_array)
+    {
+        return None;
+    }
+    Some(snapshot.clone())
 }
 
 /// 解析 `custom` 帧（payload.name == "yuxi.warning"）：非阻塞运行提示。
@@ -3019,7 +3036,7 @@ mod tests {
             "capabilities": ["ask_user_question", "citation_v2"]
         }))
         .expect("能力快照应可解析");
-        assert_eq!(info.protocol_version, "1.4");
+        assert_eq!(info.protocol_version, "1.5");
         assert_eq!(info.min_supported_protocol_version, "1.2");
         assert_eq!(info.capabilities.len(), 2);
         assert!(parse_protocol_info(&json!({"protocol_version": "oops"})).is_none());
@@ -3166,7 +3183,7 @@ mod contract_fixtures {
     use super::{
         ClarificationQuestion, FigureCardAsset, ProgressText, QuestionAnswer, QuestionOption,
         ServerRunContext, build_resume_payload, knowledge_asset_url, parse_citation_ready,
-        parse_custom_warning, parse_error_body, parse_interrupt_questions,
+        parse_custom_warning, parse_error_body, parse_graph_snapshot, parse_interrupt_questions,
         parse_locator_candidates, parse_protocol_info, parse_run_result,
         validate_authoritative_run_context,
     };
@@ -3331,6 +3348,12 @@ mod contract_fixtures {
                         "compact warning 帧必须可解析"
                     );
                 }
+                Some("yuxi.graph_snapshot_ready") => {
+                    let snapshot =
+                        parse_graph_snapshot(&data).expect("compact graph snapshot 帧必须可解析");
+                    assert_eq!(snapshot["schema"], "graph_snapshot_v1");
+                    assert_eq!(snapshot["edges"].as_array().map(Vec::len), Some(1));
+                }
                 _ => {}
             }
         }
@@ -3465,7 +3488,7 @@ mod contract_fixtures {
             "th-demo-01",
             "desktop-7c9e16af2d3b4f5e",
         )
-        .expect("1.4 契约语料必须通过权威校验");
+        .expect("1.5 契约语料必须通过权威校验");
     }
 
     #[test]

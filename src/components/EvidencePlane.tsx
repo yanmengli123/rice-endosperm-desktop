@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, FileText, ImageOff, Quote } from "lucide-react";
+import { AlertTriangle, FileText, ImageOff, Network, Quote } from "lucide-react";
 import { getFigureAsset } from "../services/tauri-client";
-import type { CitationRef, FigureCardAsset, LocatorCandidate } from "../types";
+import type { CitationRef, FigureCardAsset, GraphSnapshot, LocatorCandidate } from "../types";
 
 /** 单条结构化引用芯片（citation_ready v2）：文件名 + 区块/页码，按实值展示，缺席不猜。 */
 function CitationChip({ citation }: { citation: CitationRef }) {
@@ -144,6 +144,47 @@ export function EvidenceLocatorCandidates({ candidates }: { candidates: LocatorC
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** 桌面端关系图降级投影：与 Web 画布消费同一 graph_snapshot_v1，
+ * 用可访问的节点/边卡片展示，绝不从回答文本重建关系。 */
+export function EvidenceGraphSnapshots({ snapshots }: { snapshots: GraphSnapshot[] }) {
+  if (!snapshots || snapshots.length === 0) return null;
+  return (
+    <div className="evidence-graphs" aria-label="规范知识关系图">
+      {snapshots.map((snapshot, snapshotIndex) => {
+        const names = new Map(snapshot.nodes.map((node) => [node.entity_id, node.name]));
+        return (
+          <section
+            className="evidence-graph-card"
+            key={snapshot.retrieval_id ?? snapshotIndex}
+            aria-label="已审核关系子图"
+          >
+            <header className="evidence-graph-header">
+              <Network size={15} aria-hidden />
+              <strong>知识关系图</strong>
+              <span>{snapshot.nodes.length} 节点 · {snapshot.edges.length} 关系</span>
+              {snapshot.truncated && <span className="evidence-graph-badge">已截断</span>}
+              {snapshot.conflict_present && <span className="evidence-graph-badge warning">有冲突</span>}
+            </header>
+            {snapshot.edges.length > 0 ? (
+              <ul className="evidence-graph-relations">
+                {snapshot.edges.map((edge) => (
+                  <li key={edge.triple_id}>
+                    <span>{names.get(edge.source_entity_id) ?? edge.source_entity_id}</span>
+                    <b>—{edge.predicate}→</b>
+                    <span>{names.get(edge.target_entity_id) ?? edge.target_entity_id}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="evidence-graph-empty">当前审核策略下无可发布关系</div>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }

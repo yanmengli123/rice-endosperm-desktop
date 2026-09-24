@@ -238,11 +238,40 @@ export type LocatorCandidate = {
   filename: string;
 };
 
+export type GraphSnapshotNode = {
+  entity_id: string;
+  kb_id: string;
+  name: string;
+  label: string;
+  is_seed?: boolean;
+};
+
+export type GraphSnapshotEdge = {
+  triple_id: string;
+  kb_id: string;
+  source_entity_id: string;
+  target_entity_id: string;
+  predicate: string;
+  review_status?: string;
+  conflict_status?: string;
+};
+
+export type GraphSnapshot = {
+  schema: "graph_snapshot_v1";
+  retrieval_id?: string;
+  outcome: "HIT" | "MISS" | "AMBIGUOUS" | "UNAVAILABLE";
+  truncated?: boolean;
+  conflict_present?: boolean;
+  nodes: GraphSnapshotNode[];
+  edges: GraphSnapshotEdge[];
+};
+
 /** 一次 run 观测到的证据平面快照（权威投影原样存档，恢复时不做二次推断）。 */
 export type MessageEvidence = {
   citations: CitationRef[];
   figures: FigureCardAsset[];
   locatorCandidates: LocatorCandidate[];
+  graphSnapshots?: GraphSnapshot[];
   warnings: string[];
 };
 
@@ -410,6 +439,7 @@ export type RunEvent =
   | { type: "ask_user_question"; runId: string; questions: ClarificationQuestion[] }
   | { type: "citations_ready"; runId: string; citation: CitationRef; figures: FigureCardAsset[] }
   | { type: "locator_candidates"; runId: string; candidates: LocatorCandidate[] }
+  | { type: "graph_snapshot_ready"; runId: string; snapshot: GraphSnapshot }
   | { type: "warning"; message: string }
   | { type: "done"; runId: string; status: string; text: string; context: ServerRunContext };
 

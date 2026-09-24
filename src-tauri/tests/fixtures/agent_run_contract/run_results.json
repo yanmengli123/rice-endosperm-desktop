@@ -9,8 +9,27 @@
     "request_id": "desktop-7c9e16af2d3b4f5e",
     "final_message_id": "msg-final-01",
     "langfuse_trace_id": "trace-0001",
+    "artifacts": [
+      {
+        "id": 1,
+        "run_id": "run-0001",
+        "thread_id": "th-demo-01",
+        "origin": {
+          "source": "mcp",
+          "mcp_server": "ricekb",
+          "mcp_tool": "search_genes",
+          "mcp_call_audit_id": 9001
+        },
+        "name": "ricekb_search-genes_1a2b3c4d.json",
+        "virtual_path": "/home/gem/user-data/outputs/mcp_results/ricekb_search-genes_1a2b3c4d.json",
+        "sha256": "3f5b2c1b9bd8dc0f5d63a94f78ee4b03ee91c4d5226f1a24c7a2f28c6dcaa1e9",
+        "size_bytes": 4096,
+        "media_type": "application/json",
+        "created_at": "2026-09-22 08:00:00"
+      }
+    ],
     "run_context": {
-      "protocol_version": "1.4",
+      "protocol_version": "1.5",
       "agent_slug": "default-chatbot",
       "thread_id": "th-demo-01",
       "request_id": "desktop-7c9e16af2d3b4f5e",
@@ -32,25 +51,28 @@
   "failed": {
     "status": "failed",
     "output": null,
+    "artifacts": [],
     "error": {"type": "model_error", "message": "模型调用失败"},
     "run_context": {
-      "protocol_version": "1.4",
+      "protocol_version": "1.5",
       "result_authority": "yuxi_server"
     }
   },
   "interrupted": {
     "status": "interrupted",
     "output": "",
+    "artifacts": [],
     "run_context": {
-      "protocol_version": "1.4",
+      "protocol_version": "1.5",
       "result_authority": "yuxi_server"
     }
   },
   "cancelled": {
     "status": "cancelled",
     "output": null,
+    "artifacts": [],
     "run_context": {
-      "protocol_version": "1.4",
+      "protocol_version": "1.5",
       "result_authority": "yuxi_server"
     }
   }

@@ -6,6 +6,7 @@ import type {
   CitationRef,
   ClarificationQuestion,
   FigureCardAsset,
+  GraphSnapshot,
   LocatorCandidate,
   QuestionAnswer,
   RunEvent,
@@ -26,6 +27,8 @@ type AdapterCallbacks = {
   onCitationsReady?: (runId: string, citation: CitationRef, figures: FigureCardAsset[]) => void;
   /** 跨文献歧义候选清单（locator_candidates）：展示用。 */
   onLocatorCandidates?: (runId: string, candidates: LocatorCandidate[]) => void;
+  /** 确定性规范关系子图（graph_snapshot_v1）。 */
+  onGraphSnapshotReady?: (runId: string, snapshot: GraphSnapshot) => void;
   /** 运行内非阻塞提示（yuxi.warning）。 */
   onWarning?: (message: string) => void;
   bridgeAttachment?: PendingChatAttachment;
@@ -188,6 +191,8 @@ export function createYuxiAdapter(
             callbacks.onCitationsReady?.(event.runId, event.citation, event.figures);
           } else if (event.type === "locator_candidates") {
             callbacks.onLocatorCandidates?.(event.runId, event.candidates);
+          } else if (event.type === "graph_snapshot_ready") {
+            callbacks.onGraphSnapshotReady?.(event.runId, event.snapshot);
           } else if (event.type === "warning") {
             callbacks.onWarning?.(event.message);
           } else if (event.type === "done") {

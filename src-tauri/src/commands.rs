@@ -24,8 +24,8 @@ use crate::{
         CitationRef, ClarificationQuestion, FigureCardAsset, LocatorCandidate, ModelOption,
         PendingChatAttachment, ProgressText, ProtocolInfo, QuestionAnswer, RunResult,
         ServerRunContext, build_resume_payload, parse_citation_ready, parse_custom_warning,
-        parse_interrupt_questions, parse_locator_candidates, sanitize_visible_model_text,
-        terminal_status, validate_authoritative_run_context,
+        parse_graph_snapshot, parse_interrupt_questions, parse_locator_candidates,
+        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -47,13 +47,14 @@ const KNOWN_SSE_EVENTS: [&str; 7] = [
 /// `payload.name`。一级白名单对 custom 恒命中，若不做二级校验，服务端新增
 /// custom 名（如新的证据类事件）会被静默丢弃且无任何告警——这里把未知
 /// custom 名记 WARN 并计入会话摘要（sse_custom_unknown）。
-const KNOWN_CUSTOM_EVENT_NAMES: [&str; 4] = [
+const KNOWN_CUSTOM_EVENT_NAMES: [&str; 5] = [
     // 已知且刻意不渲染：进度语义由 messages 帧（status=progress）承载。
     "yuxi.agent_state",
-    // 证据平面三件套 + 运行提示（1.4 capabilities 对应的 custom 载荷名）。
+    // 证据平面附件 + 运行提示（1.5 capabilities 对应的 custom 载荷名）。
     "yuxi.warning",
     "yuxi.citation_ready",
     "yuxi.locator_candidates",
+    "yuxi.graph_snapshot_ready",
 ];
 
 fn is_known_sse_event(name: &str) -> bool {
@@ -209,6 +210,11 @@ pub enum RunEvent {
     LocatorCandidates {
         run_id: String,
         candidates: Vec<LocatorCandidate>,
+    },
+    /// 规范关系图的版本化消息附件（graph_snapshot_v1）。
+    GraphSnapshotReady {
+        run_id: String,
+        snapshot: Value,
     },
     /// 运行内非阻塞提示（yuxi.warning）：不影响终态，UI 以可关闭的提示条呈现。
     Warning {
@@ -1699,6 +1705,18 @@ async fn send_message_inner(
                                     run_evidence.locator_candidates.extend(candidates);
                                 }
                             }
+                            "yuxi.graph_snapshot_ready" => {
+                                if let Some(snapshot) = parse_graph_snapshot(&value) {
+                                    send_channel(
+                                        on_event,
+                                        RunEvent::GraphSnapshotReady {
+                                            run_id: created.run_id.clone(),
+                                            snapshot: snapshot.clone(),
+                                        },
+                                    )?;
+                                    run_evidence.graph_snapshots.push(snapshot);
+                                }
+                            }
                             "yuxi.warning" => {
                                 if let Some(warning) = parse_custom_warning(&value) {
                                     send_channel(
@@ -2742,13 +2760,14 @@ mod tests {
 
     #[test]
     fn known_custom_event_names_cover_evidence_plane() {
-        // 1.4 契约的 custom 语义名：证据三件套 + 运行提示 + 刻意不渲染的
+        // 1.5 契约的 custom 语义名：证据附件 + 运行提示 + 刻意不渲染的
         // agent_state（进度语义由 messages 帧承载）。
         for name in [
             "yuxi.agent_state",
             "yuxi.warning",
             "yuxi.citation_ready",
             "yuxi.locator_candidates",
+            "yuxi.graph_snapshot_ready",
         ] {
             assert!(is_known_custom_event(name), "{name} 必须在 custom 白名单内");
         }

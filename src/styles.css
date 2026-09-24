@@ -1436,6 +1436,64 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   max-width: 760px;
 }
 
+.evidence-graphs {
+  display: grid;
+  gap: 0.65rem;
+  width: min(760px, calc(100% - 2rem));
+  margin: 0.5rem auto;
+}
+
+.evidence-graph-card {
+  border: 1px solid color-mix(in srgb, var(--green-700) 24%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 94%, var(--green-100));
+  overflow: hidden;
+}
+
+.evidence-graph-header {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.65rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.78rem;
+}
+
+.evidence-graph-header > span {
+  color: var(--muted);
+}
+
+.evidence-graph-badge {
+  margin-left: auto;
+  padding: 0.1rem 0.38rem;
+  border-radius: 999px;
+  background: var(--gray-100);
+}
+
+.evidence-graph-badge.warning {
+  color: #9a5a00;
+}
+
+.evidence-graph-relations {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0.7rem 1rem 0.8rem 1.8rem;
+  font-size: 0.82rem;
+}
+
+.evidence-graph-relations li b {
+  margin: 0 0.35rem;
+  color: var(--green-700);
+  font-weight: 600;
+}
+
+.evidence-graph-empty {
+  padding: 0.85rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 .evidence-figure {
   margin: 0;
   border: 1px solid #e5e7eb;
@@ -1564,5 +1622,3 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   margin-left: 8px;
   font-weight: 400;
 }
-
-

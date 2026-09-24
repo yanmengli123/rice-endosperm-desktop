@@ -81,6 +81,8 @@ pub struct MessageEvidence {
     #[serde(default)]
     pub locator_candidates: Vec<crate::yuxi::LocatorCandidate>,
     #[serde(default)]
+    pub graph_snapshots: Vec<serde_json::Value>,
+    #[serde(default)]
     pub warnings: Vec<String>,
 }
 

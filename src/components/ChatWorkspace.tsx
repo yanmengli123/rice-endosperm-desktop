@@ -41,6 +41,7 @@ import { ClarificationCard } from "./ClarificationCard";
 import {
   EvidenceCitations,
   EvidenceFigures,
+  EvidenceGraphSnapshots,
   EvidenceLocatorCandidates,
   EvidenceWarnings,
 } from "./EvidencePlane";
@@ -83,12 +84,13 @@ function toInitialMessages(messages: LocalMessage[]): ThreadMessageLike[] {
 
 /** 汇总历史消息中的证据快照为单一证据平面（恢复渲染用）。 */
 function mergeEvidence(items: Array<MessageEvidence | undefined>): MessageEvidence {
-  const merged: MessageEvidence = { citations: [], figures: [], locatorCandidates: [], warnings: [] };
+  const merged: MessageEvidence = { citations: [], figures: [], locatorCandidates: [], graphSnapshots: [], warnings: [] };
   for (const item of items) {
     if (!item) continue;
     merged.citations.push(...(item.citations ?? []));
     merged.figures.push(...(item.figures ?? []));
     merged.locatorCandidates.push(...(item.locatorCandidates ?? []));
+    merged.graphSnapshots?.push(...(item.graphSnapshots ?? []));
     merged.warnings.push(...(item.warnings ?? []));
   }
   return merged;
@@ -289,6 +291,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
       citations: [...current.citations, ...(patch.citations ?? [])],
       figures: [...current.figures, ...(patch.figures ?? [])],
       locatorCandidates: [...current.locatorCandidates, ...(patch.locatorCandidates ?? [])],
+      graphSnapshots: [...(current.graphSnapshots ?? []), ...(patch.graphSnapshots ?? [])],
       warnings: [...current.warnings, ...(patch.warnings ?? [])],
     }));
   // 能力位驱动渲染：连接成功后拉协议能力快照，图卡仅在服务端声明 figures_card
@@ -436,6 +439,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           mergeLiveEvidence({ citations: [citation], figures }),
         onLocatorCandidates: (_runId, candidates) =>
           mergeLiveEvidence({ locatorCandidates: candidates }),
+        onGraphSnapshotReady: (_runId, snapshot) =>
+          mergeLiveEvidence({ graphSnapshots: [snapshot] }),
         onWarning: (message) => mergeLiveEvidence({ warnings: [message] }),
         bridgeAttachment,
         onBridgeConsumed,
@@ -484,6 +489,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           <EvidenceWarnings warnings={evidence.warnings} />
           <EvidenceCitations citations={evidence.citations} />
           <EvidenceFigures figures={evidence.figures} capabilityEnabled={figuresCapabilityEnabled} />
+          <EvidenceGraphSnapshots snapshots={evidence.graphSnapshots ?? []} />
           <EvidenceLocatorCandidates candidates={evidence.locatorCandidates} />
           <TraceTimeline trace={trace} />
           <AuiIf condition={(state) => state.thread.isRunning}>
