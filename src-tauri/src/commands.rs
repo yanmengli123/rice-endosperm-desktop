@@ -1741,6 +1741,17 @@ async fn send_message_inner(
                             },
                         )?;
                     }
+                    if belongs_to_parent_thread
+                        && let Some(message) = compression_status_message(&value)
+                    {
+                        send_channel(
+                            on_event,
+                            RunEvent::Status {
+                                status: "running".into(),
+                                message: message.into(),
+                            },
+                        )?;
+                    }
                     if belongs_to_parent_thread && let Some(text) = progress_text.apply(&value) {
                         accumulated = text;
                         state
@@ -2235,6 +2246,20 @@ fn run_progress_message(value: &Value) -> Option<&str> {
         .filter(|message| !message.trim().is_empty())
 }
 
+/// messages 帧内的上下文压缩状态（chunk.status == "context_compression"）：
+/// 压缩期间给用户一个可解释的进度提示；结束语义由后续进度文本自然覆盖
+/// （与 Web 端 threadState.contextCompressing 同一事件源）。
+fn compression_status_message(value: &Value) -> Option<&'static str> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("context_compression") {
+        return None;
+    }
+    match chunk.pointer("/compression/status").and_then(Value::as_str) {
+        Some("started") => Some("正在压缩上下文…"),
+        _ => None,
+    }
+}
+
 /// 从 SSE `event: trace` 帧中提取属于当前 run 的 wire 事件；
 /// 形状不符或 run_id 不匹配（防御未来跨 run 混流）时返回 None。
 fn extract_run_trace_event(value: &Value, run_id: &str) -> Option<Value> {
@@ -2598,8 +2623,9 @@ pub async fn set_chat_model_preference(
 mod tests {
     use super::{
         AppState, CitationRef, ClarificationQuestion, LocatorCandidate, QuestionAnswer, RunEvent,
-        SendMessageRequest, ensure_active_bearer, extract_run_trace_event, is_known_custom_event,
-        is_known_sse_event, is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
+        SendMessageRequest, compression_status_message, ensure_active_bearer,
+        extract_run_trace_event, is_known_custom_event, is_known_sse_event,
+        is_reasoning_protocol_failure, local_account_scope, principal_of_scope,
         remote_principal_for_scope, run_progress_message, validate_send_request,
     };
     use crate::yuxi::{PendingChatAttachment, QuestionOption};
@@ -2826,6 +2852,37 @@ mod tests {
         );
         assert_eq!(
             run_progress_message(&serde_json::json!({"payload": {"status": "running"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_context_compression_status() {
+        let started = serde_json::json!({
+            "payload": {
+                "chunk": {
+                    "status": "context_compression",
+                    "compression": { "type": "yuxi.context_compression", "status": "started" }
+                }
+            }
+        });
+        assert_eq!(
+            compression_status_message(&started),
+            Some("正在压缩上下文…")
+        );
+        let completed = serde_json::json!({
+            "payload": {
+                "chunk": {
+                    "status": "context_compression",
+                    "compression": { "type": "yuxi.context_compression", "status": "completed" }
+                }
+            }
+        });
+        assert_eq!(compression_status_message(&completed), None);
+        assert_eq!(
+            compression_status_message(&serde_json::json!({
+                "payload": { "chunk": { "status": "progress", "message": "检索中" } }
+            })),
             None
         );
     }
