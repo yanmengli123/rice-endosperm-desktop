@@ -29,7 +29,7 @@ const GATEWAY_TRACE_HEADER: &str = "X-Gateway-Trace-ID";
 
 /// 桌面端构建时面向的 AgentRun 协议版本（与服务端 /api/agent/protocol 对账）。
 /// 同 major 内服务端承诺 N-1 兼容；major 不一致在连接阶段即 fail-fast。
-pub const DESKTOP_PROTOCOL_VERSION: &str = "1.5";
+pub const DESKTOP_PROTOCOL_VERSION: &str = "1.8";
 const PROTOCOL_VERSION_HEADER: &str = "X-Yuxi-Protocol-Version";
 
 #[derive(Clone)]
@@ -38,8 +38,9 @@ pub struct YuxiClient {
 }
 
 /// GET /api/agent/protocol 能力快照（连接阶段 fail-fast 兼容判断）。
+/// wire 为服务端 snake_case（protocol_version/…），出口给 TS 侧为 camelCase。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ProtocolInfo {
     pub protocol_version: String,
     #[serde(default)]
@@ -57,7 +58,7 @@ pub struct QuestionOption {
 
 /// ask_user_question_required 中断携带的澄清问题（wire snake_case → UI camelCase）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ClarificationQuestion {
     pub question_id: String,
     pub question: String,
@@ -90,8 +91,12 @@ pub const OTHER_OPTION_VALUE: &str = "__other__";
 /// citation_ready v2 的九键引用：基线七键（status/evidence_id/file_id/filename/
 /// zone/page/anchor_id）+ 取图三段式硬前置（kb_id/revision_id）。所有键均可缺席——
 /// 渲染层按实值展示，缺席不猜测补全。
+///
+/// 键向红线：wire（服务端载荷）是 **snake_case**，出口（IPC → TS）是 camelCase。
+/// 反序列化方向写成 camelCase 会让真实载荷解析成全 None，`is_displayable`
+/// 随后把整条证据平面静默丢弃（2026-09 事故：单测/tsc 全绿、真机全空）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct CitationRef {
     pub status: Option<String>,
     pub evidence_id: Option<String>,
@@ -106,7 +111,7 @@ pub struct CitationRef {
 
 /// 图卡选择元数据（PublishableFigure.selection，服务端确定性投影）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct FigureSelection {
     pub asset_count: Option<i64>,
     pub rule: Option<String>,
@@ -117,7 +122,7 @@ pub struct FigureSelection {
 /// 缺键 fail-closed 不渲染图卡——契约语料中的 figures 是简化展示样例，生产
 /// 投影以本类型为准，禁止按样例的三字段写死。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct FigureCardAsset {
     pub binding_id: Option<String>,
     pub kb_id: Option<String>,
@@ -156,22 +161,120 @@ impl FigureCardAsset {
 
 /// locator_candidates 候选文献（跨文献歧义清单，只含文档身份三键）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct LocatorCandidate {
     pub file_id: String,
     pub kb_id: String,
     pub filename: String,
 }
 
+/// 图表锚点绑定（citation_ready v3 figure_refs，ADR-0008）：正文〔图表F#〕
+/// 签发芯片与消息级图卡/证据原文的桥接。字段全部可缺席（缺席 ⟺ 未发布）；
+/// `figureIndex` 指向同载荷 figures[] 下标（null = 无卡片，Table/suppressed
+/// 场景经 evidenceId 跳原文）。渲染层不解析芯片文本推断身份。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct FigureRef {
+    #[serde(rename = "ref", default)]
+    pub ref_id: Option<String>,
+    pub kind: Option<String>,
+    pub label: Option<String>,
+    pub source: Option<String>,
+    pub citation_ref: Option<String>,
+    pub evidence_id: Option<String>,
+    pub anchor_id: Option<String>,
+    pub kb_id: Option<String>,
+    pub file_id: Option<String>,
+    pub revision_id: Option<String>,
+    pub page: Option<i64>,
+    pub figure_index: Option<i64>,
+    pub table_index: Option<i64>,
+    pub suppressed_reason: Option<String>,
+}
+
+/// 表格单元格（ADR-0008 P2 受控解析）：纯文本 + 数值跨度，无任何标记语言。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct TableCell {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub rowspan: i64,
+    #[serde(default)]
+    pub colspan: i64,
+    #[serde(default)]
+    pub header: bool,
+}
+
+/// 服务端 PublishableTable 投影（citation_ready.tables[]）。字段全部可缺席；
+/// rows 为行列 JSON（永不携带原始 HTML），渲染层只做文本插值（受控渲染）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub struct PublishableTable {
+    pub projection_version: Option<String>,
+    pub table_id: Option<String>,
+    pub kb_id: Option<String>,
+    pub file_id: Option<String>,
+    pub revision_id: Option<String>,
+    pub anchor_id: Option<String>,
+    pub evidence_id: Option<String>,
+    pub label: Option<String>,
+    pub caption: Option<String>,
+    pub page: Option<i64>,
+    pub header_rows: Option<i64>,
+    pub rows: Vec<Vec<TableCell>>,
+    pub row_count: Option<i64>,
+    pub col_count: Option<i64>,
+    pub truncated: Option<bool>,
+    /// 规模护栏截断（行/列/单元格上限，后端 limited）：与跨页延续块区分，文案分流
+    pub limited: Option<bool>,
+    /// 投影择优与修订绑定的审计元数据；桌面端不据此裁决，但必须原样保留。
+    pub selection: Option<Value>,
+}
+
+impl PublishableTable {
+    /// 展示硬前置：table_id 与非空 rows 才渲染（fail-closed）。
+    pub fn is_displayable(&self) -> bool {
+        self.table_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && !self.rows.is_empty()
+    }
+}
+
+impl FigureRef {
+    /// 展示硬前置：编号与标签齐备才渲染锚点（fail-closed，不猜测）。
+    pub fn is_displayable(&self) -> bool {
+        self.ref_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .label
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
 /// 解析 `custom` 帧（payload.name == "yuxi.citation_ready"）：
-/// chunk.citation 九键 + 可选 chunk.figures（字段缺席 ⟺ 本 run 未发布图卡）。
-/// 形状不符返回 None（不猜测）。
-pub fn parse_citation_ready(value: &Value) -> Option<(CitationRef, Vec<FigureCardAsset>)> {
+/// chunk.citation 九键 + 可选 chunk.figures / chunk.figure_refs / chunk.tables（字段缺席 ⟺
+/// 本 run 未发布该项）。v3 发射解耦后 citation 可缺席（⟺ 无已验证定位），
+/// citation / figure_refs / tables 至少一域非空才认为载荷有效；形状不符返回 None。
+pub fn parse_citation_ready(
+    value: &Value,
+) -> Option<(
+    CitationRef,
+    Vec<FigureCardAsset>,
+    Vec<FigureRef>,
+    Vec<PublishableTable>,
+)> {
     let chunk = value.pointer("/payload/chunk")?;
     if chunk.get("status").and_then(Value::as_str) != Some("citation_ready") {
         return None;
     }
-    let citation: CitationRef = serde_json::from_value(chunk.get("citation")?.clone()).ok()?;
+    let citation: CitationRef = chunk
+        .get("citation")
+        .and_then(|item| serde_json::from_value::<CitationRef>(item.clone()).ok())
+        .unwrap_or_default();
     let figures = chunk
         .get("figures")
         .and_then(Value::as_array)
@@ -182,7 +285,33 @@ pub fn parse_citation_ready(value: &Value) -> Option<(CitationRef, Vec<FigureCar
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Some((citation, figures))
+    let figure_refs = chunk
+        .get("figure_refs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<FigureRef>(item.clone()).ok())
+                .filter(FigureRef::is_displayable)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tables = chunk
+        .get("tables")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<PublishableTable>(item.clone()).ok())
+                .filter(PublishableTable::is_displayable)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // 发射解耦后的有效性：citation 全空（无已验证定位）且无锚点/表格 → 无效载荷
+    if citation == CitationRef::default() && figure_refs.is_empty() && tables.is_empty() {
+        return None;
+    }
+    Some((citation, figures, figure_refs, tables))
 }
 
 /// 解析 `custom` 帧（payload.name == "yuxi.locator_candidates"）：候选文献清单。
@@ -3036,7 +3165,7 @@ mod tests {
             "capabilities": ["ask_user_question", "citation_v2"]
         }))
         .expect("能力快照应可解析");
-        assert_eq!(info.protocol_version, "1.5");
+        assert_eq!(info.protocol_version, "1.4");
         assert_eq!(info.min_supported_protocol_version, "1.2");
         assert_eq!(info.capabilities.len(), 2);
         assert!(parse_protocol_info(&json!({"protocol_version": "oops"})).is_none());
@@ -3242,7 +3371,7 @@ mod contract_fixtures {
     fn capabilities_fixture_parses_as_protocol_info() {
         let info =
             parse_protocol_info(&load_json("capabilities.json")).expect("能力快照语料必须可解析");
-        assert_eq!(info.protocol_version, "1.4");
+        assert_eq!(info.protocol_version, "1.8");
         assert!(
             info.capabilities
                 .iter()
@@ -3276,8 +3405,10 @@ mod contract_fixtures {
                 }
             }
         });
-        let (citation, figures) =
+        let (citation, figures, figure_refs, tables) =
             parse_citation_ready(&citation_frame).expect("citation_ready 帧必须可解析");
+        assert!(figure_refs.is_empty(), "v2 语料无 figure_refs");
+        assert!(tables.is_empty(), "v2 语料无 tables");
         assert_eq!(citation.kb_id.as_deref(), Some("kb-0001"));
         assert_eq!(citation.revision_id.as_deref(), Some("rev-0012"));
         assert_eq!(citation.evidence_id.as_deref(), Some("ev-0001"));
@@ -3357,6 +3488,174 @@ mod contract_fixtures {
                 _ => {}
             }
         }
+    }
+
+    /// 键向红线（2026-09 事故回归锁）：服务端载荷是 **snake_case**，出口给 TS 是
+    /// camelCase。反序列化方向若写成 camelCase，真实 wire 会解析成全 `None`，
+    /// `is_displayable` 随即把整条证据平面静默丢弃——而 vitest / tsc 全绿
+    /// （mock 用的是 camelCase **出口**形态）。本测试用真实 wire 形态钉死两侧。
+    #[test]
+    fn evidence_plane_wire_is_snake_case_and_export_is_camel_case() {
+        let frame = json!({
+            "payload": {
+                "name": "yuxi.citation_ready",
+                "chunk": {
+                    "status": "citation_ready",
+                    "figure_refs": [{
+                        "ref": "F1",
+                        "kind": "table",
+                        "label": "Table 1",
+                        "source": "caption",
+                        "citation_ref": "E3",
+                        "evidence_id": "evdoc_1",
+                        "anchor_id": "ea_1",
+                        "kb_id": "kb-1",
+                        "file_id": "file-1",
+                        "revision_id": "pr_1",
+                        "page": 11,
+                        "figure_index": null,
+                        "table_index": 0,
+                        "suppressed_reason": null
+                    }],
+                    "tables": [{
+                        "projection_version": "table_projection_v1",
+                        "table_id": "tbl_abc",
+                        "kb_id": "kb-1",
+                        "file_id": "file-1",
+                        "revision_id": "pr_1",
+                        "anchor_id": "ea_1",
+                        "evidence_id": "evdoc_1",
+                        "label": "Table 1",
+                        "caption": "Table 1. grain properties",
+                        "page": 11,
+                        "header_rows": 1,
+                        "rows": [[
+                            {"text": "Material", "rowspan": 1, "colspan": 1, "header": true},
+                            {"text": "Traits", "rowspan": 1, "colspan": 2, "header": true}
+                        ]],
+                        "row_count": 1,
+                        "col_count": 3,
+                        "truncated": false,
+                        "limited": false,
+                        "selection": {"candidate_chunks": 1, "match_score": 0.83, "chunk_id": "chunk-0"}
+                    }]
+                }
+            }
+        });
+        let (citation, figures, figure_refs, tables) = parse_citation_ready(&frame)
+            .expect("发射解耦：citation 缺席但 refs/tables 非空 → 载荷仍须有效");
+        assert!(citation.kb_id.is_none(), "wire 无 citation 时不得补全");
+        assert!(citation.page.is_none());
+        assert!(figures.is_empty());
+        assert_eq!(
+            figure_refs.len(),
+            1,
+            "snake_case 的 figure_refs 必须解析出条目"
+        );
+        let reference = &figure_refs[0];
+        assert_eq!(reference.ref_id.as_deref(), Some("F1"));
+        assert_eq!(reference.kind.as_deref(), Some("table"));
+        assert_eq!(reference.table_index, Some(0));
+        assert_eq!(reference.evidence_id.as_deref(), Some("evdoc_1"));
+        assert_eq!(reference.revision_id.as_deref(), Some("pr_1"));
+        assert_eq!(tables.len(), 1, "snake_case 的 tables 必须解析出卡片");
+        assert!(tables[0].is_displayable());
+        assert_eq!(tables[0].table_id.as_deref(), Some("tbl_abc"));
+        assert_eq!(
+            tables[0].projection_version.as_deref(),
+            Some("table_projection_v1")
+        );
+        assert_eq!(
+            tables[0]
+                .selection
+                .as_ref()
+                .and_then(|value| value.get("chunk_id"))
+                .and_then(Value::as_str),
+            Some("chunk-0"),
+            "投影审计元数据必须跨 Rust/SQLite 边界保留"
+        );
+        assert_eq!(
+            tables[0].rows[0][1].colspan, 2,
+            "合并表头跨度必须从 wire 落到单元格"
+        );
+        // 出口方向：IPC → TS 一律 camelCase（desktop types.ts 依赖该形态）
+        let exported_table = serde_json::to_value(&tables[0]).expect("表格投影必须可序列化");
+        assert_eq!(
+            exported_table.get("tableId").and_then(Value::as_str),
+            Some("tbl_abc")
+        );
+        assert!(
+            exported_table.get("table_id").is_none(),
+            "出口不得残留 snake_case 键"
+        );
+        let exported_ref = serde_json::to_value(&figure_refs[0]).expect("锚点必须可序列化");
+        assert_eq!(exported_ref.get("ref").and_then(Value::as_str), Some("F1"));
+        assert_eq!(
+            exported_ref.get("tableIndex").and_then(Value::as_i64),
+            Some(0)
+        );
+        assert!(exported_ref.get("table_index").is_none());
+    }
+
+    #[test]
+    fn contract_fixture_contains_decoupled_v4_table_frame() {
+        let parsed = load_frames().into_iter().find_map(|(event, data)| {
+            if event != "custom"
+                || data.pointer("/payload/name").and_then(Value::as_str)
+                    != Some("yuxi.citation_ready")
+                || data.pointer("/payload/chunk/citation").is_some()
+            {
+                return None;
+            }
+            let payload = parse_citation_ready(&data)?;
+            (!payload.2.is_empty() && !payload.3.is_empty()).then_some(payload)
+        });
+        let (_citation, _figures, refs, tables) =
+            parsed.expect("共享 SSE 语料必须覆盖 citation 缺席的 v4 表卡帧");
+        assert_eq!(refs[0].table_index, Some(0));
+        assert_eq!(tables[0].table_id.as_deref(), Some("tbl-0001"));
+    }
+
+    /// 同族键向锁：候选文献（String 字段，解析失败会被 `.ok()` 静默丢弃）与
+    /// 澄清问题（wire snake_case，见 ClarificationQuestion 文档注释）。
+    #[test]
+    fn candidates_and_questions_parse_snake_case_wire() {
+        let candidates = json!({
+            "payload": {
+                "chunk": {
+                    "status": "locator_candidates",
+                    "candidates": [
+                        {"file_id": "file-a", "kb_id": "kb-1", "filename": "paper-a.pdf"}
+                    ]
+                }
+            }
+        });
+        let parsed = parse_locator_candidates(&candidates).expect("候选清单必须可解析");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].file_id, "file-a");
+        assert_eq!(parsed[0].kb_id, "kb-1");
+
+        let questions = json!({
+            "payload": {
+                "chunk": {
+                    "status": "ask_user_question_required",
+                    "questions": [{
+                        "question_id": "q-stage",
+                        "question": "which stage?",
+                        "options": [{"label": "filling", "value": "filling"}],
+                        "multi_select": false,
+                        "allow_other": true
+                    }]
+                }
+            }
+        });
+        let parsed_questions = parse_interrupt_questions(&questions).expect("澄清问题必须可解析");
+        assert_eq!(parsed_questions.len(), 1);
+        assert_eq!(parsed_questions[0].question_id, "q-stage");
+        assert!(
+            parsed_questions[0].allow_other,
+            "wire snake_case allow_other 必须落到字段"
+        );
     }
 
     #[test]
@@ -3488,7 +3787,7 @@ mod contract_fixtures {
             "th-demo-01",
             "desktop-7c9e16af2d3b4f5e",
         )
-        .expect("1.5 契约语料必须通过权威校验");
+        .expect("1.8 契约语料必须通过权威校验");
     }
 
     #[test]

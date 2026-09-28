@@ -1474,6 +1474,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   color: #9a5a00;
 }
 
+.evidence-graph-badge.pending,
+.evidence-graph-relation-meta .pending {
+  color: #92400e;
+  background: rgba(251, 191, 36, 0.14);
+}
+
 .evidence-graph-relations {
   display: grid;
   gap: 0.35rem;
@@ -1486,6 +1492,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   margin: 0 0.35rem;
   color: var(--green-700);
   font-weight: 600;
+}
+
+.evidence-graph-relation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.evidence-graph-relation-meta > span {
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  background: var(--gray-100);
+}
+
+.evidence-graph-relation-meta .warning {
+  color: #9a5a00;
 }
 
 .evidence-graph-empty {

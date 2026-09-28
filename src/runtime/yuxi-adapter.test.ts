@@ -456,7 +456,7 @@ describe("createYuxiAdapter", () => {
     for await (const _update of stream) {
       // consume
     }
-    expect(onCitationsReady).toHaveBeenCalledWith("run-ev", citation, figures);
+    expect(onCitationsReady).toHaveBeenCalledWith("run-ev", citation, figures, [], []);
   });
 
   it("把 locator_candidates 候选清单透传给 UI", async () => {

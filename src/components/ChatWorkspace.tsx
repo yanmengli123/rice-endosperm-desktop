@@ -40,7 +40,9 @@ import {
 import { ClarificationCard } from "./ClarificationCard";
 import {
   EvidenceCitations,
+  EvidenceFigureRefs,
   EvidenceFigures,
+  EvidenceTables,
   EvidenceGraphSnapshots,
   EvidenceLocatorCandidates,
   EvidenceWarnings,
@@ -290,6 +292,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
     setEvidence((current) => ({
       citations: [...current.citations, ...(patch.citations ?? [])],
       figures: [...current.figures, ...(patch.figures ?? [])],
+      figureRefs: [...(current.figureRefs ?? []), ...(patch.figureRefs ?? [])],
+      tables: [...(current.tables ?? []), ...(patch.tables ?? [])],
       locatorCandidates: [...current.locatorCandidates, ...(patch.locatorCandidates ?? [])],
       graphSnapshots: [...(current.graphSnapshots ?? []), ...(patch.graphSnapshots ?? [])],
       warnings: [...current.warnings, ...(patch.warnings ?? [])],
@@ -298,12 +302,16 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
   // 能力位时尝试取图（fail-closed）。快照与服务器 `figure_card_enabled` 开闸解耦——
   // 能力位是「服务端是否会发图卡」，开闸是「本次 run 是否真的发了」，二者独立。
   const [figuresCapabilityEnabled, setFiguresCapabilityEnabled] = useState(false);
+  const [figureRefsCapabilityEnabled, setFigureRefsCapabilityEnabled] = useState(false);
+  const [tableCardsCapabilityEnabled, setTableCardsCapabilityEnabled] = useState(false);
   useEffect(() => {
     let cancelled = false;
     getProtocolCapabilities()
       .then((info) => {
         if (cancelled || !info) return;
         setFiguresCapabilityEnabled(info.capabilities.includes("figures_card"));
+        setFigureRefsCapabilityEnabled(info.capabilities.includes("figure_refs"));
+        setTableCardsCapabilityEnabled(info.capabilities.includes("table_cards"));
       })
       .catch(() => undefined);
     return () => {
@@ -435,8 +443,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
         },
         onTraceEvent: handleTraceEvent,
         onAskUserQuestion: (runId, questions) => setAskUser({ runId, questions }),
-        onCitationsReady: (_runId, citation, figures) =>
-          mergeLiveEvidence({ citations: [citation], figures }),
+        onCitationsReady: (_runId, citation, figures, figureRefs, tables) =>
+          mergeLiveEvidence({ citations: [citation], figures, figureRefs, tables }),
         onLocatorCandidates: (_runId, candidates) =>
           mergeLiveEvidence({ locatorCandidates: candidates }),
         onGraphSnapshotReady: (_runId, snapshot) =>
@@ -489,6 +497,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           <EvidenceWarnings warnings={evidence.warnings} />
           <EvidenceCitations citations={evidence.citations} />
           <EvidenceFigures figures={evidence.figures} capabilityEnabled={figuresCapabilityEnabled} />
+          <EvidenceFigureRefs refs={evidence.figureRefs ?? []} capabilityEnabled={figureRefsCapabilityEnabled} />
+          <EvidenceTables tables={evidence.tables ?? []} capabilityEnabled={tableCardsCapabilityEnabled} />
           <EvidenceGraphSnapshots snapshots={evidence.graphSnapshots ?? []} />
           <EvidenceLocatorCandidates candidates={evidence.locatorCandidates} />
           <TraceTimeline trace={trace} />

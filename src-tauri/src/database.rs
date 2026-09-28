@@ -79,6 +79,10 @@ pub struct MessageEvidence {
     #[serde(default)]
     pub figures: Vec<crate::yuxi::FigureCardAsset>,
     #[serde(default)]
+    pub figure_refs: Vec<crate::yuxi::FigureRef>,
+    #[serde(default)]
+    pub tables: Vec<crate::yuxi::PublishableTable>,
+    #[serde(default)]
     pub locator_candidates: Vec<crate::yuxi::LocatorCandidate>,
     #[serde(default)]
     pub graph_snapshots: Vec<serde_json::Value>,

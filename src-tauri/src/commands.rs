@@ -21,11 +21,12 @@ use crate::{
     error::{AppError, AppResult, CommandError},
     state::AppState,
     yuxi::{
-        CitationRef, ClarificationQuestion, FigureCardAsset, LocatorCandidate, ModelOption,
-        PendingChatAttachment, ProgressText, ProtocolInfo, QuestionAnswer, RunResult,
-        ServerRunContext, build_resume_payload, parse_citation_ready, parse_custom_warning,
-        parse_graph_snapshot, parse_interrupt_questions, parse_locator_candidates,
-        sanitize_visible_model_text, terminal_status, validate_authoritative_run_context,
+        CitationRef, ClarificationQuestion, FigureCardAsset, FigureRef, LocatorCandidate,
+        ModelOption, PendingChatAttachment, ProgressText, ProtocolInfo, PublishableTable,
+        QuestionAnswer, RunResult, ServerRunContext, build_resume_payload, parse_citation_ready,
+        parse_custom_warning, parse_graph_snapshot, parse_interrupt_questions,
+        parse_locator_candidates, sanitize_visible_model_text, terminal_status,
+        validate_authoritative_run_context,
     },
 };
 
@@ -50,7 +51,7 @@ const KNOWN_SSE_EVENTS: [&str; 7] = [
 const KNOWN_CUSTOM_EVENT_NAMES: [&str; 5] = [
     // 已知且刻意不渲染：进度语义由 messages 帧（status=progress）承载。
     "yuxi.agent_state",
-    // 证据平面附件 + 运行提示（1.5 capabilities 对应的 custom 载荷名）。
+    // 证据平面附件 + 运行提示（1.8 capabilities 对应的 custom 载荷名）。
     "yuxi.warning",
     "yuxi.citation_ready",
     "yuxi.locator_candidates",
@@ -204,6 +205,8 @@ pub enum RunEvent {
         run_id: String,
         citation: CitationRef,
         figures: Vec<FigureCardAsset>,
+        figure_refs: Vec<FigureRef>,
+        tables: Vec<PublishableTable>,
     },
     /// 跨文献歧义候选清单（locator_candidates）：只含文档身份三键，展示用；
     /// 「一键重问」依赖服务端 mention.v2 落地后再开。
@@ -1661,7 +1664,9 @@ async fn send_message_inner(
                     if belongs_to_parent_thread && event.event == "custom" {
                         match custom_event_name.as_str() {
                             "yuxi.citation_ready" => {
-                                if let Some((citation, figures)) = parse_citation_ready(&value) {
+                                if let Some((citation, figures, figure_refs, tables)) =
+                                    parse_citation_ready(&value)
+                                {
                                     // 取图硬前置（Rust 侧 fail-closed 观测）：缺键图卡不阻断
                                     // 事件下发，前端按题注降级渲染；这里只保证方法在生产路径
                                     // 被调用，不猜测补全。
@@ -1687,10 +1692,14 @@ async fn send_message_inner(
                                             run_id: created.run_id.clone(),
                                             citation: citation.clone(),
                                             figures: figures.clone(),
+                                            figure_refs: figure_refs.clone(),
+                                            tables: tables.clone(),
                                         },
                                     )?;
                                     run_evidence.citations.push(citation);
                                     run_evidence.figures.extend(figures);
+                                    run_evidence.figure_refs.extend(figure_refs);
+                                    run_evidence.tables.extend(tables);
                                 }
                             }
                             "yuxi.locator_candidates" => {
@@ -2743,6 +2752,8 @@ mod tests {
                 ..Default::default()
             },
             figures: vec![],
+            figure_refs: vec![],
+            tables: vec![],
         })
         .expect("serialize citations_ready");
         assert_eq!(citations["type"], "citations_ready");
@@ -2786,7 +2797,7 @@ mod tests {
 
     #[test]
     fn known_custom_event_names_cover_evidence_plane() {
-        // 1.5 契约的 custom 语义名：证据附件 + 运行提示 + 刻意不渲染的
+        // 1.8 契约的 custom 语义名：证据附件 + 运行提示 + 刻意不渲染的
         // agent_state（进度语义由 messages 帧承载）。
         for name in [
             "yuxi.agent_state",

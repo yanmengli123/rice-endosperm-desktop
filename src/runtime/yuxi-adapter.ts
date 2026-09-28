@@ -6,6 +6,8 @@ import type {
   CitationRef,
   ClarificationQuestion,
   FigureCardAsset,
+  FigureRef,
+  PublishableTable,
   GraphSnapshot,
   LocatorCandidate,
   QuestionAnswer,
@@ -24,7 +26,13 @@ type AdapterCallbacks = {
   /** 澄清问题中断（ask_user_question_required）：UI 渲染选项卡片。 */
   onAskUserQuestion?: (runId: string, questions: ClarificationQuestion[]) => void;
   /** 证据平面：结构化引用（citation_ready v2 九键）与可选图卡投影。 */
-  onCitationsReady?: (runId: string, citation: CitationRef, figures: FigureCardAsset[]) => void;
+  onCitationsReady?: (
+    runId: string,
+    citation: CitationRef,
+    figures: FigureCardAsset[],
+    figureRefs: FigureRef[],
+    tables: PublishableTable[],
+  ) => void;
   /** 跨文献歧义候选清单（locator_candidates）：展示用。 */
   onLocatorCandidates?: (runId: string, candidates: LocatorCandidate[]) => void;
   /** 确定性规范关系子图（graph_snapshot_v1）。 */
@@ -188,7 +196,13 @@ export function createYuxiAdapter(
           } else if (event.type === "ask_user_question") {
             callbacks.onAskUserQuestion?.(event.runId, event.questions);
           } else if (event.type === "citations_ready") {
-            callbacks.onCitationsReady?.(event.runId, event.citation, event.figures);
+            callbacks.onCitationsReady?.(
+              event.runId,
+              event.citation,
+              event.figures,
+              event.figureRefs ?? [],
+              event.tables ?? [],
+            );
           } else if (event.type === "locator_candidates") {
             callbacks.onLocatorCandidates?.(event.runId, event.candidates);
           } else if (event.type === "graph_snapshot_ready") {

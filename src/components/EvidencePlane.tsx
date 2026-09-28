@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, FileText, ImageOff, Network, Quote } from "lucide-react";
 import { getFigureAsset } from "../services/tauri-client";
-import type { CitationRef, FigureCardAsset, GraphSnapshot, LocatorCandidate } from "../types";
+import type {
+  CitationRef,
+  FigureCardAsset,
+  FigureRef,
+  GraphSnapshot,
+  LocatorCandidate,
+  PublishableTable,
+} from "../types";
 
 /** 单条结构化引用芯片（citation_ready v2）：文件名 + 区块/页码，按实值展示，缺席不猜。 */
 function CitationChip({ citation }: { citation: CitationRef }) {
@@ -148,6 +155,136 @@ export function EvidenceLocatorCandidates({ candidates }: { candidates: LocatorC
   );
 }
 
+/** 图表锚点芯片列表（citation_ready v3 figure_refs，ADR-0008）：后端签发的
+ * 正文〔图表F#〕锚点绑定，只按结构化载荷展示（不解析芯片文本）。
+ * capabilityEnabled=false（服务端未声明 figure_refs 能力位）时不渲染（fail-closed）。 */
+export function EvidenceFigureRefs({
+  refs,
+  capabilityEnabled,
+}: {
+  refs: FigureRef[];
+  capabilityEnabled: boolean;
+}) {
+  if (!capabilityEnabled || !refs || refs.length === 0) return null;
+  const displayable = refs.filter((ref) => ref.ref && ref.label);
+  if (displayable.length === 0) return null;
+  return (
+    <div className="evidence-figure-refs" role="list" aria-label="图表引用锚点">
+      {displayable.map((ref) => {
+        const parts: string[] = [];
+        if (typeof ref.page === "number") parts.push(`p.${ref.page}`);
+        if (ref.suppressedReason) parts.push("原图暂不可用");
+        const meta = parts.length > 0 ? `（${parts.join(" · ")}）` : "";
+        return (
+          <span
+            key={ref.ref}
+            className="evidence-citation-chip"
+            title={`${ref.kind === "table" ? "表格" : "图"}引用 · ${ref.label}`}
+          >
+            {ref.kind === "table" ? (
+              <FileText size={12} aria-hidden />
+            ) : (
+              <ImageOff size={12} aria-hidden />
+            )}
+            <span>
+              {ref.label}
+              {meta}
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/** 表格卡片（citation_ready v4 tables[]，ADR-0008 P2）：受控渲染的行列 JSON——
+ * 单元格只做文本插值（React 自动转义），rowspan/colspan 为数值绑定；
+ * 数据来自服务端白名单解析，永不携带原始 HTML。
+ * capabilityEnabled=false（服务端未声明 table_cards 能力位）时不渲染（fail-closed）。 */
+const safeTableSpan = (value?: number) => {
+  if (!Number.isInteger(value)) return 1;
+  return Math.max(1, Math.min(value as number, 50));
+};
+
+export function EvidenceTables({
+  tables,
+  capabilityEnabled,
+}: {
+  tables: PublishableTable[];
+  capabilityEnabled: boolean;
+}) {
+  if (!capabilityEnabled) return null;
+  const displayable = (tables ?? []).filter(
+    (table) => (table.tableId ?? "").trim() && (table.rows ?? []).length > 0,
+  );
+  if (displayable.length === 0) return null;
+  return (
+    <div className="evidence-tables" aria-label="表格卡片">
+      {displayable.map((table) => {
+        // 本地历史数据也可能来自旧版或被手工篡改；UI 边界重复执行与服务端
+        // 相同的行/列/span 护栏，不能把协议字段直接交给 DOM 布局引擎。
+        const rows = (table.rows ?? []).slice(0, 200).map((row) => row.slice(0, 60));
+        const headerCount = table.headerRows ?? 0;
+        const headerRows = headerCount > 0 ? rows.slice(0, headerCount) : [];
+        const bodyRows = headerCount > 0 ? rows.slice(headerCount) : rows;
+        const label = (table.label ?? "").trim() || (table.page ? `表 · 第${table.page}页` : "表格");
+        return (
+          <figure className="evidence-table" key={table.tableId} aria-label={label}>
+            <figcaption className="evidence-table-caption">
+              <strong>{label}</strong>
+              <span className="evidence-table-meta">
+                {table.rowCount ?? rows.length} 行 × {table.colCount ?? ""} 列
+                {table.page ? ` · 第 ${table.page} 页` : ""}
+                {table.limited
+                  ? " · 已按规模截断"
+                  : table.truncated
+                    ? " · 跨页已截取"
+                    : ""}
+              </span>
+            </figcaption>
+            <div className="evidence-table-scroll">
+              <table>
+                {headerRows.length > 0 && (
+                  <thead>
+                    {headerRows.map((row, rowIndex) => (
+                      <tr key={`h${rowIndex}`}>
+                        {row.map((cell, cellIndex) => (
+                          <th
+                            key={`h${rowIndex}-${cellIndex}`}
+                            rowSpan={safeTableSpan(cell.rowspan) > 1 ? safeTableSpan(cell.rowspan) : undefined}
+                            colSpan={safeTableSpan(cell.colspan) > 1 ? safeTableSpan(cell.colspan) : undefined}
+                          >
+                            {cell.text}
+                          </th>
+                        ))}
+                      </tr>
+                    ))}
+                  </thead>
+                )}
+                <tbody>
+                  {bodyRows.map((row, rowIndex) => (
+                    <tr key={`b${rowIndex}`}>
+                      {row.map((cell, cellIndex) => (
+                        <td
+                          key={`b${rowIndex}-${cellIndex}`}
+                          rowSpan={safeTableSpan(cell.rowspan) > 1 ? safeTableSpan(cell.rowspan) : undefined}
+                          colSpan={safeTableSpan(cell.colspan) > 1 ? safeTableSpan(cell.colspan) : undefined}
+                        >
+                          {cell.text}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </figure>
+        );
+      })}
+    </div>
+  );
+}
+
 /** 桌面端关系图降级投影：与 Web 画布消费同一 graph_snapshot_v1，
  * 用可访问的节点/边卡片展示，绝不从回答文本重建关系。 */
 export function EvidenceGraphSnapshots({ snapshots }: { snapshots: GraphSnapshot[] }) {
@@ -156,16 +293,27 @@ export function EvidenceGraphSnapshots({ snapshots }: { snapshots: GraphSnapshot
     <div className="evidence-graphs" aria-label="规范知识关系图">
       {snapshots.map((snapshot, snapshotIndex) => {
         const names = new Map(snapshot.nodes.map((node) => [node.entity_id, node.name]));
+        const knowledgeBaseIds = new Set([
+          ...snapshot.nodes.map((node) => node.kb_id),
+          ...snapshot.edges.map((edge) => edge.kb_id),
+        ]);
+        const pendingCount = snapshot.edges.reduce((count, edge) => {
+          if (edge.candidate_parallel_count != null) return count + edge.candidate_parallel_count;
+          return count + (edge.review_status?.toUpperCase() === "CANDIDATE" ? 1 : 0);
+        }, 0);
         return (
           <section
             className="evidence-graph-card"
             key={snapshot.retrieval_id ?? snapshotIndex}
-            aria-label="已审核关系子图"
+            aria-label={pendingCount ? "已审核及待审核候选关系子图" : "已审核关系子图"}
           >
             <header className="evidence-graph-header">
               <Network size={15} aria-hidden />
               <strong>知识关系图</strong>
               <span>{snapshot.nodes.length} 节点 · {snapshot.edges.length} 关系</span>
+              {pendingCount > 0 && (
+                <span className="evidence-graph-badge pending">{pendingCount} 条待审核</span>
+              )}
               {snapshot.truncated && <span className="evidence-graph-badge">已截断</span>}
               {snapshot.conflict_present && <span className="evidence-graph-badge warning">有冲突</span>}
             </header>
@@ -173,9 +321,23 @@ export function EvidenceGraphSnapshots({ snapshots }: { snapshots: GraphSnapshot
               <ul className="evidence-graph-relations">
                 {snapshot.edges.map((edge) => (
                   <li key={edge.triple_id}>
-                    <span>{names.get(edge.source_entity_id) ?? edge.source_entity_id}</span>
-                    <b>—{edge.predicate}→</b>
-                    <span>{names.get(edge.target_entity_id) ?? edge.target_entity_id}</span>
+                    <div>
+                      <span>{names.get(edge.source_entity_id) ?? edge.source_entity_id}</span>
+                      <b>—{edge.predicate}→</b>
+                      <span>{names.get(edge.target_entity_id) ?? edge.target_entity_id}</span>
+                    </div>
+                    <div className="evidence-graph-relation-meta">
+                      {(edge.parallel_count ?? 0) > 1 && <span>×{edge.parallel_count}</span>}
+                      {knowledgeBaseIds.size > 1 && <span title={edge.kb_id}>来源 {edge.kb_id}</span>}
+                      {edge.review_status?.toUpperCase() === "CANDIDATE" ? (
+                        <span className="pending">待审核</span>
+                      ) : (edge.candidate_parallel_count ?? 0) > 0 ? (
+                        <span className="pending">含 {edge.candidate_parallel_count} 条待审核</span>
+                      ) : null}
+                      {edge.conflict_status && edge.conflict_status !== "NONE" && (
+                        <span className="warning">冲突</span>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>

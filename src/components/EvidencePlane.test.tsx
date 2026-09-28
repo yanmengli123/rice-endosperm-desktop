@@ -3,11 +3,13 @@
 import "@testing-library/jest-dom/vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CitationRef, FigureCardAsset, LocatorCandidate } from "../types";
+import type { CitationRef, FigureCardAsset, GraphSnapshot, LocatorCandidate, PublishableTable } from "../types";
 import {
   EvidenceCitations,
   EvidenceFigures,
+  EvidenceGraphSnapshots,
   EvidenceLocatorCandidates,
+  EvidenceTables,
   EvidenceWarnings,
 } from "./EvidencePlane";
 
@@ -97,6 +99,64 @@ describe("EvidencePlane", () => {
     expect(screen.getByText(/多个可能指代的文献/)).toBeInTheDocument();
     expect(screen.getByText("paper-a.pdf")).toBeInTheDocument();
     expect(screen.getByText("paper-b.pdf")).toBeInTheDocument();
+  });
+
+  it("表格卡片按能力位失败关闭，并将文本转义、跨度限制在安全范围", () => {
+    const table: PublishableTable = {
+      tableId: "tbl-1",
+      label: "Table 1",
+      page: 11,
+      headerRows: 1,
+      rows: [
+        [{ text: "<script>alert(1)</script>", header: true, rowspan: 999, colspan: 999 }],
+        [{ text: "75.2", rowspan: -4, colspan: 0 }],
+      ],
+      rowCount: 2,
+      colCount: 1,
+    };
+
+    const closed = render(<EvidenceTables tables={[table]} capabilityEnabled={false} />);
+    expect(closed.container.firstChild).toBeNull();
+    closed.unmount();
+
+    render(<EvidenceTables tables={[table]} capabilityEnabled />);
+    const textCell = screen.getByText("<script>alert(1)</script>");
+    expect(textCell.tagName).toBe("TH");
+    expect(textCell).toHaveAttribute("rowspan", "50");
+    expect(textCell).toHaveAttribute("colspan", "50");
+    expect(document.querySelector("script")).toBeNull();
+    expect(screen.getByText(/第 11 页/)).toBeInTheDocument();
+  });
+
+  it("关系图降级列表披露候选计数、冲突和多知识库来源", () => {
+    const snapshot: GraphSnapshot = {
+      schema: "graph_snapshot_v1",
+      outcome: "HIT",
+      nodes: [
+        { entity_id: "e1", kb_id: "kb-a", name: "GS3", label: "Gene", is_seed: true },
+        { entity_id: "e2", kb_id: "kb-b", name: "grain size", label: "Trait" },
+      ],
+      edges: [
+        {
+          triple_id: "t1",
+          kb_id: "kb-b",
+          source_entity_id: "e1",
+          target_entity_id: "e2",
+          predicate: "regulates",
+          review_status: "APPROVED",
+          parallel_count: 3,
+          candidate_parallel_count: 2,
+          conflict_status: "CONTESTED",
+        },
+      ],
+    };
+
+    render(<EvidenceGraphSnapshots snapshots={[snapshot]} />);
+    expect(screen.getByLabelText("已审核及待审核候选关系子图")).toBeInTheDocument();
+    expect(screen.getByText("2 条待审核")).toBeInTheDocument();
+    expect(screen.getByText("含 2 条待审核")).toBeInTheDocument();
+    expect(screen.getByText("来源 kb-b")).toBeInTheDocument();
+    expect(screen.getByText("冲突")).toBeInTheDocument();
   });
 
   it("渲染运行提示条且可逐条关闭", async () => {

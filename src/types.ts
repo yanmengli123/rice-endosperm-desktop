@@ -238,9 +238,62 @@ export type LocatorCandidate = {
   filename: string;
 };
 
+/** 图表锚点绑定（citation_ready v3 figure_refs，ADR-0008）：正文〔图表F#〕
+ * 签发芯片与消息级图卡/证据原文的桥接。figureIndex 指向同载荷 figures[]
+ * 下标（null = 无卡片，Table/suppressed 经 evidenceId 跳原文）。 */
+export type FigureRef = {
+  ref: string;
+  kind?: string;
+  label?: string;
+  source?: string;
+  citationRef?: string;
+  evidenceId?: string;
+  anchorId?: string;
+  kbId?: string;
+  fileId?: string;
+  revisionId?: string;
+  page?: number;
+  figureIndex?: number | null;
+  tableIndex?: number | null;
+  suppressedReason?: string | null;
+};
+
+/** 表格单元格（ADR-0008 P2 受控解析）：纯文本 + 数值跨度，无任何标记语言。 */
+export type TableCell = {
+  text?: string;
+  rowspan?: number;
+  colspan?: number;
+  header?: boolean;
+};
+
+/** 服务端 PublishableTable 投影（citation_ready.tables[]）。rows 为行列 JSON
+ * （永不携带原始 HTML），渲染层只做文本插值（受控渲染）。 */
+export type PublishableTable = {
+  projectionVersion?: string;
+  tableId?: string;
+  kbId?: string;
+  fileId?: string;
+  revisionId?: string;
+  anchorId?: string;
+  evidenceId?: string;
+  label?: string;
+  caption?: string;
+  page?: number;
+  headerRows?: number;
+  rows?: TableCell[][];
+  rowCount?: number;
+  colCount?: number;
+  truncated?: boolean;
+  /** 规模护栏截断（行/列/单元格上限，后端 limited）：与跨页延续块区分，文案分流 */
+  limited?: boolean;
+  /** 服务端确定性投影审计元数据；客户端只持久化/透传，不参与权威裁决。 */
+  selection?: Record<string, unknown>;
+};
+
 export type GraphSnapshotNode = {
   entity_id: string;
   kb_id: string;
+  canonical_identity?: string;
   name: string;
   label: string;
   is_seed?: boolean;
@@ -248,18 +301,48 @@ export type GraphSnapshotNode = {
 
 export type GraphSnapshotEdge = {
   triple_id: string;
+  triple_ids?: string[];
+  reviewed_triple_ids?: string[];
+  candidate_triple_ids?: string[];
   kb_id: string;
   source_entity_id: string;
   target_entity_id: string;
   predicate: string;
+  relation_group?: string;
+  predicates?: string[];
+  parallel_count?: number;
+  reviewed_parallel_count?: number;
+  candidate_parallel_count?: number;
   review_status?: string;
+  review_version?: number;
+  support_count?: number;
+  literature_count?: number;
   conflict_status?: string;
+  risk_score?: number | null;
 };
 
 export type GraphSnapshot = {
   schema: "graph_snapshot_v1";
   retrieval_id?: string;
-  outcome: "HIT" | "MISS" | "AMBIGUOUS" | "UNAVAILABLE";
+  outcome: "HIT" | "MISS" | "PENDING_REVIEW" | "AMBIGUOUS" | "UNAVAILABLE";
+  scope_version?: number | string;
+  review_policy?: "approved_only" | "approved_plus_candidate";
+  seed_entity_ids?: string[];
+  seed_names?: string[];
+  seed_display_name?: string;
+  total_raw_edge_count?: number;
+  aggregation?: {
+    strategy?: string;
+    group_count?: number;
+    seed_collapsed?: boolean;
+  };
+  suppressed?: {
+    review_policy?: number;
+    rejected?: number;
+    edge_budget?: number;
+    node_budget?: number;
+  };
+  projection_hash?: string;
   truncated?: boolean;
   conflict_present?: boolean;
   nodes: GraphSnapshotNode[];
@@ -270,6 +353,8 @@ export type GraphSnapshot = {
 export type MessageEvidence = {
   citations: CitationRef[];
   figures: FigureCardAsset[];
+  figureRefs?: FigureRef[];
+  tables?: PublishableTable[];
   locatorCandidates: LocatorCandidate[];
   graphSnapshots?: GraphSnapshot[];
   warnings: string[];
@@ -437,7 +522,14 @@ export type RunEvent =
   | { type: "text"; text: string; eventId?: string }
   | { type: "trace"; runId: string; trace: TraceEvent }
   | { type: "ask_user_question"; runId: string; questions: ClarificationQuestion[] }
-  | { type: "citations_ready"; runId: string; citation: CitationRef; figures: FigureCardAsset[] }
+  | {
+      type: "citations_ready";
+      runId: string;
+      citation: CitationRef;
+      figures: FigureCardAsset[];
+      figureRefs: FigureRef[];
+      tables: PublishableTable[];
+    }
   | { type: "locator_candidates"; runId: string; candidates: LocatorCandidate[] }
   | { type: "graph_snapshot_ready"; runId: string; snapshot: GraphSnapshot }
   | { type: "warning"; message: string }

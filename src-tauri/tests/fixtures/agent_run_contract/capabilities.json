@@ -1,15 +1,18 @@
 {
   "service": "yuxi",
-  "protocol_version": "1.5",
+  "protocol_version": "1.8",
   "min_supported_protocol_version": "1.2",
   "capabilities": [
     "ask_user_question",
     "human_approval_resume",
     "citation_v2",
     "figures_card",
+    "figure_refs",
+    "table_cards",
     "graph_snapshot_card",
     "locator_candidates",
     "run_trace_endpoints",
-    "sse_compact_default"
+    "sse_compact_default",
+    "trace_stage_facets"
   ]
 }
