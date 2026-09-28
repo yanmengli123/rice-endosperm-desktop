@@ -24,9 +24,9 @@ use crate::{
         CitationRef, ClarificationQuestion, FigureCardAsset, FigureRef, LocatorCandidate,
         ModelOption, PendingChatAttachment, ProgressText, ProtocolInfo, PublishableTable,
         QuestionAnswer, RunResult, ServerRunContext, build_resume_payload, parse_citation_ready,
-        parse_custom_warning, parse_graph_snapshot, parse_interrupt_questions,
-        parse_locator_candidates, sanitize_visible_model_text, terminal_status,
-        validate_authoritative_run_context,
+        parse_custom_warning, parse_followup_suggestions, parse_graph_snapshot,
+        parse_interrupt_questions, parse_locator_candidates, sanitize_visible_model_text,
+        terminal_status, validate_authoritative_run_context,
     },
 };
 
@@ -48,7 +48,7 @@ const KNOWN_SSE_EVENTS: [&str; 7] = [
 /// `payload.name`。一级白名单对 custom 恒命中，若不做二级校验，服务端新增
 /// custom 名（如新的证据类事件）会被静默丢弃且无任何告警——这里把未知
 /// custom 名记 WARN 并计入会话摘要（sse_custom_unknown）。
-const KNOWN_CUSTOM_EVENT_NAMES: [&str; 5] = [
+const KNOWN_CUSTOM_EVENT_NAMES: [&str; 6] = [
     // 已知且刻意不渲染：进度语义由 messages 帧（status=progress）承载。
     "yuxi.agent_state",
     // 证据平面附件 + 运行提示（1.8 capabilities 对应的 custom 载荷名）。
@@ -56,6 +56,8 @@ const KNOWN_CUSTOM_EVENT_NAMES: [&str; 5] = [
     "yuxi.citation_ready",
     "yuxi.locator_candidates",
     "yuxi.graph_snapshot_ready",
+    // 追问建议（1.9 followup_suggestions）：回答终态前的可点击下一问清单。
+    "yuxi.followup_suggestions",
 ];
 
 fn is_known_sse_event(name: &str) -> bool {
@@ -222,6 +224,12 @@ pub enum RunEvent {
     /// 运行内非阻塞提示（yuxi.warning）：不影响终态，UI 以可关闭的提示条呈现。
     Warning {
         message: String,
+    },
+    /// 追问建议（yuxi.followup_suggestions）：回答终态前下发的可点击下一问
+    /// 清单；点击后由前端作为普通用户消息发送（完整 run 链路）。
+    FollowupSuggestions {
+        run_id: String,
+        suggestions: Vec<String>,
     },
     Done {
         run_id: String,
@@ -1737,6 +1745,18 @@ async fn send_message_inner(
                                     run_evidence.warnings.push(warning);
                                 }
                             }
+                            "yuxi.followup_suggestions" => {
+                                if let Some(suggestions) = parse_followup_suggestions(&value) {
+                                    send_channel(
+                                        on_event,
+                                        RunEvent::FollowupSuggestions {
+                                            run_id: created.run_id.clone(),
+                                            suggestions: suggestions.clone(),
+                                        },
+                                    )?;
+                                    run_evidence.followup_suggestions = suggestions;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -2805,6 +2825,7 @@ mod tests {
             "yuxi.citation_ready",
             "yuxi.locator_candidates",
             "yuxi.graph_snapshot_ready",
+            "yuxi.followup_suggestions",
         ] {
             assert!(is_known_custom_event(name), "{name} 必须在 custom 白名单内");
         }

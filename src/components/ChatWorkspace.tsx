@@ -46,6 +46,7 @@ import {
   EvidenceGraphSnapshots,
   EvidenceLocatorCandidates,
   EvidenceWarnings,
+  FollowupSuggestions,
 } from "./EvidencePlane";
 import { CodeHeader, HtmlFencedCodeBlock, HtmlPreviewCodeBlock, MermaidDiagram, PrismCodeBlock } from "./RichCodeBlocks";
 import { TraceTimeline } from "./TraceTimeline";
@@ -94,6 +95,10 @@ function mergeEvidence(items: Array<MessageEvidence | undefined>): MessageEviden
     merged.locatorCandidates.push(...(item.locatorCandidates ?? []));
     merged.graphSnapshots?.push(...(item.graphSnapshots ?? []));
     merged.warnings.push(...(item.warnings ?? []));
+    // 追问建议只代表最新一轮：取最后一条非空快照（不跨轮累加）
+    if (item.followupSuggestions?.length) {
+      merged.followupSuggestions = [...item.followupSuggestions];
+    }
   }
   return merged;
 }
@@ -297,6 +302,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
       locatorCandidates: [...current.locatorCandidates, ...(patch.locatorCandidates ?? [])],
       graphSnapshots: [...(current.graphSnapshots ?? []), ...(patch.graphSnapshots ?? [])],
       warnings: [...current.warnings, ...(patch.warnings ?? [])],
+      // 追问建议是「最新一轮」语义：整组替换，不累加
+      followupSuggestions: patch.followupSuggestions ?? current.followupSuggestions,
     }));
   // 能力位驱动渲染：连接成功后拉协议能力快照，图卡仅在服务端声明 figures_card
   // 能力位时尝试取图（fail-closed）。快照与服务器 `figure_card_enabled` 开闸解耦——
@@ -304,6 +311,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
   const [figuresCapabilityEnabled, setFiguresCapabilityEnabled] = useState(false);
   const [figureRefsCapabilityEnabled, setFigureRefsCapabilityEnabled] = useState(false);
   const [tableCardsCapabilityEnabled, setTableCardsCapabilityEnabled] = useState(false);
+  const [followupSuggestionsCapabilityEnabled, setFollowupSuggestionsCapabilityEnabled] = useState(false);
   useEffect(() => {
     let cancelled = false;
     getProtocolCapabilities()
@@ -312,6 +320,7 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
         setFiguresCapabilityEnabled(info.capabilities.includes("figures_card"));
         setFigureRefsCapabilityEnabled(info.capabilities.includes("figure_refs"));
         setTableCardsCapabilityEnabled(info.capabilities.includes("table_cards"));
+        setFollowupSuggestionsCapabilityEnabled(info.capabilities.includes("followup_suggestions"));
       })
       .catch(() => undefined);
     return () => {
@@ -418,6 +427,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
             pendingResumeQuestionsRef.current = null;
             pendingResumeAnswersRef.current = null;
             setAskUser(null);
+            // 新一轮开始：上一轮的追问建议随之隐藏（点击入口失效）
+            setEvidence((current) => ({ ...current, followupSuggestions: undefined }));
             setTrace((current) =>
               current.runId === state.runId
                 ? current
@@ -449,6 +460,8 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
           mergeLiveEvidence({ locatorCandidates: candidates }),
         onGraphSnapshotReady: (_runId, snapshot) =>
           mergeLiveEvidence({ graphSnapshots: [snapshot] }),
+        onFollowupSuggestions: (_runId, suggestions) =>
+          mergeLiveEvidence({ followupSuggestions: suggestions }),
         onWarning: (message) => mergeLiveEvidence({ warnings: [message] }),
         bridgeAttachment,
         onBridgeConsumed,
@@ -494,6 +507,12 @@ function RuntimeThread({ threadId, messages, onRunState, onCompleted, bridgeAtta
         <ThreadPrimitive.Viewport className="thread-viewport">
           <Welcome />
           <ThreadPrimitive.Messages components={{ Message: ChatMessage }} />
+          <FollowupSuggestions
+            suggestions={
+              followupSuggestionsCapabilityEnabled ? (evidence.followupSuggestions ?? []) : []
+            }
+            onSelect={(question) => runtime.thread.append(question)}
+          />
           <EvidenceWarnings warnings={evidence.warnings} />
           <EvidenceCitations citations={evidence.citations} />
           <EvidenceFigures figures={evidence.figures} capabilityEnabled={figuresCapabilityEnabled} />

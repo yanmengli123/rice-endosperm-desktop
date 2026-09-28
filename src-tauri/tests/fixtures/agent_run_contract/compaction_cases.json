@@ -6,33 +6,58 @@
       "response": "",
       "thread_id": "th-demo-01",
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "文本"}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01",
+        "content": "文本"
+      }
     },
     "expected": {
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "文本"}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01",
+        "content": "文本"
+      }
     }
   },
   {
     "name": "reasoning_content_becomes_state",
     "input": {
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "答案", "reasoning_content": "思考原文不得外泄"}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01",
+        "content": "答案",
+        "reasoning_content": "思考原文不得外泄"
+      }
     },
     "expected": {
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": "答案", "reasoning_state": "thinking"}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01",
+        "content": "答案",
+        "reasoning_state": "thinking"
+      }
     }
   },
   {
     "name": "empty_content_dropped",
     "input": {
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01", "content": ""}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01",
+        "content": ""
+      }
     },
     "expected": {
       "status": "loading",
-      "stream_event": {"type": "message_delta", "message_id": "msg-01"}
+      "stream_event": {
+        "type": "message_delta",
+        "message_id": "msg-01"
+      }
     }
   },
   {
@@ -43,12 +68,19 @@
         {
           "question_id": "q-stage",
           "question": "重点分析哪个发育阶段？",
-          "options": [{"label": "灌浆期", "value": "灌浆期"}],
+          "options": [
+            {
+              "label": "灌浆期",
+              "value": "灌浆期"
+            }
+          ],
           "multi_select": false,
           "allow_other": true
         }
       ],
-      "interrupt_info": {"reason": "ask_user_question_required"}
+      "interrupt_info": {
+        "reason": "ask_user_question_required"
+      }
     },
     "expected": {
       "status": "ask_user_question_required",
@@ -56,17 +88,54 @@
         {
           "question_id": "q-stage",
           "question": "重点分析哪个发育阶段？",
-          "options": [{"label": "灌浆期", "value": "灌浆期"}],
+          "options": [
+            {
+              "label": "灌浆期",
+              "value": "灌浆期"
+            }
+          ],
           "multi_select": false,
           "allow_other": true
         }
       ],
-      "interrupt_info": {"reason": "ask_user_question_required"}
+      "interrupt_info": {
+        "reason": "ask_user_question_required"
+      }
     }
   },
   {
     "name": "unlisted_field_stripped",
-    "input": {"status": "loading", "secret_field": "x", "message": "进度"},
-    "expected": {"status": "loading", "message": "进度"}
+    "input": {
+      "status": "loading",
+      "secret_field": "x",
+      "message": "进度"
+    },
+    "expected": {
+      "status": "loading",
+      "message": "进度"
+    }
+  },
+  {
+    "name": "followup_suggestions_whitelisted",
+    "input": {
+      "request_id": "desktop-7c9e16af2d3b4f5e",
+      "response": "",
+      "thread_id": "th-demo-01",
+      "status": "followup_suggestions",
+      "followup_suggestions": [
+        "灌浆期淀粉积累的关键酶有哪些？",
+        "胚乳细胞程序性死亡何时启动？",
+        "转录因子OsX如何调控胚乳发育？"
+      ],
+      "secret_field": "x"
+    },
+    "expected": {
+      "status": "followup_suggestions",
+      "followup_suggestions": [
+        "灌浆期淀粉积累的关键酶有哪些？",
+        "胚乳细胞程序性死亡何时启动？",
+        "转录因子OsX如何调控胚乳发育？"
+      ]
+    }
   }
 ]

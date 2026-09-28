@@ -358,6 +358,8 @@ export type MessageEvidence = {
   locatorCandidates: LocatorCandidate[];
   graphSnapshots?: GraphSnapshot[];
   warnings: string[];
+  /** 追问建议（followup_suggestions）：随 evidence_json 存档，重开线程时恢复。 */
+  followupSuggestions?: string[];
 };
 
 /** GET /api/agent/protocol 能力快照（渲染分支的能力位真源）。 */
@@ -532,6 +534,7 @@ export type RunEvent =
     }
   | { type: "locator_candidates"; runId: string; candidates: LocatorCandidate[] }
   | { type: "graph_snapshot_ready"; runId: string; snapshot: GraphSnapshot }
+  | { type: "followup_suggestions"; runId: string; suggestions: string[] }
   | { type: "warning"; message: string }
   | { type: "done"; runId: string; status: string; text: string; context: ServerRunContext };
 

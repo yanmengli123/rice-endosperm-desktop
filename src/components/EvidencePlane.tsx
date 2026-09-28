@@ -351,6 +351,34 @@ export function EvidenceGraphSnapshots({ snapshots }: { snapshots: GraphSnapshot
   );
 }
 
+/** 追问建议（followup_suggestions）：最后一条回答下方的可点击下一问。
+ * 数据只来自服务端权威载荷（SSE / evidence_json 存档），纯文本渲染；
+ * 点击后由 ChatWorkspace 以普通用户消息发送（完整 run 链路）。 */
+export function FollowupSuggestions({
+  suggestions,
+  onSelect,
+}: {
+  suggestions: string[];
+  onSelect: (question: string) => void;
+}) {
+  if (!suggestions || suggestions.length === 0) return null;
+  return (
+    <div className="followup-suggestions" role="group" aria-label="推荐的后续问题">
+      {suggestions.map((question) => (
+        <button
+          key={question}
+          type="button"
+          className="followup-chip"
+          title={question}
+          onClick={() => onSelect(question)}
+        >
+          {question}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /** 运行内非阻塞提示条（yuxi.warning）：可关闭，不影响终态。 */
 export function EvidenceWarnings({ warnings }: { warnings: string[] }) {
   const [dismissed, setDismissed] = useState(0);

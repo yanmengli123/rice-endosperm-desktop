@@ -37,6 +37,8 @@ type AdapterCallbacks = {
   onLocatorCandidates?: (runId: string, candidates: LocatorCandidate[]) => void;
   /** 确定性规范关系子图（graph_snapshot_v1）。 */
   onGraphSnapshotReady?: (runId: string, snapshot: GraphSnapshot) => void;
+  /** 追问建议（followup_suggestions）：回答终态前的可点击下一问清单。 */
+  onFollowupSuggestions?: (runId: string, suggestions: string[]) => void;
   /** 运行内非阻塞提示（yuxi.warning）。 */
   onWarning?: (message: string) => void;
   bridgeAttachment?: PendingChatAttachment;
@@ -207,6 +209,8 @@ export function createYuxiAdapter(
             callbacks.onLocatorCandidates?.(event.runId, event.candidates);
           } else if (event.type === "graph_snapshot_ready") {
             callbacks.onGraphSnapshotReady?.(event.runId, event.snapshot);
+          } else if (event.type === "followup_suggestions") {
+            callbacks.onFollowupSuggestions?.(event.runId, event.suggestions);
           } else if (event.type === "warning") {
             callbacks.onWarning?.(event.message);
           } else if (event.type === "done") {

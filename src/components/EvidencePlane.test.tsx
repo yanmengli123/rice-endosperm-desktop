@@ -11,6 +11,7 @@ import {
   EvidenceLocatorCandidates,
   EvidenceTables,
   EvidenceWarnings,
+  FollowupSuggestions,
 } from "./EvidencePlane";
 
 const mocks = vi.hoisted(() => ({
@@ -167,5 +168,26 @@ describe("EvidencePlane", () => {
     await waitFor(() => {
       expect(screen.queryByText("部分检索来源超时")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("FollowupSuggestions", () => {
+  it("空清单不渲染，非空清单点击即回调原样问题", () => {
+    const { container, unmount } = render(
+      <FollowupSuggestions suggestions={[]} onSelect={() => undefined} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+    unmount();
+
+    const onSelect = vi.fn();
+    render(
+      <FollowupSuggestions
+        suggestions={["灌浆期淀粉积累的关键酶有哪些？", "胚乳细胞何时分化？"]}
+        onSelect={onSelect}
+      />,
+    );
+    expect(screen.getByLabelText("推荐的后续问题")).toBeInTheDocument();
+    screen.getByRole("button", { name: "胚乳细胞何时分化？" }).click();
+    expect(onSelect).toHaveBeenCalledWith("胚乳细胞何时分化？");
   });
 });

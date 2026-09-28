@@ -88,6 +88,10 @@ pub struct MessageEvidence {
     pub graph_snapshots: Vec<serde_json::Value>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 追问建议（followup_suggestions）：回答终态前下发的下一问清单；
+    /// 随 evidence_json 存档，重开线程时恢复到最后一条回答。
+    #[serde(default)]
+    pub followup_suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]

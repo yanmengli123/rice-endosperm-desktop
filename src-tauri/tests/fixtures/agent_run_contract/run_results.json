@@ -29,7 +29,7 @@
       }
     ],
     "run_context": {
-      "protocol_version": "1.8",
+      "protocol_version": "1.9",
       "agent_slug": "default-chatbot",
       "thread_id": "th-demo-01",
       "request_id": "desktop-7c9e16af2d3b4f5e",
@@ -57,7 +57,7 @@
       "message": "模型调用失败"
     },
     "run_context": {
-      "protocol_version": "1.8",
+      "protocol_version": "1.9",
       "result_authority": "yuxi_server"
     }
   },
@@ -66,7 +66,7 @@
     "output": "",
     "artifacts": [],
     "run_context": {
-      "protocol_version": "1.8",
+      "protocol_version": "1.9",
       "result_authority": "yuxi_server"
     }
   },
@@ -75,7 +75,7 @@
     "output": null,
     "artifacts": [],
     "run_context": {
-      "protocol_version": "1.8",
+      "protocol_version": "1.9",
       "result_authority": "yuxi_server"
     }
   }

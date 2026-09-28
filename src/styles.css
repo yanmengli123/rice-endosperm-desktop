@@ -1647,3 +1647,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   margin-left: 8px;
   font-weight: 400;
 }
+
+/* 追问建议（followup_suggestions）：最后一条回答下方的可点击下一问 */
+.followup-suggestions { width: min(760px, 100%); display: flex; flex-wrap: wrap; gap: 8px; margin: 2px auto 14px; }
+.followup-chip { max-width: 100%; padding: 6px 14px; border: 1px solid #dce6dc; border-radius: 999px; background: rgba(255,255,255,.85); color: var(--green-700); font-size: 13px; line-height: 1.5; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: border-color .2s ease, background-color .2s ease; }
+.followup-chip:hover { border-color: #b8d3be; background: #fff; }

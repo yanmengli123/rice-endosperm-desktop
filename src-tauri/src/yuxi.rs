@@ -363,6 +363,26 @@ pub fn parse_custom_warning(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// 解析 `custom` 帧（payload.name == "yuxi.followup_suggestions"）：追问建议
+/// 清单。服务端出口已校验（非空字符串、限长、去重），这里只做形状防御；
+/// 空清单/形状不符返回 None。
+pub fn parse_followup_suggestions(value: &Value) -> Option<Vec<String>> {
+    let chunk = value.pointer("/payload/chunk")?;
+    if chunk.get("status").and_then(Value::as_str) != Some("followup_suggestions") {
+        return None;
+    }
+    let suggestions = chunk
+        .get("followup_suggestions")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!suggestions.is_empty()).then_some(suggestions)
+}
+
 /// 取图资产 URL 的路径段校验：拒绝空段、分隔符、目录穿越与控制字符。
 fn sanitize_asset_segment(segment: &str) -> AppResult<&str> {
     let trimmed = segment.trim();
@@ -3312,9 +3332,9 @@ mod contract_fixtures {
     use super::{
         ClarificationQuestion, FigureCardAsset, ProgressText, QuestionAnswer, QuestionOption,
         ServerRunContext, build_resume_payload, knowledge_asset_url, parse_citation_ready,
-        parse_custom_warning, parse_error_body, parse_graph_snapshot, parse_interrupt_questions,
-        parse_locator_candidates, parse_protocol_info, parse_run_result,
-        validate_authoritative_run_context,
+        parse_custom_warning, parse_error_body, parse_followup_suggestions, parse_graph_snapshot,
+        parse_interrupt_questions, parse_locator_candidates, parse_protocol_info,
+        parse_run_result, validate_authoritative_run_context,
     };
     use crate::error::AppError;
     use serde_json::{Value, json};
@@ -3454,6 +3474,32 @@ mod contract_fixtures {
             Some("部分检索来源超时，结果可能不完整")
         );
 
+        // yuxi.followup_suggestions：回答终态前的追问建议清单（1.9 加法）。
+        let followup_frame = json!({
+            "payload": {
+                "name": "yuxi.followup_suggestions",
+                "chunk": {
+                    "status": "followup_suggestions",
+                    "followup_suggestions": ["  灌浆期淀粉积累的关键酶有哪些？ ", "", 42, "胚乳细胞何时分化？"]
+                }
+            }
+        });
+        assert_eq!(
+            parse_followup_suggestions(&followup_frame),
+            Some(vec![
+                "灌浆期淀粉积累的关键酶有哪些？".to_owned(),
+                "胚乳细胞何时分化？".to_owned()
+            ])
+        );
+        // 形状不符 / 空清单 → None（不猜测补全）
+        let empty_frame = json!({
+            "payload": {
+                "name": "yuxi.followup_suggestions",
+                "chunk": {"status": "followup_suggestions", "followup_suggestions": []}
+            }
+        });
+        assert_eq!(parse_followup_suggestions(&empty_frame), None);
+
         // 语料 compact 视图（data 帧）与 verbose 视图驱动同一批解析器。
         for (event, data) in load_frames() {
             if event != "custom" {
@@ -3484,6 +3530,11 @@ mod contract_fixtures {
                         parse_graph_snapshot(&data).expect("compact graph snapshot 帧必须可解析");
                     assert_eq!(snapshot["schema"], "graph_snapshot_v1");
                     assert_eq!(snapshot["edges"].as_array().map(Vec::len), Some(1));
+                }
+                Some("yuxi.followup_suggestions") => {
+                    let suggestions = parse_followup_suggestions(&data)
+                        .expect("compact followup suggestions 帧必须可解析");
+                    assert!(!suggestions.is_empty());
                 }
                 _ => {}
             }
